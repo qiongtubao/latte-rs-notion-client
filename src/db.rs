@@ -1,0 +1,1958 @@
+//! SQLite 本地存储：schema + CRUD（本地优先，dirty 标记软同步）。
+//!
+//! 同步语义：
+//! - 所有本地写操作立即生效并置 `dirty = 1`
+//! - 删除：从未同步过（notion_page_id 为空）的行直接物理删除；
+//!   已同步过的行置 `deleted = 1, dirty = 1`，待同步任务在 Notion 端归档后再物理删除
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::Result;
+use rusqlite::types::ToSql;
+use rusqlite::{Connection, OptionalExtension, Row, params};
+use uuid::Uuid;
+
+use crate::models::{
+    Category, Event, Expense, ExtRecord, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus,
+    Tag, Task, TaskPriority,
+};
+
+pub struct Db {
+    conn: Connection,
+}
+
+const EVENT_COLS: &str =
+    "id, start_ts, end_ts, content, tag, notion_page_id, dirty, deleted, remind";
+const EXPENSE_COLS: &str = "id, item, amount_cents, ts, category, notion_page_id, dirty, deleted";
+const PROJECT_COLS: &str =
+    "id, name, status, start_ts, deadline_ts, note, notion_page_id, dirty, deleted";
+const NOTE_COLS: &str = "id, parent_id, kind, title, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted";
+const IDEA_COLS: &str =
+    "id, content, tag, pinned, created_ts, updated_ts, notion_page_id, dirty, deleted";
+const TASK_COLS: &str =
+    "id, date, title, priority, done, created_ts, updated_ts, notion_page_id, dirty, deleted";
+const EXT_RECORD_COLS: &str =
+    "ns, id, title, props_json, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted";
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let conn = Connection::open(path)?;
+        let db = Self { conn };
+        db.init()?;
+        Ok(db)
+    }
+
+    /// 内存数据库（仅测试用）
+    #[cfg(test)]
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let db = Self { conn };
+        db.init()?;
+        Ok(db)
+    }
+
+    fn init(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                start_ts INTEGER NOT NULL,
+                end_ts INTEGER,
+                content TEXT NOT NULL DEFAULT '',
+                tag TEXT NOT NULL DEFAULT '生活',
+                remind INTEGER NOT NULL DEFAULT 0,
+                notion_page_id TEXT,
+                dirty INTEGER NOT NULL DEFAULT 1,
+                deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS expenses (
+                id TEXT PRIMARY KEY,
+                item TEXT NOT NULL DEFAULT '',
+                amount_cents INTEGER NOT NULL DEFAULT 0,
+                ts INTEGER NOT NULL,
+                category TEXT NOT NULL DEFAULT '其他',
+                notion_page_id TEXT,
+                dirty INTEGER NOT NULL DEFAULT 1,
+                deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '进行中',
+                start_ts INTEGER,
+                deadline_ts INTEGER,
+                note TEXT NOT NULL DEFAULT '',
+                notion_page_id TEXT,
+                dirty INTEGER NOT NULL DEFAULT 1,
+                deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS notes (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                kind TEXT NOT NULL CHECK (kind IN ('dir', 'doc')),
+                title TEXT NOT NULL DEFAULT '',
+                content_md TEXT NOT NULL DEFAULT '',
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                notion_page_id TEXT,
+                dirty INTEGER NOT NULL DEFAULT 1,
+                deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS ext_records (
+                ns TEXT NOT NULL,
+                id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                props_json TEXT NOT NULL DEFAULT '{}',
+                content_md TEXT NOT NULL DEFAULT '',
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                notion_page_id TEXT,
+                dirty INTEGER NOT NULL DEFAULT 1,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (ns, id)
+            );
+            CREATE TABLE IF NOT EXISTS ext_namespaces (
+                ns TEXT PRIMARY KEY,
+                notion_page_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ideas (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                tag TEXT NOT NULL DEFAULT '灵感',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER,
+                updated_ts INTEGER,
+                notion_page_id TEXT,
+                dirty INTEGER DEFAULT 1,
+                deleted INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                title TEXT NOT NULL,
+                priority TEXT NOT NULL DEFAULT '中',
+                done INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER,
+                updated_ts INTEGER,
+                notion_page_id TEXT,
+                dirty INTEGER DEFAULT 1,
+                deleted INTEGER DEFAULT 0
+            );",
+        )?;
+        self.migrate()?;
+        Ok(())
+    }
+
+    /// 旧库补齐后加的列（目前仅 events.remind）
+    fn migrate(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(events)")?;
+        let has_remind = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .any(|name| name.is_ok_and(|n| n == "remind"));
+        if !has_remind {
+            self.conn
+                .execute_batch("ALTER TABLE events ADD COLUMN remind INTEGER NOT NULL DEFAULT 0")?;
+        }
+        Ok(())
+    }
+
+    // ---------- 事件 ----------
+
+    fn row_to_event(row: &Row) -> rusqlite::Result<Event> {
+        Ok(Event {
+            id: row.get(0)?,
+            start_ts: row.get(1)?,
+            end_ts: row.get(2)?,
+            content: row.get(3)?,
+            tag: Tag::from_label(&row.get::<_, String>(4)?).unwrap_or(Tag::Life),
+            notion_page_id: row.get(5)?,
+            dirty: row.get::<_, i64>(6)? != 0,
+            deleted: row.get::<_, i64>(7)? != 0,
+            remind: row.get::<_, i64>(8)? != 0,
+        })
+    }
+
+    /// 开始一个新事件（进行中）
+    pub fn create_event(&self, start_ts: i64) -> Result<Event> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO events (id, start_ts) VALUES (?1, ?2)",
+            params![id, start_ts],
+        )?;
+        Ok(Event {
+            id,
+            start_ts,
+            end_ts: None,
+            content: String::new(),
+            tag: Tag::Life,
+            remind: false,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    /// 手动补录/规划一个完整事件（end_ts 为 None 表示计划中/进行中）
+    pub fn add_event_full(
+        &self,
+        start_ts: i64,
+        end_ts: Option<i64>,
+        content: &str,
+        tag: Tag,
+        remind: bool,
+    ) -> Result<Event> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO events (id, start_ts, end_ts, content, tag, remind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, start_ts, end_ts, content, tag.label(), remind],
+        )?;
+        Ok(Event {
+            id,
+            start_ts,
+            end_ts,
+            content: content.to_string(),
+            tag,
+            remind,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    /// 结束事件并填写内容与标签
+    pub fn finish_event(&self, id: &str, end_ts: i64, content: &str, tag: Tag) -> Result<()> {
+        self.conn.execute(
+            "UPDATE events SET end_ts = ?2, content = ?3, tag = ?4, dirty = 1 WHERE id = ?1",
+            params![id, end_ts, content, tag.label()],
+        )?;
+        Ok(())
+    }
+
+    /// 当前进行中的事件（最多一个）
+    pub fn ongoing_event(&self) -> Result<Option<Event>> {
+        let sql =
+            format!("SELECT {EVENT_COLS} FROM events WHERE end_ts IS NULL AND deleted = 0 LIMIT 1");
+        let ev = self
+            .conn
+            .query_row(&sql, [], Self::row_to_event)
+            .optional()?;
+        Ok(ev)
+    }
+
+    /// 按 id 查询未删除事件
+    pub fn get_event(&self, id: &str) -> Result<Option<Event>> {
+        let sql = format!("SELECT {EVENT_COLS} FROM events WHERE id = ?1 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::row_to_event)
+            .optional()?)
+    }
+
+    /// 部分更新事件；end_ts 传 Some(None) 表示显式清空（重新打开事件）。
+    /// 返回是否存在该（未删除）行。有任何字段更新时置 dirty。
+    pub fn update_event(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        tag: Option<Tag>,
+        start_ts: Option<i64>,
+        end_ts: Option<Option<i64>>,
+        remind: Option<bool>,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(c) = content {
+            sets.push("content = ?");
+            values.push(Box::new(c.to_string()));
+        }
+        if let Some(t) = tag {
+            sets.push("tag = ?");
+            values.push(Box::new(t.label().to_string()));
+        }
+        if let Some(s) = start_ts {
+            sets.push("start_ts = ?");
+            values.push(Box::new(s));
+        }
+        if let Some(e) = end_ts {
+            sets.push("end_ts = ?");
+            values.push(Box::new(e));
+        }
+        if let Some(r) = remind {
+            sets.push("remind = ?");
+            values.push(Box::new(r));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_event(id)?.is_some());
+        }
+        sets.push("dirty = 1");
+        let sql = format!(
+            "UPDATE events SET {} WHERE id = ? AND deleted = 0",
+            sets.join(", ")
+        );
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    /// 与 [from, to) 时间范围有交集的未删除事件；now 用于进行中的事件
+    pub fn events_between(&self, from: i64, to: i64, now: i64) -> Result<Vec<Event>> {
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events
+             WHERE deleted = 0 AND start_ts < ?2 AND COALESCE(end_ts, ?3) > ?1
+             ORDER BY start_ts"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from, to, now], Self::row_to_event)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_event(&self, id: &str) -> Result<()> {
+        self.soft_or_hard_delete("events", id)
+    }
+
+    /// 待同步事件（含 deleted = 1 的）
+    pub fn dirty_events(&self) -> Result<Vec<Event>> {
+        let sql = format!("SELECT {EVENT_COLS} FROM events WHERE dirty = 1 ORDER BY start_ts");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_event)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_event_page_id(&self, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE events SET notion_page_id = ?2, dirty = 0 WHERE id = ?1",
+            params![id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_event_dirty(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE events SET dirty = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn purge_event(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM events WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---------- 消费 ----------
+
+    fn row_to_expense(row: &Row) -> rusqlite::Result<Expense> {
+        Ok(Expense {
+            id: row.get(0)?,
+            item: row.get(1)?,
+            amount_cents: row.get(2)?,
+            ts: row.get(3)?,
+            category: Category::from_label(&row.get::<_, String>(4)?).unwrap_or(Category::Other),
+            notion_page_id: row.get(5)?,
+            dirty: row.get::<_, i64>(6)? != 0,
+            deleted: row.get::<_, i64>(7)? != 0,
+        })
+    }
+
+    pub fn add_expense(
+        &self,
+        item: &str,
+        amount_cents: i64,
+        ts: i64,
+        category: Category,
+    ) -> Result<Expense> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO expenses (id, item, amount_cents, ts, category) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, item, amount_cents, ts, category.label()],
+        )?;
+        Ok(Expense {
+            id,
+            item: item.to_string(),
+            amount_cents,
+            ts,
+            category,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    pub fn all_expenses(&self) -> Result<Vec<Expense>> {
+        let sql = format!("SELECT {EXPENSE_COLS} FROM expenses WHERE deleted = 0 ORDER BY ts DESC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_expense)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// [from, to) 范围内的未删除消费
+    pub fn expenses_between(&self, from: i64, to: i64) -> Result<Vec<Expense>> {
+        let sql = format!(
+            "SELECT {EXPENSE_COLS} FROM expenses
+             WHERE deleted = 0 AND ts >= ?1 AND ts < ?2 ORDER BY ts"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from, to], Self::row_to_expense)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 按 id 查询未删除消费
+    pub fn get_expense(&self, id: &str) -> Result<Option<Expense>> {
+        let sql = format!("SELECT {EXPENSE_COLS} FROM expenses WHERE id = ?1 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::row_to_expense)
+            .optional()?)
+    }
+
+    /// 部分更新消费。返回是否存在该（未删除）行。有任何字段更新时置 dirty。
+    pub fn update_expense(
+        &self,
+        id: &str,
+        item: Option<&str>,
+        amount_cents: Option<i64>,
+        ts: Option<i64>,
+        category: Option<Category>,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(i) = item {
+            sets.push("item = ?");
+            values.push(Box::new(i.to_string()));
+        }
+        if let Some(a) = amount_cents {
+            sets.push("amount_cents = ?");
+            values.push(Box::new(a));
+        }
+        if let Some(t) = ts {
+            sets.push("ts = ?");
+            values.push(Box::new(t));
+        }
+        if let Some(c) = category {
+            sets.push("category = ?");
+            values.push(Box::new(c.label().to_string()));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_expense(id)?.is_some());
+        }
+        sets.push("dirty = 1");
+        let sql = format!(
+            "UPDATE expenses SET {} WHERE id = ? AND deleted = 0",
+            sets.join(", ")
+        );
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    pub fn delete_expense(&self, id: &str) -> Result<()> {
+        self.soft_or_hard_delete("expenses", id)
+    }
+
+    pub fn dirty_expenses(&self) -> Result<Vec<Expense>> {
+        let sql = format!("SELECT {EXPENSE_COLS} FROM expenses WHERE dirty = 1 ORDER BY ts");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_expense)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_expense_page_id(&self, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE expenses SET notion_page_id = ?2, dirty = 0 WHERE id = ?1",
+            params![id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_expense_dirty(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE expenses SET dirty = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn purge_expense(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM expenses WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---------- 项目 ----------
+
+    fn row_to_project(row: &Row) -> rusqlite::Result<Project> {
+        Ok(Project {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            status: ProjectStatus::from_label(&row.get::<_, String>(2)?)
+                .unwrap_or(ProjectStatus::Doing),
+            start_ts: row.get(3)?,
+            deadline_ts: row.get(4)?,
+            note: row.get(5)?,
+            notion_page_id: row.get(6)?,
+            dirty: row.get::<_, i64>(7)? != 0,
+            deleted: row.get::<_, i64>(8)? != 0,
+        })
+    }
+
+    pub fn add_project(
+        &self,
+        name: &str,
+        status: ProjectStatus,
+        start_ts: Option<i64>,
+        deadline_ts: Option<i64>,
+        note: &str,
+    ) -> Result<Project> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO projects (id, name, status, start_ts, deadline_ts, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, name, status.label(), start_ts, deadline_ts, note],
+        )?;
+        Ok(Project {
+            id,
+            name: name.to_string(),
+            status,
+            start_ts,
+            deadline_ts,
+            note: note.to_string(),
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    pub fn all_projects(&self) -> Result<Vec<Project>> {
+        let sql = format!("SELECT {PROJECT_COLS} FROM projects WHERE deleted = 0 ORDER BY rowid");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_project)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 按 id 查询未删除项目
+    pub fn get_project(&self, id: &str) -> Result<Option<Project>> {
+        let sql = format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::row_to_project)
+            .optional()?)
+    }
+
+    /// 部分更新项目；start_ts / deadline_ts 传 Some(None) 表示显式清空。
+    /// 返回是否存在该（未删除）行。有任何字段更新时置 dirty。
+    pub fn update_project(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        status: Option<ProjectStatus>,
+        start_ts: Option<Option<i64>>,
+        deadline_ts: Option<Option<i64>>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(n) = name {
+            sets.push("name = ?");
+            values.push(Box::new(n.to_string()));
+        }
+        if let Some(s) = status {
+            sets.push("status = ?");
+            values.push(Box::new(s.label().to_string()));
+        }
+        if let Some(s) = start_ts {
+            sets.push("start_ts = ?");
+            values.push(Box::new(s));
+        }
+        if let Some(d) = deadline_ts {
+            sets.push("deadline_ts = ?");
+            values.push(Box::new(d));
+        }
+        if let Some(n) = note {
+            sets.push("note = ?");
+            values.push(Box::new(n.to_string()));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_project(id)?.is_some());
+        }
+        sets.push("dirty = 1");
+        let sql = format!(
+            "UPDATE projects SET {} WHERE id = ? AND deleted = 0",
+            sets.join(", ")
+        );
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    pub fn set_project_status(&self, id: &str, status: ProjectStatus) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET status = ?2, dirty = 1 WHERE id = ?1",
+            params![id, status.label()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_project(&self, id: &str) -> Result<()> {
+        self.soft_or_hard_delete("projects", id)
+    }
+
+    pub fn dirty_projects(&self) -> Result<Vec<Project>> {
+        let sql = format!("SELECT {PROJECT_COLS} FROM projects WHERE dirty = 1 ORDER BY rowid");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_project)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_project_page_id(&self, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET notion_page_id = ?2, dirty = 0 WHERE id = ?1",
+            params![id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_project_dirty(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE projects SET dirty = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn purge_project(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---------- 知识库 ----------
+
+    fn row_to_note(row: &Row) -> rusqlite::Result<Note> {
+        Ok(Note {
+            id: row.get(0)?,
+            parent_id: row.get(1)?,
+            kind: NoteKind::from_label(&row.get::<_, String>(2)?).unwrap_or(NoteKind::Doc),
+            title: row.get(3)?,
+            content_md: row.get(4)?,
+            created_ts: row.get(5)?,
+            updated_ts: row.get(6)?,
+            notion_page_id: row.get(7)?,
+            dirty: row.get::<_, i64>(8)? != 0,
+            deleted: row.get::<_, i64>(9)? != 0,
+        })
+    }
+
+    pub fn add_note(
+        &self,
+        parent_id: Option<&str>,
+        kind: NoteKind,
+        title: &str,
+        content_md: &str,
+        now: i64,
+    ) -> Result<Note> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO notes (id, parent_id, kind, title, content_md, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id, parent_id, kind.label(), title, content_md, now],
+        )?;
+        Ok(Note {
+            id,
+            parent_id: parent_id.map(str::to_string),
+            kind,
+            title: title.to_string(),
+            content_md: content_md.to_string(),
+            created_ts: now,
+            updated_ts: now,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    /// 按 id 查询未删除条目
+    pub fn get_note(&self, id: &str) -> Result<Option<Note>> {
+        let sql = format!("SELECT {NOTE_COLS} FROM notes WHERE id = ?1 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::row_to_note)
+            .optional()?)
+    }
+
+    /// 全部未删除条目（按创建时间排序，供树接口使用）
+    pub fn all_notes(&self) -> Result<Vec<Note>> {
+        let sql =
+            format!("SELECT {NOTE_COLS} FROM notes WHERE deleted = 0 ORDER BY created_ts, rowid");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_note)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 全部条目（含 deleted = 1，供同步使用）
+    pub fn all_notes_any(&self) -> Result<Vec<Note>> {
+        let sql = format!("SELECT {NOTE_COLS} FROM notes ORDER BY created_ts, rowid");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_note)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 部分更新条目；parent_id 传 Some(None) 表示移到根。
+    /// 返回是否存在该（未删除）行。有任何字段更新时刷新 updated_ts 并置 dirty。
+    pub fn update_note(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        content_md: Option<&str>,
+        parent_id: Option<Option<&str>>,
+        now: i64,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(t) = title {
+            sets.push("title = ?");
+            values.push(Box::new(t.to_string()));
+        }
+        if let Some(c) = content_md {
+            sets.push("content_md = ?");
+            values.push(Box::new(c.to_string()));
+        }
+        if let Some(p) = parent_id {
+            sets.push("parent_id = ?");
+            values.push(Box::new(p.map(str::to_string)));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_note(id)?.is_some());
+        }
+        sets.push("updated_ts = ?");
+        values.push(Box::new(now));
+        sets.push("dirty = 1");
+        let sql = format!(
+            "UPDATE notes SET {} WHERE id = ? AND deleted = 0",
+            sets.join(", ")
+        );
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    /// 把 note_id 移到 new_parent_id 下是否会成环（沿 new_parent 的祖先链查找 note_id）
+    pub fn note_would_cycle(&self, note_id: &str, new_parent_id: &str) -> Result<bool> {
+        let mut cur = Some(new_parent_id.to_string());
+        while let Some(pid) = cur {
+            if pid == note_id {
+                return Ok(true);
+            }
+            cur = self
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM notes WHERE id = ?1",
+                    params![pid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+        }
+        Ok(false)
+    }
+
+    /// 递归删除条目及其全部子孙：已同步过的软删（待远端归档），未同步过的物理删
+    pub fn delete_note_recursive(&self, id: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare("SELECT id, parent_id FROM notes")?;
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for (nid, pid) in rows {
+            if let Some(pid) = pid {
+                children.entry(pid).or_default().push(nid);
+            }
+        }
+        let mut stack = vec![id.to_string()];
+        let mut all = Vec::new();
+        while let Some(cur) = stack.pop() {
+            if let Some(kids) = children.get(&cur) {
+                stack.extend(kids.iter().cloned());
+            }
+            all.push(cur);
+        }
+        for nid in all {
+            self.soft_or_hard_delete("notes", &nid)?;
+        }
+        Ok(())
+    }
+
+    /// 待同步条目（含 deleted = 1 的）
+    pub fn dirty_notes(&self) -> Result<Vec<Note>> {
+        let sql =
+            format!("SELECT {NOTE_COLS} FROM notes WHERE dirty = 1 ORDER BY created_ts, rowid");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_note)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_note_page_id(&self, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE notes SET notion_page_id = ?2, dirty = 0 WHERE id = ?1",
+            params![id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_note_dirty(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE notes SET dirty = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn purge_note(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---------- 好想法 ----------
+
+    fn row_to_idea(row: &Row) -> rusqlite::Result<Idea> {
+        Ok(Idea {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            tag: IdeaTag::from_label(&row.get::<_, String>(2)?).unwrap_or(IdeaTag::Inspiration),
+            pinned: row.get::<_, i64>(3)? != 0,
+            created_ts: row.get(4)?,
+            updated_ts: row.get(5)?,
+            notion_page_id: row.get(6)?,
+            dirty: row.get::<_, i64>(7)? != 0,
+            deleted: row.get::<_, i64>(8)? != 0,
+        })
+    }
+
+    pub fn add_idea(&self, content: &str, tag: IdeaTag, pinned: bool, now: i64) -> Result<Idea> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO ideas (id, content, tag, pinned, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, content, tag.label(), pinned, now],
+        )?;
+        Ok(Idea {
+            id,
+            content: content.to_string(),
+            tag,
+            pinned,
+            created_ts: now,
+            updated_ts: now,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    /// 全部未删除想法（置顶优先，再按创建时间倒序）；tag 为 Some 时按标签过滤
+    pub fn all_ideas(&self, tag: Option<IdeaTag>) -> Result<Vec<Idea>> {
+        let (sql, tag_label) = match tag {
+            Some(t) => (
+                format!(
+                    "SELECT {IDEA_COLS} FROM ideas WHERE deleted = 0 AND tag = ?1
+                     ORDER BY pinned DESC, created_ts DESC, rowid DESC"
+                ),
+                Some(t.label().to_string()),
+            ),
+            None => (
+                format!(
+                    "SELECT {IDEA_COLS} FROM ideas WHERE deleted = 0
+                     ORDER BY pinned DESC, created_ts DESC, rowid DESC"
+                ),
+                None,
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match &tag_label {
+            Some(l) => stmt.query_map(params![l], Self::row_to_idea)?,
+            None => stmt.query_map([], Self::row_to_idea)?,
+        };
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 按 id 查询未删除想法
+    pub fn get_idea(&self, id: &str) -> Result<Option<Idea>> {
+        let sql = format!("SELECT {IDEA_COLS} FROM ideas WHERE id = ?1 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::row_to_idea)
+            .optional()?)
+    }
+
+    /// 部分更新想法。返回是否存在该（未删除）行。有任何字段更新时刷新 updated_ts 并置 dirty。
+    pub fn update_idea(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        tag: Option<IdeaTag>,
+        pinned: Option<bool>,
+        now: i64,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(c) = content {
+            sets.push("content = ?");
+            values.push(Box::new(c.to_string()));
+        }
+        if let Some(t) = tag {
+            sets.push("tag = ?");
+            values.push(Box::new(t.label().to_string()));
+        }
+        if let Some(p) = pinned {
+            sets.push("pinned = ?");
+            values.push(Box::new(p));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_idea(id)?.is_some());
+        }
+        sets.push("updated_ts = ?");
+        values.push(Box::new(now));
+        sets.push("dirty = 1");
+        let sql = format!(
+            "UPDATE ideas SET {} WHERE id = ? AND deleted = 0",
+            sets.join(", ")
+        );
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    pub fn delete_idea(&self, id: &str) -> Result<()> {
+        self.soft_or_hard_delete("ideas", id)
+    }
+
+    /// 待同步想法（含 deleted = 1 的）
+    pub fn dirty_ideas(&self) -> Result<Vec<Idea>> {
+        let sql =
+            format!("SELECT {IDEA_COLS} FROM ideas WHERE dirty = 1 ORDER BY created_ts, rowid");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_idea)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_idea_page_id(&self, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ideas SET notion_page_id = ?2, dirty = 0 WHERE id = ?1",
+            params![id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_idea_dirty(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE ideas SET dirty = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn purge_idea(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM ideas WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---------- 今日任务 ----------
+
+    fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
+        Ok(Task {
+            id: row.get(0)?,
+            date: row.get(1)?,
+            title: row.get(2)?,
+            priority: TaskPriority::from_label(&row.get::<_, String>(3)?)
+                .unwrap_or(TaskPriority::Mid),
+            done: row.get::<_, i64>(4)? != 0,
+            created_ts: row.get(5)?,
+            updated_ts: row.get(6)?,
+            notion_page_id: row.get(7)?,
+            dirty: row.get::<_, i64>(8)? != 0,
+            deleted: row.get::<_, i64>(9)? != 0,
+        })
+    }
+
+    pub fn add_task(
+        &self,
+        date: &str,
+        title: &str,
+        priority: TaskPriority,
+        now: i64,
+    ) -> Result<Task> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO tasks (id, date, title, priority, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, date, title, priority.label(), now],
+        )?;
+        Ok(Task {
+            id,
+            date: date.to_string(),
+            title: title.to_string(),
+            priority,
+            done: false,
+            created_ts: now,
+            updated_ts: now,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    /// 指定日期的未删除任务：优先级 高>中>低，未完成在前，再按创建时间升序
+    pub fn tasks_on(&self, date: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE deleted = 0 AND date = ?1
+             ORDER BY CASE priority WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END,
+                      done ASC, created_ts ASC, rowid ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![date], Self::row_to_task)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 按 id 查询未删除任务
+    pub fn get_task(&self, id: &str) -> Result<Option<Task>> {
+        let sql = format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?1 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::row_to_task)
+            .optional()?)
+    }
+
+    /// 部分更新任务。返回是否存在该（未删除）行。有任何字段更新时刷新 updated_ts 并置 dirty。
+    pub fn update_task(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        priority: Option<TaskPriority>,
+        done: Option<bool>,
+        date: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(t) = title {
+            sets.push("title = ?");
+            values.push(Box::new(t.to_string()));
+        }
+        if let Some(p) = priority {
+            sets.push("priority = ?");
+            values.push(Box::new(p.label().to_string()));
+        }
+        if let Some(d) = done {
+            sets.push("done = ?");
+            values.push(Box::new(d));
+        }
+        if let Some(d) = date {
+            sets.push("date = ?");
+            values.push(Box::new(d.to_string()));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_task(id)?.is_some());
+        }
+        sets.push("updated_ts = ?");
+        values.push(Box::new(now));
+        sets.push("dirty = 1");
+        let sql = format!(
+            "UPDATE tasks SET {} WHERE id = ? AND deleted = 0",
+            sets.join(", ")
+        );
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    pub fn delete_task(&self, id: &str) -> Result<()> {
+        self.soft_or_hard_delete("tasks", id)
+    }
+
+    /// 待同步任务（含 deleted = 1 的）
+    pub fn dirty_tasks(&self) -> Result<Vec<Task>> {
+        let sql = format!("SELECT {TASK_COLS} FROM tasks WHERE dirty = 1 ORDER BY created_ts, rowid");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_task)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_task_page_id(&self, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET notion_page_id = ?2, dirty = 0 WHERE id = ?1",
+            params![id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_task_dirty(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE tasks SET dirty = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn purge_task(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---------- 外部记录（/api/ext） ----------
+
+    fn row_to_ext_record(row: &Row) -> rusqlite::Result<ExtRecord> {
+        Ok(ExtRecord {
+            ns: row.get(0)?,
+            id: row.get(1)?,
+            title: row.get(2)?,
+            props_json: row.get(3)?,
+            content_md: row.get(4)?,
+            created_ts: row.get(5)?,
+            updated_ts: row.get(6)?,
+            notion_page_id: row.get(7)?,
+            dirty: row.get::<_, i64>(8)? != 0,
+            deleted: row.get::<_, i64>(9)? != 0,
+        })
+    }
+
+    pub fn insert_ext_record(
+        &self,
+        ns: &str,
+        id: &str,
+        title: &str,
+        props_json: &str,
+        content_md: &str,
+        now: i64,
+    ) -> Result<ExtRecord> {
+        self.conn.execute(
+            "INSERT INTO ext_records (ns, id, title, props_json, content_md, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![ns, id, title, props_json, content_md, now],
+        )?;
+        Ok(ExtRecord {
+            ns: ns.to_string(),
+            id: id.to_string(),
+            title: title.to_string(),
+            props_json: props_json.to_string(),
+            content_md: content_md.to_string(),
+            created_ts: now,
+            updated_ts: now,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+        })
+    }
+
+    /// 按 (ns, id) 查询未删除记录
+    pub fn get_ext_record(&self, ns: &str, id: &str) -> Result<Option<ExtRecord>> {
+        let sql = format!(
+            "SELECT {EXT_RECORD_COLS} FROM ext_records WHERE ns = ?1 AND id = ?2 AND deleted = 0"
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![ns, id], Self::row_to_ext_record)
+            .optional()?)
+    }
+
+    /// 命名空间下全部未删除记录（按更新时间倒序）
+    pub fn ext_records(&self, ns: &str) -> Result<Vec<ExtRecord>> {
+        let sql = format!(
+            "SELECT {EXT_RECORD_COLS} FROM ext_records
+             WHERE ns = ?1 AND deleted = 0 ORDER BY updated_ts DESC, rowid DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![ns], Self::row_to_ext_record)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 部分更新记录。返回是否存在该（未删除）行。有任何字段更新时刷新 updated_ts 并置 dirty。
+    pub fn update_ext_record(
+        &self,
+        ns: &str,
+        id: &str,
+        title: Option<&str>,
+        props_json: Option<&str>,
+        content_md: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(t) = title {
+            sets.push("title = ?");
+            values.push(Box::new(t.to_string()));
+        }
+        if let Some(p) = props_json {
+            sets.push("props_json = ?");
+            values.push(Box::new(p.to_string()));
+        }
+        if let Some(c) = content_md {
+            sets.push("content_md = ?");
+            values.push(Box::new(c.to_string()));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_ext_record(ns, id)?.is_some());
+        }
+        sets.push("updated_ts = ?");
+        values.push(Box::new(now));
+        sets.push("dirty = 1");
+        let sql = format!(
+            "UPDATE ext_records SET {} WHERE ns = ? AND id = ? AND deleted = 0",
+            sets.join(", ")
+        );
+        values.push(Box::new(ns.to_string()));
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    /// 已同步过的记录软删（待远端归档），未同步过的直接物理删
+    pub fn delete_ext_record(&self, ns: &str, id: &str) -> Result<()> {
+        let page_id: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT notion_page_id FROM ext_records WHERE ns = ?1 AND id = ?2",
+                params![ns, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match page_id.flatten() {
+            Some(_) => {
+                self.conn.execute(
+                    "UPDATE ext_records SET deleted = 1, dirty = 1 WHERE ns = ?1 AND id = ?2",
+                    params![ns, id],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM ext_records WHERE ns = ?1 AND id = ?2",
+                    params![ns, id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 待同步记录（含 deleted = 1 的）
+    pub fn dirty_ext_records(&self) -> Result<Vec<ExtRecord>> {
+        let sql = format!(
+            "SELECT {EXT_RECORD_COLS} FROM ext_records WHERE dirty = 1 ORDER BY created_ts, rowid"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_ext_record)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_ext_record_page_id(&self, ns: &str, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ext_records SET notion_page_id = ?3, dirty = 0 WHERE ns = ?1 AND id = ?2",
+            params![ns, id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_ext_record_dirty(&self, ns: &str, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ext_records SET dirty = 0 WHERE ns = ?1 AND id = ?2",
+            params![ns, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn purge_ext_record(&self, ns: &str, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ext_records WHERE ns = ?1 AND id = ?2",
+            params![ns, id],
+        )?;
+        Ok(())
+    }
+
+    /// 命名空间 → Notion 根页 id 映射（同步用）
+    pub fn ext_namespaces(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ns, notion_page_id FROM ext_namespaces")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_ext_namespace_page_id(&self, ns: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ext_namespaces (ns, notion_page_id) VALUES (?1, ?2)",
+            params![ns, page_id],
+        )?;
+        Ok(())
+    }
+
+    // ---------- 删除公共逻辑 ----------
+
+    /// 待同步（dirty = 1）行总数
+    pub fn pending_count(&self) -> Result<usize> {
+        let mut total = 0i64;
+        for table in [
+            "events",
+            "expenses",
+            "projects",
+            "notes",
+            "ext_records",
+            "ideas",
+            "tasks",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE dirty = 1");
+            total += self.conn.query_row(&sql, [], |r| r.get::<_, i64>(0))?;
+        }
+        Ok(total as usize)
+    }
+
+    /// 已同步过的行软删除（等同步任务归档远端后清除），未同步过的行直接物理删除
+    fn soft_or_hard_delete(&self, table: &str, id: &str) -> Result<()> {
+        let sql = format!("SELECT notion_page_id FROM {table} WHERE id = ?1");
+        let page_id: Option<Option<String>> = self
+            .conn
+            .query_row(&sql, params![id], |r| r.get(0))
+            .optional()?;
+        match page_id.flatten() {
+            Some(_) => {
+                let sql = format!("UPDATE {table} SET deleted = 1, dirty = 1 WHERE id = ?1");
+                self.conn.execute(&sql, params![id])?;
+            }
+            None => {
+                let sql = format!("DELETE FROM {table} WHERE id = ?1");
+                self.conn.execute(&sql, params![id])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_lifecycle() {
+        let db = Db::in_memory().unwrap();
+        let ev = db.create_event(1000).unwrap();
+        assert!(ev.dirty);
+        assert_eq!(db.ongoing_event().unwrap().unwrap().id, ev.id);
+
+        db.finish_event(&ev.id, 4600, "写代码", Tag::Work).unwrap();
+        assert!(db.ongoing_event().unwrap().is_none());
+
+        let list = db.events_between(0, 10000, 10000).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].end_ts, Some(4600));
+        assert_eq!(list[0].content, "写代码");
+        assert_eq!(list[0].tag, Tag::Work);
+
+        let dirty = db.dirty_events().unwrap();
+        assert_eq!(dirty.len(), 1);
+        db.set_event_page_id(&ev.id, "page-1").unwrap();
+        assert!(db.dirty_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn events_between_overlap_semantics() {
+        let db = Db::in_memory().unwrap();
+        // 跨天事件 23:00 -> 次日 01:00（相对范围）
+        let ev = db.create_event(100).unwrap();
+        db.finish_event(&ev.id, 300, "x", Tag::Life).unwrap();
+        // 范围完全在事件之前
+        assert!(db.events_between(0, 100, 1000).unwrap().is_empty());
+        // 范围完全在事件之后（start < to 不满足）
+        assert!(db.events_between(300, 400, 1000).unwrap().is_empty());
+        // 部分重叠
+        assert_eq!(db.events_between(0, 150, 1000).unwrap().len(), 1);
+        assert_eq!(db.events_between(250, 400, 1000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_unsynced_row_is_hard() {
+        let db = Db::in_memory().unwrap();
+        let ev = db.create_event(1000).unwrap();
+        db.delete_event(&ev.id).unwrap();
+        assert!(db.events_between(0, 99999, 99999).unwrap().is_empty());
+        // 物理删除，不产生 dirty 行
+        assert!(db.dirty_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_synced_row_is_soft_then_purge() {
+        let db = Db::in_memory().unwrap();
+        let ev = db.create_event(1000).unwrap();
+        db.finish_event(&ev.id, 2000, "x", Tag::Life).unwrap();
+        db.set_event_page_id(&ev.id, "page-1").unwrap();
+        db.delete_event(&ev.id).unwrap();
+        // 列表中不可见，但 dirty 行中包含 deleted 记录
+        assert!(db.events_between(0, 99999, 99999).unwrap().is_empty());
+        let dirty = db.dirty_events().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty[0].deleted);
+        db.purge_event(&ev.id).unwrap();
+        assert!(db.dirty_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn expense_crud() {
+        let db = Db::in_memory().unwrap();
+        let e1 = db.add_expense("午饭", 2500, 100, Category::Food).unwrap();
+        let _e2 = db
+            .add_expense("地铁", 400, 200, Category::Transport)
+            .unwrap();
+        let all = db.all_expenses().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].item, "地铁"); // 按时间倒序
+        let ranged = db.expenses_between(0, 150).unwrap();
+        assert_eq!(ranged.len(), 1);
+        assert_eq!(ranged[0].amount_cents, 2500);
+
+        db.set_expense_page_id(&e1.id, "p").unwrap();
+        db.delete_expense(&e1.id).unwrap();
+        assert_eq!(db.all_expenses().unwrap().len(), 1);
+        let dirty = db.dirty_expenses().unwrap();
+        assert!(dirty.iter().any(|e| e.deleted));
+    }
+
+    #[test]
+    fn project_crud_and_status() {
+        let db = Db::in_memory().unwrap();
+        let p = db
+            .add_project("Latte", ProjectStatus::Doing, Some(100), None, "备注")
+            .unwrap();
+        let list = db.all_projects().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, ProjectStatus::Doing);
+
+        db.set_project_status(&p.id, ProjectStatus::Done).unwrap();
+        let list = db.all_projects().unwrap();
+        assert_eq!(list[0].status, ProjectStatus::Done);
+        assert!(db.dirty_projects().unwrap().iter().any(|x| x.id == p.id));
+
+        db.clear_project_dirty(&p.id).unwrap();
+        assert!(db.dirty_projects().unwrap().is_empty());
+
+        db.delete_project(&p.id).unwrap();
+        assert!(db.all_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_event_partial_fields() {
+        let db = Db::in_memory().unwrap();
+        let ev = db.create_event(1000).unwrap();
+        db.finish_event(&ev.id, 2000, "旧内容", Tag::Life).unwrap();
+        db.clear_event_dirty(&ev.id).unwrap();
+
+        // 只改内容，其余字段不变，且重新置 dirty
+        assert!(
+            db.update_event(&ev.id, Some("新内容"), None, None, None, None)
+                .unwrap()
+        );
+        let e = db.get_event(&ev.id).unwrap().unwrap();
+        assert_eq!(e.content, "新内容");
+        assert_eq!(e.tag, Tag::Life);
+        assert_eq!(e.start_ts, 1000);
+        assert_eq!(e.end_ts, Some(2000));
+        assert!(e.dirty);
+
+        // 显式清空 end_ts（重新打开事件），并打开提醒
+        db.update_event(
+            &ev.id,
+            None,
+            Some(Tag::Work),
+            Some(500),
+            Some(None),
+            Some(true),
+        )
+        .unwrap();
+        let e = db.get_event(&ev.id).unwrap().unwrap();
+        assert_eq!(e.content, "新内容");
+        assert_eq!(e.tag, Tag::Work);
+        assert_eq!(e.start_ts, 500);
+        assert_eq!(e.end_ts, None);
+        assert!(e.remind);
+
+        // 不存在的 id 返回 false
+        assert!(
+            !db.update_event("nope", Some("x"), None, None, None, None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn add_event_full_roundtrip() {
+        let db = Db::in_memory().unwrap();
+        let ev = db
+            .add_event_full(1000, Some(2000), "补录会议", Tag::Work, true)
+            .unwrap();
+        assert!(ev.dirty);
+        let e = db.get_event(&ev.id).unwrap().unwrap();
+        assert_eq!(e.start_ts, 1000);
+        assert_eq!(e.end_ts, Some(2000));
+        assert_eq!(e.content, "补录会议");
+        assert_eq!(e.tag, Tag::Work);
+        assert!(e.remind);
+
+        // end_ts 为空的计划事件会被 ongoing_event 视为进行中
+        let ev2 = db
+            .add_event_full(3000, None, "计划", Tag::Reading, false)
+            .unwrap();
+        assert_eq!(db.ongoing_event().unwrap().unwrap().id, ev2.id);
+        assert!(!db.get_event(&ev2.id).unwrap().unwrap().remind);
+    }
+
+    #[test]
+    fn migrate_adds_remind_column_to_old_db() {
+        let path = std::env::temp_dir().join(format!("latte-test-{}.db", Uuid::new_v4()));
+        // 先造一个旧版 schema（无 remind 列）的库，并写入一行
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id TEXT PRIMARY KEY,
+                    start_ts INTEGER NOT NULL,
+                    end_ts INTEGER,
+                    content TEXT NOT NULL DEFAULT '',
+                    tag TEXT NOT NULL DEFAULT '生活',
+                    notion_page_id TEXT,
+                    dirty INTEGER NOT NULL DEFAULT 1,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO events (id, start_ts, end_ts, content, tag)
+                VALUES ('old', 1000, 2000, '旧事', '工作');",
+            )
+            .unwrap();
+        }
+        // 打开后应自动迁移：旧行 remind 默认为 false，新写入可带 remind
+        let db = Db::open(&path).unwrap();
+        let old = db.get_event("old").unwrap().unwrap();
+        assert!(!old.remind);
+        assert_eq!(old.content, "旧事");
+        let ev = db
+            .add_event_full(3000, None, "新事", Tag::Life, true)
+            .unwrap();
+        assert!(db.get_event(&ev.id).unwrap().unwrap().remind);
+        drop(db);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn update_expense_partial_fields() {
+        let db = Db::in_memory().unwrap();
+        let ex = db.add_expense("午饭", 2500, 100, Category::Food).unwrap();
+        assert!(
+            db.update_expense(&ex.id, None, Some(3000), None, Some(Category::Fun))
+                .unwrap()
+        );
+        let e = db.get_expense(&ex.id).unwrap().unwrap();
+        assert_eq!(e.item, "午饭");
+        assert_eq!(e.amount_cents, 3000);
+        assert_eq!(e.ts, 100);
+        assert_eq!(e.category, Category::Fun);
+        assert!(
+            !db.update_expense("nope", Some("x"), None, None, None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn update_project_partial_fields() {
+        let db = Db::in_memory().unwrap();
+        let p = db
+            .add_project("Latte", ProjectStatus::Doing, Some(100), None, "备注")
+            .unwrap();
+        db.update_project(
+            &p.id,
+            None,
+            Some(ProjectStatus::Paused),
+            None,
+            Some(Some(999)),
+            None,
+        )
+        .unwrap();
+        let p2 = db.get_project(&p.id).unwrap().unwrap();
+        assert_eq!(p2.name, "Latte");
+        assert_eq!(p2.status, ProjectStatus::Paused);
+        assert_eq!(p2.start_ts, Some(100));
+        assert_eq!(p2.deadline_ts, Some(999));
+        assert_eq!(p2.note, "备注");
+
+        // 显式清空 deadline
+        db.update_project(&p.id, None, None, None, Some(None), None)
+            .unwrap();
+        assert_eq!(db.get_project(&p.id).unwrap().unwrap().deadline_ts, None);
+        assert!(
+            !db.update_project("nope", Some("x"), None, None, None, None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn note_crud_and_tree_order() {
+        let db = Db::in_memory().unwrap();
+        let dir = db.add_note(None, NoteKind::Dir, "根目录", "", 100).unwrap();
+        assert!(dir.dirty);
+        let doc = db
+            .add_note(Some(&dir.id), NoteKind::Doc, "文档", "# 你好", 200)
+            .unwrap();
+        let all = db.all_notes().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, dir.id); // 按 created_ts 排序
+        assert_eq!(all[1].parent_id.as_deref(), Some(dir.id.as_str()));
+        assert_eq!(all[1].kind, NoteKind::Doc);
+
+        // 部分更新：改标题 + 移到根
+        db.clear_note_dirty(&doc.id).unwrap();
+        assert!(
+            db.update_note(&doc.id, Some("新标题"), None, Some(None), 300)
+                .unwrap()
+        );
+        let n = db.get_note(&doc.id).unwrap().unwrap();
+        assert_eq!(n.title, "新标题");
+        assert_eq!(n.content_md, "# 你好");
+        assert_eq!(n.parent_id, None);
+        assert_eq!(n.updated_ts, 300);
+        assert!(n.dirty);
+        assert!(!db.update_note("nope", Some("x"), None, None, 400).unwrap());
+    }
+
+    #[test]
+    fn note_cycle_detection() {
+        let db = Db::in_memory().unwrap();
+        let a = db.add_note(None, NoteKind::Dir, "A", "", 1).unwrap();
+        let b = db.add_note(Some(&a.id), NoteKind::Dir, "B", "", 2).unwrap();
+        let c = db.add_note(Some(&b.id), NoteKind::Doc, "C", "", 3).unwrap();
+
+        // A 移到自己或子孙 B 下 → 成环
+        assert!(db.note_would_cycle(&a.id, &a.id).unwrap());
+        assert!(db.note_would_cycle(&a.id, &b.id).unwrap());
+        // C 移到 A 下（跨分支）、B 保持在 A 下 → 不成环
+        assert!(!db.note_would_cycle(&c.id, &a.id).unwrap());
+        assert!(!db.note_would_cycle(&b.id, &a.id).unwrap());
+        // 不存在的 parent 不成环（由 API 层另外校验存在性）
+        assert!(!db.note_would_cycle(&a.id, "ghost").unwrap());
+    }
+
+    #[test]
+    fn note_recursive_delete_soft_and_hard() {
+        let db = Db::in_memory().unwrap();
+        let dir = db.add_note(None, NoteKind::Dir, "A", "", 1).unwrap();
+        let sub = db
+            .add_note(Some(&dir.id), NoteKind::Dir, "B", "", 2)
+            .unwrap();
+        let doc = db
+            .add_note(Some(&sub.id), NoteKind::Doc, "C", "", 3)
+            .unwrap();
+        // dir 已同步过，sub/doc 未同步
+        db.set_note_page_id(&dir.id, "page-a").unwrap();
+
+        db.delete_note_recursive(&dir.id).unwrap();
+        // 全部从可见列表消失
+        assert!(db.all_notes().unwrap().is_empty());
+        assert!(db.get_note(&doc.id).unwrap().is_none());
+        // dir 软删（dirty + deleted），sub/doc 物理删除
+        let dirty = db.dirty_notes().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].id, dir.id);
+        assert!(dirty[0].deleted);
+        assert!(db.all_notes_any().unwrap().iter().all(|n| n.id == dir.id));
+        db.purge_note(&dir.id).unwrap();
+        assert!(db.all_notes_any().unwrap().is_empty());
+    }
+
+    #[test]
+    fn old_db_without_notes_table_opens_and_works() {
+        let path = std::env::temp_dir().join(format!("latte-test-{}.db", Uuid::new_v4()));
+        // 旧版 schema：只有 3 张表，无 notes
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id TEXT PRIMARY KEY,
+                    start_ts INTEGER NOT NULL,
+                    end_ts INTEGER,
+                    content TEXT NOT NULL DEFAULT '',
+                    tag TEXT NOT NULL DEFAULT '生活',
+                    notion_page_id TEXT,
+                    dirty INTEGER NOT NULL DEFAULT 1,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE expenses (
+                    id TEXT PRIMARY KEY,
+                    item TEXT NOT NULL DEFAULT '',
+                    amount_cents INTEGER NOT NULL DEFAULT 0,
+                    ts INTEGER NOT NULL,
+                    category TEXT NOT NULL DEFAULT '其他',
+                    notion_page_id TEXT,
+                    dirty INTEGER NOT NULL DEFAULT 1,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '进行中',
+                    start_ts INTEGER,
+                    deadline_ts INTEGER,
+                    note TEXT NOT NULL DEFAULT '',
+                    notion_page_id TEXT,
+                    dirty INTEGER NOT NULL DEFAULT 1,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        }
+        // 打开后 notes 表自动建好，可正常读写
+        let db = Db::open(&path).unwrap();
+        let dir = db.add_note(None, NoteKind::Dir, "目录", "", 1).unwrap();
+        assert_eq!(db.all_notes().unwrap().len(), 1);
+        assert_eq!(db.pending_count().unwrap(), 1);
+        db.delete_note_recursive(&dir.id).unwrap();
+        assert_eq!(db.pending_count().unwrap(), 0);
+        drop(db);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ext_record_upsert_list_delete() {
+        let db = Db::in_memory().unwrap();
+        let r1 = db
+            .insert_ext_record("agents", "task-1", "任务一", "{}", "", 100)
+            .unwrap();
+        assert!(r1.dirty);
+        db.insert_ext_record("agents", "task-2", "任务二", "{}", "正文", 200)
+            .unwrap();
+        // 其他命名空间互不影响
+        db.insert_ext_record("wiki", "task-1", "同名", "{}", "", 300)
+            .unwrap();
+
+        // 列表按 updated_ts 倒序
+        let list = db.ext_records("agents").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "task-2");
+        assert_eq!(list[1].id, "task-1");
+
+        // upsert 更新：只改出现的字段，刷 updated_ts/dirty
+        db.clear_ext_record_dirty("agents", "task-1").unwrap();
+        assert!(
+            db.update_ext_record(
+                "agents",
+                "task-1",
+                Some("改名"),
+                Some("{\"a\":1}"),
+                None,
+                400
+            )
+            .unwrap()
+        );
+        let r = db.get_ext_record("agents", "task-1").unwrap().unwrap();
+        assert_eq!(r.title, "改名");
+        assert_eq!(r.props_json, "{\"a\":1}");
+        assert_eq!(r.content_md, "");
+        assert_eq!(r.created_ts, 100);
+        assert_eq!(r.updated_ts, 400);
+        assert!(r.dirty);
+        assert_eq!(db.ext_records("agents").unwrap()[0].id, "task-1");
+        assert!(
+            !db.update_ext_record("agents", "nope", Some("x"), None, None, 500)
+                .unwrap()
+        );
+
+        // 删除语义：未同步物理删，已同步软删 + purge
+        db.delete_ext_record("agents", "task-2").unwrap();
+        assert!(db.get_ext_record("agents", "task-2").unwrap().is_none());
+        assert!(
+            db.dirty_ext_records()
+                .unwrap()
+                .iter()
+                .all(|r| r.id != "task-2")
+        );
+        db.set_ext_record_page_id("agents", "task-1", "page-1")
+            .unwrap();
+        db.delete_ext_record("agents", "task-1").unwrap();
+        assert!(db.ext_records("agents").unwrap().is_empty());
+        // dirty 行：agents/task-1 软删（wiki/task-1 从未清过 dirty，也在其中）
+        let dirty = db.dirty_ext_records().unwrap();
+        let deleted: Vec<_> = dirty.iter().filter(|r| r.deleted).collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].ns, "agents");
+        db.purge_ext_record("agents", "task-1").unwrap();
+        assert!(
+            db.dirty_ext_records()
+                .unwrap()
+                .iter()
+                .all(|r| r.ns == "wiki")
+        );
+        // wiki 命名空间的同名记录不受影响
+        assert_eq!(db.ext_records("wiki").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ext_namespace_page_id_roundtrip() {
+        let db = Db::in_memory().unwrap();
+        assert!(db.ext_namespaces().unwrap().is_empty());
+        db.set_ext_namespace_page_id("agents", "page-ns").unwrap();
+        assert_eq!(
+            db.ext_namespaces().unwrap(),
+            vec![("agents".to_string(), "page-ns".to_string())]
+        );
+    }
+
+    #[test]
+    fn idea_crud_order_and_tag_filter() {
+        let db = Db::in_memory().unwrap();
+        let i1 = db
+            .add_idea("旧灵感", IdeaTag::Inspiration, false, 100)
+            .unwrap();
+        let i2 = db.add_idea("新待办", IdeaTag::Todo, false, 200).unwrap();
+        let i3 = db.add_idea("置顶读书", IdeaTag::Reading, true, 50).unwrap();
+        assert!(i1.dirty && !i1.pinned);
+
+        // 排序：置顶优先，其余按 created_ts 倒序
+        let all = db.all_ideas(None).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, i3.id);
+        assert_eq!(all[1].id, i2.id);
+        assert_eq!(all[2].id, i1.id);
+
+        // tag 过滤
+        let todos = db.all_ideas(Some(IdeaTag::Todo)).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "新待办");
+
+        // 部分更新：只改 pinned，刷 updated_ts 并重新置 dirty
+        db.clear_idea_dirty(&i2.id).unwrap();
+        assert!(db.update_idea(&i2.id, None, None, Some(true), 300).unwrap());
+        let idea = db.get_idea(&i2.id).unwrap().unwrap();
+        assert_eq!(idea.content, "新待办");
+        assert_eq!(idea.tag, IdeaTag::Todo);
+        assert!(idea.pinned);
+        assert_eq!(idea.created_ts, 200);
+        assert_eq!(idea.updated_ts, 300);
+        assert!(idea.dirty);
+        // 改内容与标签
+        assert!(
+            db.update_idea(&i2.id, Some("改内容"), Some(IdeaTag::Question), None, 400)
+                .unwrap()
+        );
+        let idea = db.get_idea(&i2.id).unwrap().unwrap();
+        assert_eq!(idea.content, "改内容");
+        assert_eq!(idea.tag, IdeaTag::Question);
+        assert!(!db.update_idea("nope", Some("x"), None, None, 500).unwrap());
+        assert!(db.get_idea("nope").unwrap().is_none());
+
+        // 删除语义：未同步物理删，已同步软删 + purge
+        db.delete_idea(&i1.id).unwrap();
+        assert!(db.get_idea(&i1.id).unwrap().is_none());
+        assert!(db.dirty_ideas().unwrap().iter().all(|i| i.id != i1.id));
+        db.set_idea_page_id(&i3.id, "page-1").unwrap();
+        db.delete_idea(&i3.id).unwrap();
+        assert_eq!(db.all_ideas(None).unwrap().len(), 1);
+        let dirty = db.dirty_ideas().unwrap();
+        assert!(dirty.iter().any(|i| i.id == i3.id && i.deleted));
+        db.purge_idea(&i3.id).unwrap();
+        assert!(db.dirty_ideas().unwrap().iter().all(|i| i.id != i3.id));
+
+        // pending_count 计入 ideas
+        assert!(db.pending_count().unwrap() > 0);
+        let dirty_ids: Vec<String> = db
+            .dirty_ideas()
+            .unwrap()
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        for id in dirty_ids {
+            db.clear_idea_dirty(&id).unwrap();
+        }
+        assert_eq!(db.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_count_counts_dirty_rows() {
+        let db = Db::in_memory().unwrap();
+        assert_eq!(db.pending_count().unwrap(), 0);
+        let ev = db.create_event(1000).unwrap();
+        let ex = db.add_expense("x", 100, 100, Category::Other).unwrap();
+        assert_eq!(db.pending_count().unwrap(), 2);
+        db.clear_event_dirty(&ev.id).unwrap();
+        db.clear_expense_dirty(&ex.id).unwrap();
+        assert_eq!(db.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn task_crud_order_filter_and_delete() {
+        let db = Db::in_memory().unwrap();
+        let t1 = db
+            .add_task("2024-08-01", "低优先", TaskPriority::Low, 100)
+            .unwrap();
+        let t2 = db
+            .add_task("2024-08-01", "高优先", TaskPriority::High, 200)
+            .unwrap();
+        let t3 = db
+            .add_task("2024-08-01", "中优先", TaskPriority::Mid, 300)
+            .unwrap();
+        let _other_day = db
+            .add_task("2024-08-02", "明天的", TaskPriority::High, 400)
+            .unwrap();
+        assert!(t1.dirty && !t1.done);
+
+        // 按日期过滤 + 排序：高 > 中 > 低
+        let list = db.tasks_on("2024-08-01").unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].id, t2.id);
+        assert_eq!(list[1].id, t3.id);
+        assert_eq!(list[2].id, t1.id);
+
+        // 完成的排到最后（同级优先级内未完成在前）
+        db.update_task(&t2.id, None, None, Some(true), None, 500)
+            .unwrap();
+        let list = db.tasks_on("2024-08-01").unwrap();
+        assert_eq!(list[0].id, t3.id);
+        assert_eq!(list[1].id, t1.id);
+        assert_eq!(list[2].id, t2.id);
+
+        // 部分更新：改标题/日期/优先级，刷 updated_ts 并重新置 dirty
+        db.clear_task_dirty(&t1.id).unwrap();
+        assert!(
+            db.update_task(
+                &t1.id,
+                Some("改名"),
+                Some(TaskPriority::High),
+                None,
+                Some("2024-08-03"),
+                600,
+            )
+            .unwrap()
+        );
+        let task = db.get_task(&t1.id).unwrap().unwrap();
+        assert_eq!(task.title, "改名");
+        assert_eq!(task.priority, TaskPriority::High);
+        assert_eq!(task.date, "2024-08-03");
+        assert_eq!(task.created_ts, 100);
+        assert_eq!(task.updated_ts, 600);
+        assert!(task.dirty);
+        // 已移到 8-03，8-01 列表不再包含
+        assert!(db.tasks_on("2024-08-01").unwrap().iter().all(|t| t.id != t1.id));
+        assert_eq!(db.tasks_on("2024-08-03").unwrap().len(), 1);
+        assert!(
+            !db.update_task("nope", Some("x"), None, None, None, 700)
+                .unwrap()
+        );
+
+        // 删除语义：未同步物理删，已同步软删 + purge
+        db.delete_task(&t3.id).unwrap();
+        assert!(db.get_task(&t3.id).unwrap().is_none());
+        assert!(db.dirty_tasks().unwrap().iter().all(|t| t.id != t3.id));
+        db.set_task_page_id(&t2.id, "page-1").unwrap();
+        db.delete_task(&t2.id).unwrap();
+        assert_eq!(db.tasks_on("2024-08-01").unwrap().len(), 0);
+        let dirty = db.dirty_tasks().unwrap();
+        assert!(dirty.iter().any(|t| t.id == t2.id && t.deleted));
+        db.purge_task(&t2.id).unwrap();
+        assert!(db.dirty_tasks().unwrap().iter().all(|t| t.id != t2.id));
+
+        // pending_count 计入 tasks
+        assert!(db.pending_count().unwrap() > 0);
+        let dirty_ids: Vec<String> = db
+            .dirty_tasks()
+            .unwrap()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        for id in dirty_ids {
+            db.clear_task_dirty(&id).unwrap();
+        }
+        assert_eq!(db.pending_count().unwrap(), 0);
+    }
+}
