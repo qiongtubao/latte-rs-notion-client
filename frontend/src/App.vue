@@ -104,7 +104,17 @@ let pollTimer = null
 
 const todayStr = computed(() => dayjs().format('M月D日 dddd'))
 
-// ---------- 浮动按钮配置 ----------
+// 视图映射：浮动按钮 key → 对应视图组件（面板内渲染）
+const viewMap = {
+  today: TodayView,
+  time: TimeView,
+  money: MoneyView,
+  calendar: CalendarView,
+  projects: ProjectsView,
+  notes: NotesView,
+  ideas: IdeasView,
+}
+
 const floatButtons = [
   { key: 'today', icon: '☑', label: '今日任务', color: '#409eff', x: 70, y: 220,
     subs: [

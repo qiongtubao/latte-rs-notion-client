@@ -16,12 +16,12 @@
       <span class="fab-tooltip">{{ label }}</span>
     </button>
 
-    <!-- 子按钮：左侧分布，点击主按钮后显示 -->
+    <!-- 子按钮：围绕主按钮圆心，按数量均匀分布在左侧 150°，点击主按钮后显示 -->
     <button
       v-for="(s, i) in subs"
       :key="i"
       class="fab-sub"
-      :class="s.pos || ('p' + (i + 1))"
+      :style="subPos(i)"
       :title="s.label"
       @click.stop="handleSub(s)"
     >
@@ -32,7 +32,7 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 
 const props = defineProps({
   id: { type: String, required: true },
@@ -46,7 +46,6 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['open', 'toggle', 'sub'])
-
 const propsColor = computed(() => props.color)
 
 // ---- 位置持久化（localStorage）----
@@ -56,16 +55,33 @@ function loadPos() {
     const raw = localStorage.getItem(STORE_KEY)
     if (raw) {
       const p = JSON.parse(raw)
-      if (typeof p.x === 'number' && typeof p.y === 'number') return p
+      if (typeof p.x === 'number' && typeof p.y === 'number') return { x: p.x, y: p.y }
     }
   } catch { /* 忽略损坏数据 */ }
   return { x: props.x, y: props.y ?? window.innerHeight - 120 }
 }
-const pos = ref(loadPos())
+const pos = reactive(loadPos())
 function savePos() {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({ x: pos.value.x, y: pos.value.y }))
+    localStorage.setItem(STORE_KEY, JSON.stringify({ x: pos.x, y: pos.y }))
   } catch { /* 忽略存储失败 */ }
+}
+
+// ---- 子按钮位置：按数量均匀分布在左侧 150° 扇形 ----
+const SUB_RADIUS = 74
+function subPos(i) {
+  const n = props.subs.length
+  if (n <= 1) {
+    return { left: '65px', top: '65px', transform: 'translate(-60px, 0)' }
+  }
+  const startDeg = -105
+  const endDeg = -15
+  const deg = startDeg + ((endDeg - startDeg) * i) / Math.max(1, n - 1)
+  const rad = (deg * Math.PI) / 180
+  return {
+    left: (65 + SUB_RADIUS * Math.cos(rad)) + 'px',
+    top: (65 + SUB_RADIUS * Math.sin(rad)) + 'px',
+  }
 }
 
 const opened = ref(false)
@@ -76,23 +92,23 @@ function onUp() {
   dragging = false
   window.removeEventListener('mousemove', onMove)
   window.removeEventListener('mouseup', onUp)
-  if (moved) savePos()   // 拖拽过才保存位置
+  if (moved) savePos()
 }
 function onDown(e) {
   if (e.button !== 0) return
   e.preventDefault()
   dragging = true
   moved = false
-  ox = e.clientX - pos.value.x
-  oy = e.clientY - pos.value.y
+  ox = e.clientX - pos.x
+  oy = e.clientY - pos.y
   window.addEventListener('mousemove', onMove)
   window.addEventListener('mouseup', onUp)
 }
 function onMove(e) {
   if (!dragging) return
   moved = true
-  pos.value.x = Math.max(40, Math.min(e.clientX - ox, window.innerWidth - 40))
-  pos.value.y = Math.max(50, Math.min(e.clientY - oy, window.innerHeight - 40))
+  pos.x = Math.max(40, Math.min(e.clientX - ox, window.innerWidth - 40))
+  pos.y = Math.max(50, Math.min(e.clientY - oy, window.innerHeight - 50))
 }
 function onClick(e) {
   e.stopPropagation()
@@ -105,8 +121,7 @@ function handleSub(s) {
   if (s.handler) s.handler()
   else emit('sub', s)
 }
-// 供父组件读取是否已打开
-defineExpose({ getPos: () => ({ ...pos.value }), getOpened: () => opened.value })
+defineExpose({ getPos: () => ({ ...pos }), getOpened: () => opened.value })
 </script>
 
 <style scoped>
@@ -191,12 +206,7 @@ defineExpose({ getPos: () => ({ ...pos.value }), getOpened: () => opened.value }
   pointer-events: auto;
   transform: translate(0, 0) scale(1);
 }
-/* 左侧分布位置 */
-.fab-sub.p1 { left: 8%; }                       /* 上 */
-.fab-sub.p2 { left: 8%; top: 16%; }              /* 左上 */
-.fab-sub.p3 { left: -4%; top: 50%; }             /* 左 */
-.fab-sub.p4 { left: 8%; top: 84%; }              /* 左下 */
-.fab-sub.p5 { left: 50%; top: 100%; }            /* 下 */
+/* 子按钮位置由 JS（subPos）通过 left/top 内联指定 */
 .fab-subtip {
   position: absolute;
   right: 40px;
