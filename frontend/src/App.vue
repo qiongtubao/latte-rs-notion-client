@@ -35,10 +35,11 @@
       </div>
     </main>
 
-      :id="fb.key"
-      :icon="fb.icon"
+    <!-- 浮动按钮层 -->
+    <FloatingButton
       v-for="fb in floatButtons"
       :key="fb.key"
+      :id="fb.key"
       :icon="fb.icon"
       :label="fb.label"
       :color="fb.color"
