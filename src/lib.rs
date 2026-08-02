@@ -10,4 +10,5 @@ pub mod db;
 pub mod models;
 pub mod notion;
 pub mod report;
+pub mod server;
 pub mod sync;

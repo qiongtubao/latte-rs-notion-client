@@ -57,4 +57,7 @@ export const api = {
   createTask: (data) => unwrap(http.post('/tasks', data)),
   updateTask: (id, data) => unwrap(http.put(`/tasks/${id}`, data)),
   deleteTask: (id) => unwrap(http.delete(`/tasks/${id}`)),
+  rolloverTasks: (from, to) => unwrap(http.post('/tasks/rollover', { from, to })),
+  pomodoroTask: (id) => unwrap(http.post(`/tasks/${id}/pomodoro`)),
+  getOngoingEvent: () => unwrap(http.get('/events/ongoing')),
 }

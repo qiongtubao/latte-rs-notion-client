@@ -205,9 +205,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/ideas", get(list_ideas).post(add_idea))
         .route("/api/ideas/{id}", put(update_idea).delete(delete_idea))
+        .route("/api/tasks/rollover", post(rollover_tasks))
+        .route("/api/tasks/{id}/pomodoro", post(pomodoro_task))
         .route("/api/tasks", get(list_tasks).post(add_task))
         .route("/api/tasks/{id}", put(update_task).delete(delete_task))
-        .route("/api/sync", post(sync_now))
+        .route("/api/events/ongoing", get(ongoing_event))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_configured,
@@ -1255,7 +1257,6 @@ async fn delete_idea(
 }
 
 // ---------------- 今日任务 ----------------
-
 /// 任务完整对象（不含同步内部字段）
 fn task_json(t: &Task) -> Value {
     json!({
@@ -1263,6 +1264,11 @@ fn task_json(t: &Task) -> Value {
         "date": t.date,
         "title": t.title,
         "priority": t.priority.label(),
+        "important": t.important,
+        "urgent": t.urgent,
+        "pomodoro_count": t.pomodoro_count,
+        "estimated_minutes": t.estimated_minutes,
+        "notes": t.notes,
         "done": t.done,
         "created_ts": t.created_ts,
         "updated_ts": t.updated_ts,
@@ -1279,15 +1285,20 @@ struct TasksQuery {
     date: Option<String>,
 }
 
-/// 指定日期的任务（缺省今天）：优先级 高>中>低，未完成在前，再按创建时间升序
+/// 指定日期的任务（缺省今天）：优先级 高>中>低，未完成在前，再按创建时间升序。
+/// 附带项目派生提醒任务（id 以 `proj:` 前缀，不落库）。
 async fn list_tasks(
     State(state): State<AppState>,
     Query(q): Query<TasksQuery>,
 ) -> ApiResult<Json<Value>> {
     let date = date_param(q.date)?.format("%Y-%m-%d").to_string();
-    let tasks = lock_db(&state)?
+    let mut tasks = lock_db(&state)?
         .tasks_on(&date)
         .map_err(ApiError::internal)?;
+    let derived = lock_db(&state)?
+        .project_derived_tasks(&date)
+        .map_err(ApiError::internal)?;
+    tasks.extend(derived);
     Ok(Json(Value::Array(tasks.iter().map(task_json).collect())))
 }
 
@@ -1295,6 +1306,10 @@ async fn list_tasks(
 struct AddTaskBody {
     title: String,
     priority: Option<String>,
+    important: Option<bool>,
+    urgent: Option<bool>,
+    estimated_minutes: Option<i32>,
+    notes: Option<String>,
     date: Option<String>,
 }
 
@@ -1314,7 +1329,16 @@ async fn add_task(
         .unwrap_or(TaskPriority::Mid);
     let date = date_param(body.date)?.format("%Y-%m-%d").to_string();
     let task = lock_db(&state)?
-        .add_task(&date, title, priority, now_ts())
+        .add_task(
+            &date,
+            title,
+            priority,
+            body.important.unwrap_or(false),
+            body.urgent.unwrap_or(false),
+            body.estimated_minutes,
+            body.notes.as_deref().unwrap_or(""),
+            now_ts(),
+        )
         .map_err(ApiError::internal)?;
     Ok(Json(task_json(&task)))
 }
@@ -1323,6 +1347,11 @@ async fn add_task(
 struct UpdateTaskBody {
     title: Option<String>,
     priority: Option<String>,
+    important: Option<bool>,
+    urgent: Option<bool>,
+    pomodoro_count: Option<i32>,
+    estimated_minutes: Option<Option<i32>>,
+    notes: Option<String>,
     done: Option<bool>,
     date: Option<String>,
 }
@@ -1357,6 +1386,11 @@ async fn update_task(
             &id,
             body.title.as_deref().map(str::trim),
             priority,
+            body.important,
+            body.urgent,
+            body.pomodoro_count,
+            body.estimated_minutes,
+            body.notes.as_deref(),
             body.done,
             date.as_deref(),
             now_ts(),
@@ -1382,6 +1416,103 @@ async fn delete_task(
     }
     db.delete_task(&id).map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 启动一个番茄钟：创建事件 + 递增任务番茄计数
+async fn pomodoro_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let now = now_ts();
+    let db = lock_db(&state)?;
+    let task = db
+        .get_task(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("任务不存在"))?;
+    if db.ongoing_event().map_err(ApiError::internal)?.is_some() {
+        return Err(ApiError::conflict("已有进行中事件，请先结束"));
+    }
+    // 创建 25 分钟的事件
+    let ev = db.create_event(now).map_err(ApiError::internal)?;
+    db.update_event(&ev.id, Some(&task.title), None, None, None, None)
+        .map_err(ApiError::internal)?;
+    db.increment_pomodoro(&id, now)
+        .map_err(ApiError::internal)?;
+    let task = db
+        .get_task(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("任务不存在"))?;
+    Ok(Json(json!({
+        "ok": true,
+        "event_id": ev.id,
+        "pomodoro_count": task.pomodoro_count,
+    })))
+}
+
+/// 当前进行中的事件
+async fn ongoing_event(
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    let now = now_ts();
+    let db = lock_db(&state)?;
+    match db.ongoing_event().map_err(ApiError::internal)? {
+        Some(ev) => Ok(Json(event_json(&ev, now))),
+        None => Ok(Json(Value::Null)),
+    }
+}
+
+#[derive(Deserialize)]
+struct RolloverBody {
+    /// 来源日期，缺省昨天
+    from: Option<String>,
+    /// 目标日期，缺省 from 的后一天
+    to: Option<String>,
+}
+
+/// 将指定日期的未完成任务移到另一日（默认昨天→今天）。返回移动数量。
+async fn rollover_tasks(
+    State(state): State<AppState>,
+    Json(body): Json<RolloverBody>,
+) -> ApiResult<Json<Value>> {
+    let now = now_ts();
+    let today = today();
+    let from = body
+        .from
+        .as_deref()
+        .map(|d| {
+            parse_date(d)
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .ok_or_else(|| ApiError::bad_request("from 格式应为 YYYY-MM-DD"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            // 缺省昨天
+            (today - chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string()
+        });
+    let to = body
+        .to
+        .as_deref()
+        .map(|d| {
+            parse_date(d)
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .ok_or_else(|| ApiError::bad_request("to 格式应为 YYYY-MM-DD"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            // 缺省 from 的后一天
+            NaiveDate::parse_from_str(&from, "%Y-%m-%d")
+                .unwrap()
+                .succ_opt()
+                .unwrap()
+                .format("%Y-%m-%d")
+                .to_string()
+        });
+    let count = lock_db(&state)?
+        .rollover_tasks(&from, &to, now)
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true, "count": count, "from": from, "to": to })))
 }
 
 // ---------------- 外部记录（/api/ext） ----------------
@@ -2522,6 +2653,143 @@ mod tests {
         assert_eq!(code, StatusCode::NOT_FOUND);
         let (_, body) = call(&state, "GET", "/api/tasks", None).await;
         assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tasks_quadrant_and_derived_flow() {
+        let state = test_state(true);
+
+        // 创建带重要/紧急的任务
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/tasks",
+            Some(json!({"title": "重要且紧急", "important": true, "urgent": true})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["important"], true);
+        assert_eq!(body["urgent"], true);
+        let id = body["id"].as_str().unwrap().to_string();
+
+        // 缺省两个开关为 false
+        let (_, body) = call(
+            &state,
+            "POST",
+            "/api/tasks",
+            Some(json!({"title": "普通任务"})),
+        )
+        .await;
+        assert_eq!(body["important"], false);
+        assert_eq!(body["urgent"], false);
+
+        // 部分更新只改紧急
+        let (code, body) = call(
+            &state,
+            "PUT",
+            &format!("/api/tasks/{id}"),
+            Some(json!({"urgent": false, "important": true})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["important"], true);
+        assert_eq!(body["urgent"], false);
+
+        // 项目派生提醒：截止今天
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let today_ts = Local::now().date_naive()
+            .and_hms_opt(12, 0, 0).unwrap()
+            .and_utc().timestamp();
+        let (_, body) = call(
+            &state,
+            "POST",
+            "/api/projects",
+            Some(json!({"name": "发版", "status": "进行中", "deadline_ts": today_ts})),
+        )
+        .await;
+        let proj_id = body["id"].as_str().unwrap().to_string();
+
+        let (code, body) = call(&state, "GET", &format!("/api/tasks?date={today}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        let arr = body.as_array().unwrap();
+        let derived: Vec<_> = arr.iter().filter(|t| t["id"].as_str().is_some_and(|s| s.starts_with("proj:"))).collect();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0]["title"], "📌 发版 截止");
+        assert_eq!(derived[0]["important"], true);
+        assert_eq!(derived[0]["urgent"], true);
+        assert_eq!(derived[0]["date"], today);
+        // 派生任务 id（proj: 前缀）不在库中，删除 → 404
+        let (code, _) = call(&state, "DELETE", &format!("/api/tasks/proj:{proj_id}"), None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tasks_rollover_flow() {
+        let state = test_state(true);
+
+        // 昨天一笔未完成 + 一笔已完成
+        let yesterday = (Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/tasks",
+            Some(json!({"title": "昨天的活", "priority": "高", "date": yesterday})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let id_undo = body["id"].as_str().unwrap().to_string();
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/tasks",
+            Some(json!({"title": "昨天做完的", "date": yesterday})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let id_done = body["id"].as_str().unwrap().to_string();
+        call(
+            &state,
+            "PUT",
+            &format!("/api/tasks/{id_done}"),
+            Some(json!({"done": true})),
+        )
+        .await;
+
+        // 缺省：昨天 → 今天，只移未完成
+        let (code, body) = call(&state, "POST", "/api/tasks/rollover", Some(json!({}))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(body["from"], yesterday);
+        assert_eq!(body["to"], today);
+        let (_, body) = call(&state, "GET", &format!("/api/tasks?date={today}"), None).await;
+        let arr = body.as_array().unwrap();
+        assert!(arr.iter().any(|t| t["id"] == id_undo));
+        assert!(!arr.iter().any(|t| t["id"] == id_done));
+
+        // 再次执行：昨天已无未完成 → count 0
+        let (_, body) = call(&state, "POST", "/api/tasks/rollover", Some(json!({}))).await;
+        assert_eq!(body["count"], 0);
+
+        // 显式 from/to 校验：非法日期 → 400
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/tasks/rollover",
+            Some(json!({"from": "bad"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/tasks/rollover",
+            Some(json!({"to": "bad"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

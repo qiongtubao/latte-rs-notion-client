@@ -457,7 +457,7 @@ pub fn idea_properties(idea: &Idea) -> Value {
     })
 }
 
-/// 「今日任务」database：名称(title)、日期(date)、优先级(select)、完成(checkbox)
+/// 「今日任务」database：名称(title)、日期(date)、优先级(select)、重要(checkbox)、紧急(checkbox)、完成(checkbox)
 pub fn tasks_db_body(parent_page_id: &str) -> Value {
     let pri_labels: Vec<&str> = TaskPriority::ALL.iter().map(|p| p.label()).collect();
     db_body(
@@ -467,6 +467,8 @@ pub fn tasks_db_body(parent_page_id: &str) -> Value {
             "名称": { "title": {} },
             "日期": { "date": {} },
             "优先级": { "select": { "options": select_options(&pri_labels) } },
+            "重要": { "checkbox": {} },
+            "紧急": { "checkbox": {} },
             "完成": { "checkbox": {} },
         }),
     )
@@ -478,6 +480,8 @@ pub fn task_properties(task: &Task) -> Value {
         "名称": title_prop(&task.title),
         "日期": { "date": { "start": task.date } },
         "优先级": select_prop(task.priority.label()),
+        "重要": checkbox_prop(task.important),
+        "紧急": checkbox_prop(task.urgent),
         "完成": checkbox_prop(task.done),
     })
 }
@@ -845,6 +849,11 @@ mod tests {
             date: "2024-08-01".into(),
             title: "写周报".into(),
             priority: TaskPriority::High,
+            important: true,
+            urgent: false,
+            pomodoro_count: 0,
+            estimated_minutes: None,
+            notes: String::new(),
             done: true,
             created_ts: 1_722_460_800,
             updated_ts: 1_722_460_800,
@@ -856,6 +865,8 @@ mod tests {
         assert_eq!(props["名称"]["title"][0]["text"]["content"], "写周报");
         assert_eq!(props["日期"]["date"]["start"], "2024-08-01");
         assert_eq!(props["优先级"]["select"]["name"], "高");
+        assert_eq!(props["重要"]["checkbox"], true);
+        assert_eq!(props["紧急"]["checkbox"], false);
         assert_eq!(props["完成"]["checkbox"], true);
     }
 

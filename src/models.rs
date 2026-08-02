@@ -261,10 +261,15 @@ pub struct Idea {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Task {
     pub id: String,
-    /// 本地日期（YYYY-MM-DD）
     pub date: String,
     pub title: String,
     pub priority: TaskPriority,
+    pub important: bool,
+    pub urgent: bool,
+    pub pomodoro_count: i32,
+    pub estimated_minutes: Option<i32>,
+    /// 任务备注/子任务（纯文本，子任务用 `- [ ]` / `- [x]` 标记）
+    pub notes: String,
     pub done: bool,
     pub created_ts: i64,
     pub updated_ts: i64,

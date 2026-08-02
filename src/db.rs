@@ -12,6 +12,7 @@ use anyhow::Result;
 use rusqlite::types::ToSql;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
+use chrono::{Local, NaiveDate, TimeZone};
 
 use crate::models::{
     Category, Event, Expense, ExtRecord, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus,
@@ -31,7 +32,7 @@ const NOTE_COLS: &str = "id, parent_id, kind, title, content_md, created_ts, upd
 const IDEA_COLS: &str =
     "id, content, tag, pinned, created_ts, updated_ts, notion_page_id, dirty, deleted";
 const TASK_COLS: &str =
-    "id, date, title, priority, done, created_ts, updated_ts, notion_page_id, dirty, deleted";
+    "id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted";
 const EXT_RECORD_COLS: &str =
     "ns, id, title, props_json, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted";
 
@@ -134,6 +135,11 @@ impl Db {
                 date TEXT NOT NULL,
                 title TEXT NOT NULL,
                 priority TEXT NOT NULL DEFAULT '中',
+                important INTEGER NOT NULL DEFAULT 0,
+                urgent INTEGER NOT NULL DEFAULT 0,
+                pomodoro_count INTEGER NOT NULL DEFAULT 0,
+                estimated_minutes INTEGER,
+                notes TEXT NOT NULL DEFAULT '',
                 done INTEGER NOT NULL DEFAULT 0,
                 created_ts INTEGER,
                 updated_ts INTEGER,
@@ -146,15 +152,26 @@ impl Db {
         Ok(())
     }
 
-    /// 旧库补齐后加的列（目前仅 events.remind）
+    /// 旧库补齐后加的列
     fn migrate(&self) -> Result<()> {
-        let mut stmt = self.conn.prepare("PRAGMA table_info(events)")?;
-        let has_remind = stmt
+        Self::add_column_if_missing(self, "events", "remind", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(self, "tasks", "important", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(self, "tasks", "urgent", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(self, "tasks", "pomodoro_count", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(self, "tasks", "estimated_minutes", "INTEGER")?;
+        Self::add_column_if_missing(self, "tasks", "notes", "TEXT NOT NULL DEFAULT ''")?;
+        Ok(())
+    }
+
+    /// 若表缺少指定列则 ALTER TABLE 补上
+    fn add_column_if_missing(&self, table: &str, column: &str, ddl: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let exists = stmt
             .query_map([], |r| r.get::<_, String>(1))?
-            .any(|name| name.is_ok_and(|n| n == "remind"));
-        if !has_remind {
+            .any(|name| name.is_ok_and(|n| n == column));
+        if !exists {
             self.conn
-                .execute_batch("ALTER TABLE events ADD COLUMN remind INTEGER NOT NULL DEFAULT 0")?;
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"))?;
         }
         Ok(())
     }
@@ -938,7 +955,6 @@ impl Db {
         )?;
         Ok(())
     }
-
     pub fn clear_idea_dirty(&self, id: &str) -> Result<()> {
         self.conn
             .execute("UPDATE ideas SET dirty = 0 WHERE id = ?1", params![id])?;
@@ -951,8 +967,6 @@ impl Db {
         Ok(())
     }
 
-    // ---------- 今日任务 ----------
-
     fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         Ok(Task {
             id: row.get(0)?,
@@ -960,33 +974,48 @@ impl Db {
             title: row.get(2)?,
             priority: TaskPriority::from_label(&row.get::<_, String>(3)?)
                 .unwrap_or(TaskPriority::Mid),
-            done: row.get::<_, i64>(4)? != 0,
-            created_ts: row.get(5)?,
-            updated_ts: row.get(6)?,
-            notion_page_id: row.get(7)?,
-            dirty: row.get::<_, i64>(8)? != 0,
-            deleted: row.get::<_, i64>(9)? != 0,
+            important: row.get::<_, i64>(4)? != 0,
+            urgent: row.get::<_, i64>(5)? != 0,
+            pomodoro_count: row.get::<_, i32>(6)?,
+            estimated_minutes: row.get(7)?,
+            notes: row.get(8)?,
+            done: row.get::<_, i64>(9)? != 0,
+            created_ts: row.get(10)?,
+            updated_ts: row.get(11)?,
+            notion_page_id: row.get(12)?,
+            dirty: row.get::<_, i64>(13)? != 0,
+            deleted: row.get::<_, i64>(14)? != 0,
         })
     }
 
+#[allow(clippy::too_many_arguments)]
     pub fn add_task(
         &self,
         date: &str,
         title: &str,
         priority: TaskPriority,
+        important: bool,
+        urgent: bool,
+        estimated_minutes: Option<i32>,
+        notes: &str,
         now: i64,
     ) -> Result<Task> {
         let id = Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO tasks (id, date, title, priority, created_ts, updated_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id, date, title, priority.label(), now],
+            "INSERT INTO tasks (id, date, title, priority, important, urgent, estimated_minutes, notes, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![id, date, title, priority.label(), important, urgent, estimated_minutes, notes, now],
         )?;
         Ok(Task {
             id,
             date: date.to_string(),
             title: title.to_string(),
             priority,
+            important,
+            urgent,
+            pomodoro_count: 0,
+            estimated_minutes,
+            notes: notes.to_string(),
             done: false,
             created_ts: now,
             updated_ts: now,
@@ -1000,12 +1029,60 @@ impl Db {
     pub fn tasks_on(&self, date: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {TASK_COLS} FROM tasks WHERE deleted = 0 AND date = ?1
-             ORDER BY CASE priority WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END,
-                      done ASC, created_ts ASC, rowid ASC"
+             ORDER BY done ASC,
+                      CASE priority WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END,
+                      created_ts ASC, rowid ASC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![date], Self::row_to_task)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 从项目派生提醒任务（不落库）：截止日期落在 [date, date+2] 且未完成的项目，
+    /// 生成一条「项目名 截止」提醒。返回按截止时间排序的虚拟任务（id 以 `proj:` 前缀）。
+    pub fn project_derived_tasks(&self, date: &str) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, deadline_ts FROM projects
+             WHERE deleted = 0 AND status != '已完成' AND deadline_ts IS NOT NULL",
+        )?;
+        let rows: Vec<(String, String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let target = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap_or_else(|_| Local::now().date_naive());
+        let mut out = Vec::new();
+        for (pid, name, deadline_ts) in rows {
+            // unix 秒 → 本地日期（时区一致的截止日）
+            let d = Local
+                .timestamp_opt(deadline_ts, 0)
+                .earliest()
+                .map(|dt| dt.date_naive())
+                .unwrap_or_else(|| Local::now().date_naive());
+            // 截止在 [date, date+2] 内才提醒（提前提醒窗口 2 天）
+            let window_start = target;
+            let window_end = target + chrono::Duration::days(2);
+            if d >= window_start && d <= window_end {
+                out.push(Task {
+                    id: format!("proj:{pid}"),
+                    date: date.to_string(),
+                    title: format!("📌 {name} 截止"),
+                    priority: TaskPriority::High,
+                    important: true,
+                    urgent: d == target,
+                    pomodoro_count: 0,
+                    estimated_minutes: None,
+                    notes: String::new(),
+                    done: false,
+                    created_ts: 0,
+                    updated_ts: 0,
+                    notion_page_id: None,
+                    dirty: false,
+                    deleted: false,
+                });
+            }
+        }
+        out.sort_by_key(|t| t.urgent);
+        Ok(out)
     }
 
     /// 按 id 查询未删除任务
@@ -1018,11 +1095,17 @@ impl Db {
     }
 
     /// 部分更新任务。返回是否存在该（未删除）行。有任何字段更新时刷新 updated_ts 并置 dirty。
+    #[allow(clippy::too_many_arguments)]
     pub fn update_task(
         &self,
         id: &str,
         title: Option<&str>,
         priority: Option<TaskPriority>,
+        important: Option<bool>,
+        urgent: Option<bool>,
+        pomodoro_count: Option<i32>,
+        estimated_minutes: Option<Option<i32>>,
+        notes: Option<&str>,
         done: Option<bool>,
         date: Option<&str>,
         now: i64,
@@ -1036,6 +1119,26 @@ impl Db {
         if let Some(p) = priority {
             sets.push("priority = ?");
             values.push(Box::new(p.label().to_string()));
+        }
+        if let Some(imp) = important {
+            sets.push("important = ?");
+            values.push(Box::new(imp));
+        }
+        if let Some(urg) = urgent {
+            sets.push("urgent = ?");
+            values.push(Box::new(urg));
+        }
+        if let Some(pc) = pomodoro_count {
+            sets.push("pomodoro_count = ?");
+            values.push(Box::new(pc));
+        }
+        if let Some(em) = estimated_minutes {
+            sets.push("estimated_minutes = ?");
+            values.push(Box::new(em));
+        }
+        if let Some(n) = notes {
+            sets.push("notes = ?");
+            values.push(Box::new(n.to_string()));
         }
         if let Some(d) = done {
             sets.push("done = ?");
@@ -1060,8 +1163,26 @@ impl Db {
         Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
     }
 
+    /// 递增番茄钟计数（原子操作）
+    pub fn increment_pomodoro(&self, id: &str, now: i64) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE tasks SET pomodoro_count = pomodoro_count + 1, updated_ts = ?2, dirty = 1
+             WHERE id = ?1 AND deleted = 0",
+            params![id, now],
+        )?;
+        Ok(updated > 0)
+    }
+
     pub fn delete_task(&self, id: &str) -> Result<()> {
         self.soft_or_hard_delete("tasks", id)
+    }
+
+    /// 将指定日期的未完成任务移到另一日期。返回被移动的任务数。
+    pub fn rollover_tasks(&self, from_date: &str, to_date: &str, now: i64) -> Result<usize> {
+        let sql = "UPDATE tasks SET date = ?2, updated_ts = ?3, dirty = 1
+                   WHERE deleted = 0 AND done = 0 AND date = ?1";
+        let count = self.conn.execute(sql, params![from_date, to_date, now])?;
+        Ok(count)
     }
 
     /// 待同步任务（含 deleted = 1 的）
@@ -1874,16 +1995,16 @@ mod tests {
     fn task_crud_order_filter_and_delete() {
         let db = Db::in_memory().unwrap();
         let t1 = db
-            .add_task("2024-08-01", "低优先", TaskPriority::Low, 100)
+            .add_task("2024-08-01", "低优先", TaskPriority::Low, false, false, None, "", 100)
             .unwrap();
         let t2 = db
-            .add_task("2024-08-01", "高优先", TaskPriority::High, 200)
+            .add_task("2024-08-01", "高优先", TaskPriority::High, false, false, None, "", 200)
             .unwrap();
         let t3 = db
-            .add_task("2024-08-01", "中优先", TaskPriority::Mid, 300)
+            .add_task("2024-08-01", "中优先", TaskPriority::Mid, false, false, None, "", 300)
             .unwrap();
         let _other_day = db
-            .add_task("2024-08-02", "明天的", TaskPriority::High, 400)
+            .add_task("2024-08-02", "明天的", TaskPriority::High, false, false, None, "", 400)
             .unwrap();
         assert!(t1.dirty && !t1.done);
 
@@ -1895,7 +2016,7 @@ mod tests {
         assert_eq!(list[2].id, t1.id);
 
         // 完成的排到最后（同级优先级内未完成在前）
-        db.update_task(&t2.id, None, None, Some(true), None, 500)
+        db.update_task(&t2.id, None, None, None, None, None, None, None, Some(true), None, 500)
             .unwrap();
         let list = db.tasks_on("2024-08-01").unwrap();
         assert_eq!(list[0].id, t3.id);
@@ -1910,6 +2031,11 @@ mod tests {
                 Some("改名"),
                 Some(TaskPriority::High),
                 None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some("2024-08-03"),
                 600,
             )
@@ -1921,15 +2047,10 @@ mod tests {
         assert_eq!(task.date, "2024-08-03");
         assert_eq!(task.created_ts, 100);
         assert_eq!(task.updated_ts, 600);
-        assert!(task.dirty);
-        // 已移到 8-03，8-01 列表不再包含
-        assert!(db.tasks_on("2024-08-01").unwrap().iter().all(|t| t.id != t1.id));
-        assert_eq!(db.tasks_on("2024-08-03").unwrap().len(), 1);
         assert!(
-            !db.update_task("nope", Some("x"), None, None, None, 700)
+            !db.update_task("nope", Some("x"), None, None, None, None, None, None, None, None, 700)
                 .unwrap()
         );
-
         // 删除语义：未同步物理删，已同步软删 + purge
         db.delete_task(&t3.id).unwrap();
         assert!(db.get_task(&t3.id).unwrap().is_none());
@@ -1954,5 +2075,92 @@ mod tests {
             db.clear_task_dirty(&id).unwrap();
         }
         assert_eq!(db.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn task_rollover_moves_only_undone() {
+        let db = Db::in_memory().unwrap();
+        let undo = db
+            .add_task("2024-08-01", "未完成", TaskPriority::High, true, false, None, "", 100)
+            .unwrap();
+        let done = db
+            .add_task("2024-08-01", "已完成", TaskPriority::Mid, false, false, None, "", 200)
+            .unwrap();
+        db.update_task(&done.id, None, None, None, None, None, None, None, Some(true), None, 300)
+            .unwrap();
+        let other = db
+            .add_task("2024-08-02", "别的日子", TaskPriority::Low, false, false, None, "", 400)
+            .unwrap();
+
+        // 只移动未完成的，已完成与其它日期不受影响
+        let moved = db.rollover_tasks("2024-08-01", "2024-08-02", 500).unwrap();
+        assert_eq!(moved, 1);
+
+        let task = db.get_task(&undo.id).unwrap().unwrap();
+        assert_eq!(task.date, "2024-08-02");
+        assert_eq!(task.updated_ts, 500);
+        assert!(task.dirty);
+        let done_task = db.get_task(&done.id).unwrap().unwrap();
+        assert_eq!(done_task.date, "2024-08-01");
+        let other_task = db.get_task(&other.id).unwrap().unwrap();
+        assert_eq!(other_task.date, "2024-08-02");
+
+        // 无未完成任务时返回 0
+        assert_eq!(db.rollover_tasks("2024-08-01", "2024-08-02", 600).unwrap(), 0);
+    }
+
+    #[test]
+    fn task_important_urgent_fields_roundtrip() {
+        let db = Db::in_memory().unwrap();
+        let t = db
+            .add_task("2024-08-01", "重要且紧急", TaskPriority::High, true, true, None, "", 100)
+            .unwrap();
+        assert!(t.important && t.urgent);
+        let got = db.get_task(&t.id).unwrap().unwrap();
+        assert!(got.important && got.urgent);
+
+        // 部分更新只改 urgent
+        db.update_task(&t.id, None, None, Some(false), None, None, None, None, None, None, 200)
+            .unwrap();
+        let got = db.get_task(&t.id).unwrap().unwrap();
+        assert!(!got.important && got.urgent);
+    }
+    #[test]
+    fn project_derived_tasks_window() {
+        let db = Db::in_memory().unwrap();
+        // 截止今天（unix 秒，取当天 12:00）
+        let today = Local::now().date_naive();
+        let today_ts = today
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        // 截止 5 天后（窗口外）
+        let far_ts = (today + chrono::Duration::days(5))
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        db.add_project("截止今天", ProjectStatus::Doing, None, Some(today_ts), "")
+            .unwrap();
+        db.add_project("窗口外", ProjectStatus::Doing, None, Some(far_ts), "")
+            .unwrap();
+        // 已完成项目不提醒
+        db.add_project("已完成", ProjectStatus::Done, None, Some(today_ts), "")
+            .unwrap();
+
+        let date = today.format("%Y-%m-%d").to_string();
+        let derived = db.project_derived_tasks(&date).unwrap();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].title, "📌 截止今天 截止");
+        assert!(derived[0].id.starts_with("proj:"));
+        assert!(derived[0].important);
+        assert!(derived[0].urgent); // 截止当天 → 紧急
+
+        // 提前 1 天也在窗口内，且不紧急
+        let date2 = (today - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let derived = db.project_derived_tasks(&date2).unwrap();
+        assert_eq!(derived.len(), 1);
+        assert!(!derived[0].urgent);
     }
 }

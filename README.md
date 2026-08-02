@@ -1,8 +1,14 @@
 # Latte
 
-本地 Notion 客户端（Rust Web 应用）：每日时间碎片管理、金钱管理、日历、项目管理。
+本地 Notion 客户端（**Web + 桌面双端**）：每日时间碎片管理、金钱管理、日历、项目管理。
 
-架构：**Rust(axum) 后端 + Vue 3 前端**，浏览器使用。数据流为**本地优先** —— 所有操作立即写入本地 SQLite（标记 `dirty`），后台任务每 30 秒把变更推送/更新到 Notion，失败自动重试，离线可正常使用。
+架构：**Rust(axum) 后端 + Vue 3 前端**，同一套代码同时支持：
+- **Web**：浏览器访问，axum 静态托管前端（默认 `http://127.0.0.1:3210`）
+- **桌面**（Ubuntu/macOS）：Tauri v2 壳，进程内拉起同一 axum 服务（复用 `latte::server`），Webview 加载本地地址。前端与 Web 版 100% 一致，走同一套 HTTP API。
+
+数据流为**本地优先** —— 所有操作立即写入本地 SQLite（标记 `dirty`），后台任务每 30 秒把变更推送/更新到 Notion，失败自动重试，离线可正常使用。
+
+UI 为**心流工作空间**风格：今日任务为主视图，其他功能（时间碎片/金钱/日历/项目/番茄钟/AI）收敛为**可拖拽浮动按钮**，点击在右侧弹出面板，无需切换页面。
 
 ## 功能
 
@@ -35,6 +41,8 @@ api_key = ""              # 代理有 auth 时填
 
 ## 构建与运行
 
+### Web 版（开发/生产）
+
 ```bash
 # 1. 构建前端（需要 node + pnpm）
 cd frontend && pnpm install && pnpm build && cd ..
@@ -45,11 +53,42 @@ cargo run --release
 
 启动后打开 <http://127.0.0.1:3210>。后端直接托管 `frontend/dist`，无需单独起前端服务。
 
-前端开发调试（热更新）：
+前端开发调试（热更新 + API 代理）：
 
 ```bash
 cd frontend && pnpm dev    # vite dev server，/api 自动代理到 127.0.0.1:3210
 ```
+
+### 桌面版（Ubuntu / macOS）
+
+**依赖**（Ubuntu）：
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+```
+
+macOS 无需额外系统依赖，安装 Xcode 命令行工具即可。
+
+**构建与运行**：
+```bash
+# 开发模式（热更新 + 桌面窗口）
+cargo tauri dev
+
+# 生产构建（打出 .deb / .rpm / .dmg / .AppImage 安装包）
+CI=false cargo tauri build
+```
+
+桌面版和 Web 版共用同一套前端代码和后端 API。桌面版在壳内启动 axum 服务（127.0.0.1:3210），Webview 直接加载该地址，无缝工作。
+
+### Workspace 结构
+
+```bash
+latte/                  # 根 crate（Web 入口 + 核心库）
+  src/server.rs          # 可复用服务装配（Web/桌面共用）
+  src-tauri/             # Tauri v2 桌面壳（依赖 latte crate）
+  frontend/              # Vue3 + Element Plus 前端（Web/桌面共用）
+```
+
+`latte::server::init_server` 是 Web 和桌面的共同入口：构建状态、启动同步循环、serve axum。Web 入口（main.rs）和桌面壳（src-tauri）都调用它。
 
 ## Notion 配置（首次使用）
 
@@ -101,14 +140,10 @@ cd frontend && pnpm dev    # vite dev server，/api 自动代理到 127.0.0.1:32
 ## 同步机制
 
 - 本地写操作立即生效并标记 `dirty = 1`。
-- 后台 tokio 任务每 30 秒扫描 dirty 行：`notion_page_id` 为空 → POST 新建并回填 id；已有 → PATCH 更新；`deleted = 1` → 远端归档（`archived: true`）后删除本地行。
-- 单行失败保留 dirty，下轮自动重试；遵守 Notion 限速（请求间隔 ≥ 350ms，429 按 `Retry-After` 退避，最多 3 次）。
-- 顶栏显示最近同步时间 / 待同步条数 / 错误信息；退出（Ctrl-C）前做最后一次冲刷（最多 5 秒）。
-
 ## 开发与测试
 
 ```bash
-cargo test                  # 37 个测试：report 聚合、db CRUD、notion 请求体、API 集成
+cargo test                  # 83 个测试：report 聚合、db CRUD、notion 请求体、API 集成
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 cd frontend && pnpm build   # 前端构建
@@ -117,18 +152,23 @@ cd frontend && pnpm build   # 前端构建
 代码结构：
 
 ```
-src/
-  main.rs     入口：启动 axum 服务、静态托管、后台同步任务
-  lib.rs      库入口（api/config/db/models/notion/report/sync）
-  api.rs      REST API 路由 + 集成测试
-  config.rs   ~/.config/latte/config.toml 读写、page id 解析
-  models.rs   Event / Expense / Project / Tag / Category / ProjectStatus
-  db.rs       SQLite schema + CRUD（dirty 软同步标记）
-  notion.rs   Notion API 客户端 + 请求体构造纯函数
-  sync.rs     后台同步循环（每 30s 冲刷 dirty 行）
-  report.rs   日/周/月/年聚合（纯函数）
-frontend/
-  src/api.js            axios 封装
-  src/App.vue           顶栏 + Tab 导航 + 同步状态
-  src/views/            SetupView / TimeView / MoneyView / CalendarView / ProjectsView
+latte/                       # Cargo workspace root
+  src/
+    main.rs                  Web 入口（薄，仅调用 server::init_server）
+    lib.rs                   库入口（api/config/db/models/notion/report/server/sync）
+    server.rs                HTTP 服务装配（Web/桌面共用）
+    api.rs                   REST API 路由 + 集成测试
+    config.rs                ~/.config/latte/config.toml 读写
+    models.rs                Event / Expense / Project / Task / Tag / etc.
+    db.rs                    SQLite schema + CRUD（dirty 软同步）
+    notion.rs                Notion API 客户端 & 请求体构造
+    sync.rs                  后台同步循环（每 30s 冲刷 dirty 行）
+    report.rs                日/周/月/年聚合
+  src-tauri/                 Tauri v2 桌面壳（启动 axum 服务 + Webview 窗口）
+    src/lib.rs               壳入口：setup 中调用 latte::server::init_server
+  frontend/
+    src/api.js               axios 封装
+    src/App.vue              顶栏 + 浮动按钮层 + 动态面板
+    src/components/FloatingButton.vue  可拖拽浮动按钮组件
+    src/views/               TodayView / TimeView / MoneyView / CalendarView / ProjectsView / NotesView / IdeasView
 ```
