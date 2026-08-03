@@ -77,7 +77,7 @@
 </template>
 
 <script setup>
-import { computed, markRaw, onMounted, onUnmounted, ref } from 'vue'
+import { computed, markRaw, onMounted, onUnmounted, provide, ref } from 'vue'
 import dayjs from 'dayjs'
 import {
   Bell, BellFilled, Close, Loading, Refresh
@@ -114,30 +114,38 @@ const viewMap = {
   notes: NotesView,
   ideas: IdeasView,
 }
+const subAction = ref(null)
+provide('subAction', subAction)
+
+function subActionHandler(key, action) {
+  const fb = floatButtons.find(b => b.key === key)
+  if (fb) onFloatOpen(fb)
+  setTimeout(() => { subAction.value = { key, action } }, 50)
+}
 
 const floatButtons = [
   { key: 'today', icon: '☑', label: '今日任务', color: '#409eff', x: 70, y: 220,
     subs: [
-      { icon: '＋', label: '添加', handler: () => ElMessage.info('添加今日任务') },
-      { icon: '▲', label: '排序', handler: () => ElMessage.info('按优先级排序') },
-      { icon: '✓', label: '完成', handler: () => ElMessage.info('标记完成') },
+      { icon: '＋', label: '添加', handler: () => subActionHandler('today', 'add') },
+      { icon: '▲', label: '排序', handler: () => subActionHandler('today', 'sort') },
+      { icon: '✓', label: '完成', handler: () => subActionHandler('today', 'done') },
     ] },
   { key: 'time', icon: '⏱', label: '时间碎片', color: '#e6a23c', x: 200, y: 220,
     subs: [
-      { icon: '▶', label: '开始计时', handler: () => ElMessage.success('已开始计时') },
-      { icon: '▤', label: '报表', handler: () => ElMessage.info('时间报表') },
+      { icon: '▶', label: '开始计时', handler: () => subActionHandler('time', 'start') },
+      { icon: '▤', label: '报表', handler: () => subActionHandler('time', 'report') },
     ] },
   { key: 'money', icon: '💰', label: '金钱', color: '#67c23a', x: 330, y: 220,
     subs: [
-      { icon: '＋', label: '记一笔', handler: () => ElMessage.info('快速记账') },
-      { icon: '☷', label: '统计', handler: () => ElMessage.info('消费统计') },
+      { icon: '＋', label: '记一笔', handler: () => subActionHandler('money', 'add') },
+      { icon: '☷', label: '统计', handler: () => subActionHandler('money', 'summary') },
     ] },
   { key: 'calendar', icon: '📅', label: '日历', color: '#909399', x: 460, y: 220,
     subs: [] },
   { key: 'projects', icon: '📊', label: '项目', color: '#e6a23c', x: 70, y: 380,
     subs: [
-      { icon: '◫', label: '看板', handler: () => ElMessage.info('项目看板') },
-      { icon: '▤', label: '甘特', handler: () => ElMessage.info('甘特图') },
+      { icon: '◫', label: '看板', handler: () => subActionHandler('projects', 'board') },
+      { icon: '▤', label: '甘特', handler: () => subActionHandler('projects', 'gantt') },
     ] },
 ]
 const activePanelConfig = ref(null)

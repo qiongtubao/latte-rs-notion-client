@@ -79,7 +79,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, inject, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
@@ -170,6 +170,19 @@ async function removeExpense(row) {
     ElMessage.error(e.message)
   }
 }
+const subAction = inject('subAction')
+watch(subAction, (act) => {
+  if (!act || act.key !== 'money') return
+  if (act.action === 'add') {
+    openCreate()
+  } else if (act.action === 'summary') {
+    nextTick(() => {
+      const box = document.querySelector('.panel-body')
+      if (box) box.scrollTo({ top: 0, behavior: 'smooth' })
+    })
+    ElMessage.info(`本周 ¥${(summary.value.week || 0).toFixed(2)} | 本月 ¥${(summary.value.month || 0).toFixed(2)} | 本年 ¥${(summary.value.year || 0).toFixed(2)}`)
+  }
+})
 
 onMounted(loadAll)
 </script>

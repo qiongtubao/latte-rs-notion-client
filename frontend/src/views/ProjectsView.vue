@@ -107,7 +107,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, inject, onMounted, reactive, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
@@ -244,6 +244,15 @@ async function removeProject(p) {
     ElMessage.error(e.message)
   }
 }
+const subAction = inject('subAction')
+watch(subAction, (act) => {
+  if (!act || act.key !== 'projects') return
+  if (act.action === 'board') {
+    viewMode.value = 'board'
+  } else if (act.action === 'gantt') {
+    viewMode.value = 'gantt'
+  }
+})
 
 onMounted(load)
 </script>

@@ -127,7 +127,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
@@ -250,6 +250,23 @@ function shiftReport(delta) {
   reportDate.value = dayjs(reportDate.value).add(delta, unit).format('YYYY-MM-DD')
   loadReport()
 }
+const subAction = inject('subAction')
+watch(subAction, (act) => {
+  if (!act || act.key !== 'time') return
+  if (act.action === 'start') {
+    if (current.value) {
+      ElMessage.warning('已有进行中的事件')
+    } else {
+      start()
+    }
+  } else if (act.action === 'report') {
+    nextTick(() => {
+      const cards = document.querySelectorAll('.panel-body .el-card')
+      const report = cards[cards.length - 1]
+      if (report) report.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
+})
 
 onMounted(() => {
   loadEvents()

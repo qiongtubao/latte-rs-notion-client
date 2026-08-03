@@ -212,7 +212,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, inject, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Bell, Delete, EditPen, Timer, VideoPlay } from '@element-plus/icons-vue'
@@ -553,6 +553,22 @@ async function addExpense() {
     expenseAdding.value = false
   }
 }
+const subAction = inject('subAction')
+watch(subAction, (act) => {
+  if (!act || act.key !== 'today') return
+  if (act.action === 'add') {
+    nextTick(() => {
+      const input = document.querySelector('.panel-body .add-card input')
+      if (input) input.focus()
+    })
+  } else if (act.action === 'sort') {
+    const modes = ['all', 'q1', 'q2', 'q3', 'q4']
+    const idx = modes.indexOf(quadrantFilter.value)
+    quadrantFilter.value = modes[(idx + 1) % modes.length]
+  } else if (act.action === 'done') {
+    doneCollapsed.value = !doneCollapsed.value
+  }
+})
 
 onMounted(async () => {
   await rolloverYesterday()
