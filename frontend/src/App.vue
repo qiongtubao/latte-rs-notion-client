@@ -50,6 +50,21 @@
       <CalendarDayList />
     </aside>
 
+    <!-- 项目列表/甘特图：同上，跟随「项目」按钮 -->
+    <aside v-if="dockOpen.projects" class="today-dock dock-wide" :style="projectsDockStyle">
+      <ProjectList />
+    </aside>
+
+    <!-- 知识库：编辑器式布局（左目录右内容），更宽 -->
+    <aside v-if="dockOpen.notes" class="today-dock dock-wide" :style="notesDockStyle">
+      <NoteList />
+    </aside>
+
+    <!-- 好想法列表：同上，跟随「好想法」按钮 -->
+    <aside v-if="dockOpen.ideas" class="today-dock" :style="ideasDockStyle">
+      <IdeaList />
+    </aside>
+
     <!-- 浮动按钮层 -->
     <FloatingButton
       v-for="fb in floatButtons"
@@ -113,6 +128,9 @@ import FloatingButton from './components/FloatingButton.vue'
 import TodayTaskList from './components/TodayTaskList.vue'
 import MoneyExpenseList from './components/MoneyExpenseList.vue'
 import CalendarDayList from './components/CalendarDayList.vue'
+import ProjectList from './components/ProjectList.vue'
+import NoteList from './components/NoteList.vue'
+import IdeaList from './components/IdeaList.vue'
 
 const loading = ref(true)
 const configured = ref(false)
@@ -188,8 +206,13 @@ const dockPos = reactive({
   today: { x: 130, y: 150 },
   money: { x: 130, y: 245 },
   calendar: { x: 130, y: 340 },
+  projects: { x: 130, y: 435 },
+  notes: { x: 130, y: 530 },
+  ideas: { x: 130, y: 625 },
 })
-const dockOpen = reactive({ today: false, money: false, calendar: false })
+const dockOpen = reactive({
+  today: false, money: false, calendar: false, projects: false, notes: false, ideas: false,
+})
 function onFloatMove(fb, p) {
   if (fb.key in dockPos) {
     dockPos[fb.key].x = p.x
@@ -208,6 +231,9 @@ function makeDockStyle(pos) {
 const todayDockStyle = computed(() => makeDockStyle(dockPos.today))
 const moneyDockStyle = computed(() => makeDockStyle(dockPos.money))
 const calendarDockStyle = computed(() => makeDockStyle(dockPos.calendar))
+const projectsDockStyle = computed(() => makeDockStyle(dockPos.projects))
+const notesDockStyle = computed(() => makeDockStyle(dockPos.notes))
+const ideasDockStyle = computed(() => makeDockStyle(dockPos.ideas))
 
 function openPanel(fb) {
   activePanel.value = fb.key
@@ -222,9 +248,9 @@ provide('openPanel', (key) => {
 
 function onFloatOpen(fb) {
   // 有子按钮时，主按钮点击只展开/收起子按钮（由组件自己处理），不弹面板；
-  // 日历点击切换精简日历列表（完整日历从列表里进）；
-  // 其余无子按钮的（知识库/好想法）点击直接弹面板
-  if (fb.subs.length === 0 && fb.key !== 'calendar') openPanel(fb)
+  // 有精简列表的按钮点击切换列表（完整面板从列表里进）；
+  // 其余无子按钮的点击直接弹面板
+  if (fb.subs.length === 0 && !(fb.key in dockOpen)) openPanel(fb)
 }
 
 function onFloatSub(fb, sub) {
@@ -358,6 +384,10 @@ onUnmounted(() => {
   border-radius: 10px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.08);
   padding: 12px 16px;
+}
+/* 知识库编辑器式 dock 更宽 */
+.today-dock.dock-wide {
+  width: 560px;
 }
 .empty-icon { font-size: 64px; margin-bottom: 12px; opacity: 0.5; }
 .empty-hint { font-size: 14px; }
