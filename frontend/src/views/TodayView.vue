@@ -46,6 +46,10 @@
           <el-option label="无预估" :value="null" />
           <el-option v-for="m in [15,30,45,60,90,120]" :key="m" :label="m + 'min'" :value="m" />
         </el-select>
+        <el-input v-model="newType" placeholder="类型" style="width: 90px" @keyup.enter="addTask" />
+        <el-select v-model="newProject" style="width: 120px" placeholder="项目" clearable>
+          <el-option v-for="p in projects" :key="p.id" :label="p.name" :value="p.id" />
+        </el-select>
         <el-button type="primary" :loading="adding" @click="addTask">添加</el-button>
       </div>
     </el-card>
@@ -93,6 +97,10 @@
           <el-tag v-else-if="task.urgent" type="primary" size="small">紧急</el-tag>
           <el-tag v-if="task.estimated_minutes" size="small" type="info">
             {{ task.estimated_minutes }}min
+          </el-tag>
+          <el-tag v-if="task.task_type" size="small" effect="plain">{{ task.task_type }}</el-tag>
+          <el-tag v-if="task.executed_secs > 0" size="small" type="success">
+            ⏱ {{ fmtDur(task.executed_secs) }}
           </el-tag>
           <el-tag v-if="task.pomodoro_count > 0" size="small" type="success">
             🍅 {{ task.pomodoro_count }}
@@ -202,6 +210,27 @@
             <el-option v-for="m in [15,30,45,60,90,120]" :key="m" :label="m + ' 分钟'" :value="m" />
           </el-select>
         </el-form-item>
+        <el-form-item label="类型">
+          <el-input v-model="editForm.task_type" placeholder="如：工作 / 学习 / 生活" />
+        </el-form-item>
+        <el-form-item label="项目">
+          <el-select v-model="editForm.project_id" style="width: 100%" placeholder="不关联" clearable>
+            <el-option v-for="p in projects" :key="p.id" :label="p.name" :value="p.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="计划开始">
+          <el-date-picker
+            v-model="editForm.start_ts"
+            type="datetime"
+            style="width: 100%"
+            placeholder="不排期"
+            value-format="X"
+            clearable
+          />
+        </el-form-item>
+        <el-form-item v-if="editForm.executed_secs > 0" label="累计执行">
+          <span>{{ fmtDur(editForm.executed_secs) }}</span>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="editDialog = false">取消</el-button>
@@ -234,7 +263,17 @@ const newPriority = ref('中')
 const newImportant = ref(false)
 const newUrgent = ref(false)
 const newEstimate = ref(null)
+const newType = ref('')
+const newProject = ref(null)
 const adding = ref(false)
+
+// 项目列表（任务关联项目用）
+const projects = ref([])
+async function loadProjects() {
+  try {
+    projects.value = await api.getProjects()
+  } catch { /* 项目加载失败不阻塞任务功能 */ }
+}
 
 const doneCollapsed = ref(false)
 const quadrantFilter = ref('all')
@@ -243,7 +282,16 @@ const editNotes = ref('')
 
 const editDialog = ref(false)
 const saving = ref(false)
-const editForm = reactive({ id: null, title: '', priority: '中', important: false, urgent: false, estimated_minutes: null })
+const editForm = reactive({
+  id: null, title: '', priority: '中', important: false, urgent: false,
+  estimated_minutes: null, task_type: '', project_id: null, start_ts: null, executed_secs: 0,
+})
+
+function fmtDur(secs) {
+  const h = Math.floor(secs / 3600)
+  const m = Math.round((secs % 3600) / 60)
+  return h > 0 ? `${h}h${m}m` : `${m}m`
+}
 
 // 进行中事件
 const ongoingEvent = ref(null)
@@ -369,12 +417,16 @@ async function addTask() {
       important: newImportant.value,
       urgent: newUrgent.value,
       estimated_minutes: newEstimate.value,
+      task_type: newType.value.trim() || undefined,
+      project_id: newProject.value || undefined,
       date: date.value,
     })
     newTitle.value = ''
     newImportant.value = false
     newUrgent.value = false
     newEstimate.value = null
+    newType.value = ''
+    newProject.value = null
     await load()
   } catch (e) {
     ElMessage.error(e.message)
@@ -410,7 +462,7 @@ async function startPomodoro(task) {
 
 async function startTiming(task) {
   try {
-    await api.startEvent({ content: task.title })
+    await api.startEvent({ content: task.title, task_id: task.id })
     ElMessage.success('已开始计时')
     await loadOngoing()
   } catch (e) {
@@ -479,6 +531,10 @@ function openEdit(task) {
   editForm.important = !!task.important
   editForm.urgent = !!task.urgent
   editForm.estimated_minutes = task.estimated_minutes || null
+  editForm.task_type = task.task_type || ''
+  editForm.project_id = task.project_id || null
+  editForm.start_ts = task.start_ts ? String(task.start_ts) : null
+  editForm.executed_secs = task.executed_secs || 0
   editDialog.value = true
 }
 
@@ -495,6 +551,9 @@ async function saveEdit() {
       important: editForm.important,
       urgent: editForm.urgent,
       estimated_minutes: editForm.estimated_minutes,
+      task_type: editForm.task_type.trim(),
+      project_id: editForm.project_id || null,
+      start_ts: editForm.start_ts ? Number(editForm.start_ts) : null,
     })
     editDialog.value = false
     await load()
@@ -575,6 +634,7 @@ onMounted(async () => {
   load()
   loadOngoing()
   loadTimeline()
+  loadProjects()
 })
 
 onUnmounted(() => {

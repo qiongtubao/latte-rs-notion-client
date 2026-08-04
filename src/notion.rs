@@ -203,6 +203,15 @@ impl NotionClient {
         Ok(())
     }
 
+    /// 补充 database 属性定义（同名同类型属性幂等，用于给旧 tasks 库补新增列）
+    pub async fn update_database(&self, database_id: &str, properties: &Value) -> Result<()> {
+        let body = json!({ "properties": properties });
+        self.send(reqwest::Method::PATCH, &format!("/databases/{database_id}"), &body)
+            .await
+            .context("更新 Notion database 结构失败")?;
+        Ok(())
+    }
+
     pub async fn archive_page(&self, page_id: &str) -> Result<()> {
         self.send(
             reqwest::Method::PATCH,
@@ -460,7 +469,7 @@ pub fn idea_properties(idea: &Idea) -> Value {
 /// 「今日任务」database：名称(title)、日期(date)、优先级(select)、重要(checkbox)、紧急(checkbox)、完成(checkbox)
 pub fn tasks_db_body(parent_page_id: &str) -> Value {
     let pri_labels: Vec<&str> = TaskPriority::ALL.iter().map(|p| p.label()).collect();
-    db_body(
+    let mut body = db_body(
         parent_page_id,
         "今日任务",
         json!({
@@ -471,19 +480,49 @@ pub fn tasks_db_body(parent_page_id: &str) -> Value {
             "紧急": { "checkbox": {} },
             "完成": { "checkbox": {} },
         }),
-    )
+    );
+    // 合并新增列（类型/项目/计划开始）
+    if let (Some(props), Some(extra)) = (
+        body["properties"].as_object_mut(),
+        tasks_extra_properties_schema().as_object(),
+    ) {
+        for (k, v) in extra {
+            props.insert(k.clone(), v.clone());
+        }
+    }
+    body
 }
 
-/// 今日任务 → Notion page properties（date 为本地 YYYY-MM-DD，Notion date 可直接接受）
-pub fn task_properties(task: &Task) -> Value {
+/// tasks database 的新增列定义：建库与旧库补 schema（PATCH /databases/{id}）共用。
+/// 「类型」为 select，写入时 Notion 会自动创建新选项（自由输入）。
+pub fn tasks_extra_properties_schema() -> Value {
     json!({
-        "名称": title_prop(&task.title),
-        "日期": { "date": { "start": task.date } },
-        "优先级": select_prop(task.priority.label()),
-        "重要": checkbox_prop(task.important),
-        "紧急": checkbox_prop(task.urgent),
-        "完成": checkbox_prop(task.done),
+        "类型": { "select": { "options": [] } },
+        "项目": { "rich_text": {} },
+        "计划开始": { "date": {} },
     })
+}
+
+/// 今日任务 → Notion page properties（date 为本地 YYYY-MM-DD，Notion date 可直接接受）。
+/// project_name 为关联项目的名字（无关联/找不到时跳过「项目」属性）。
+pub fn task_properties(task: &Task, project_name: Option<&str>) -> Value {
+    let mut props = serde_json::Map::new();
+    props.insert("名称".into(), title_prop(&task.title));
+    props.insert("日期".into(), json!({ "date": { "start": task.date } }));
+    props.insert("优先级".into(), select_prop(task.priority.label()));
+    props.insert("重要".into(), checkbox_prop(task.important));
+    props.insert("紧急".into(), checkbox_prop(task.urgent));
+    props.insert("完成".into(), checkbox_prop(task.done));
+    if !task.task_type.is_empty() {
+        props.insert("类型".into(), select_prop(&task.task_type));
+    }
+    if let Some(name) = project_name.filter(|n| !n.is_empty()) {
+        props.insert("项目".into(), rich_text_prop(name));
+    }
+    if let Some(ts) = task.start_ts {
+        props.insert("计划开始".into(), date_prop(ts));
+    }
+    Value::Object(props)
 }
 
 /// 「📚 知识库」根页面（父页面下的普通子页面）
@@ -619,6 +658,7 @@ mod tests {
             content: "写代码".into(),
             tag: Tag::Work,
             remind: false,
+            task_id: None,
             notion_page_id: None,
             dirty: true,
             deleted: false,
@@ -854,6 +894,9 @@ mod tests {
             pomodoro_count: 0,
             estimated_minutes: None,
             notes: String::new(),
+            task_type: String::new(),
+            project_id: None,
+            start_ts: None,
             done: true,
             created_ts: 1_722_460_800,
             updated_ts: 1_722_460_800,
@@ -861,7 +904,7 @@ mod tests {
             dirty: true,
             deleted: false,
         };
-        let props = task_properties(&task);
+        let props = task_properties(&task, None);
         assert_eq!(props["名称"]["title"][0]["text"]["content"], "写周报");
         assert_eq!(props["日期"]["date"]["start"], "2024-08-01");
         assert_eq!(props["优先级"]["select"]["name"], "高");

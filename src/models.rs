@@ -225,6 +225,8 @@ pub struct Event {
     pub tag: Tag,
     /// 是否提醒（纯本地字段，不同步 Notion）
     pub remind: bool,
+    /// 关联任务（执行计时来源的任务 id，纯本地字段，不同步 Notion）
+    pub task_id: Option<String>,
     pub notion_page_id: Option<String>,
     pub dirty: bool,
     pub deleted: bool,
@@ -270,6 +272,12 @@ pub struct Task {
     pub estimated_minutes: Option<i32>,
     /// 任务备注/子任务（纯文本，子任务用 `- [ ]` / `- [x]` 标记）
     pub notes: String,
+    /// 任务类型（自由输入，如 工作/学习/生活）
+    pub task_type: String,
+    /// 关联项目 id
+    pub project_id: Option<String>,
+    /// 计划开始时间（unix 秒，可选）
+    pub start_ts: Option<i64>,
     pub done: bool,
     pub created_ts: i64,
     pub updated_ts: i64,

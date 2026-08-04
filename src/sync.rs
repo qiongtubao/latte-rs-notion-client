@@ -143,7 +143,12 @@ async fn push_idea(client: &NotionClient, db_id: &str, idea: &Idea) -> Result<Pu
 }
 
 /// 今日任务：镜像为「今日任务」database 中的页面
-async fn push_task(client: &NotionClient, db_id: &str, task: &Task) -> Result<PushResult> {
+async fn push_task(
+    client: &NotionClient,
+    db_id: &str,
+    task: &Task,
+    project_name: Option<&str>,
+) -> Result<PushResult> {
     if task.deleted {
         if let Some(pid) = &task.notion_page_id {
             archive_tolerant(client, pid).await?;
@@ -151,12 +156,12 @@ async fn push_task(client: &NotionClient, db_id: &str, task: &Task) -> Result<Pu
         Ok(PushResult::Archived)
     } else if let Some(pid) = &task.notion_page_id {
         client
-            .update_page(pid, &notion::task_properties(task))
+            .update_page(pid, &notion::task_properties(task, project_name))
             .await?;
         Ok(PushResult::Updated)
     } else {
         let pid = client
-            .create_page(db_id, &notion::task_properties(task))
+            .create_page(db_id, &notion::task_properties(task, project_name))
             .await?;
         Ok(PushResult::Created(pid))
     }
@@ -466,8 +471,31 @@ async fn sync_tasks(
     let Some(db_id) = db_id else {
         return;
     };
+    // 旧库补新增列（类型/项目/计划开始，幂等；失败不阻断，推送报错会下轮重试）
+    if let Err(e) = client
+        .update_database(&db_id, &notion::tasks_extra_properties_schema())
+        .await
+        && outcome.error.is_none()
+    {
+        outcome.error = Some(format!("今日任务: 更新 database 结构失败: {e:#}"));
+    }
+    // 项目 id → 名称映射（任务同步「项目」属性用）
+    let project_names: HashMap<String, String> = match db.lock() {
+        Ok(g) => g
+            .all_projects()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect(),
+        Err(_) => HashMap::new(),
+    };
     for task in tasks {
-        let r = push_task(client, &db_id, &task).await;
+        let pname = task
+            .project_id
+            .as_ref()
+            .and_then(|pid| project_names.get(pid))
+            .map(String::as_str);
+        let r = push_task(client, &db_id, &task, pname).await;
         if let Some(res) = record(outcome, r, "今日任务")
             && let Ok(g) = db.lock()
         {

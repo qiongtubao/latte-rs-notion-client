@@ -27,13 +27,18 @@
       </div>
     </header>
 
-    <!-- 主区域：干净背景（所有功能都从浮动按钮进入） -->
+    <!-- 主区域：干净背景（其他功能从浮动按钮进入） -->
     <main class="main-area">
       <div class="empty-bg">
         <div class="empty-icon">☕</div>
         <p class="empty-hint">点击浮动按钮开始</p>
       </div>
     </main>
+
+    <!-- 今日任务列表：默认隐藏，点击「今日任务」按钮随子按钮一起显示/隐藏，跟随按钮拖动 -->
+    <aside v-if="todayDockOpen" class="today-dock" :style="dockStyle">
+      <TodayTaskList />
+    </aside>
 
     <!-- 浮动按钮层 -->
     <FloatingButton
@@ -47,8 +52,11 @@
       :y="fb.y"
       :subs="fb.subs"
       :emphasized="activePanel === fb.key"
+      :timing="fb.key === 'today' && timing"
       @open="onFloatOpen(fb)"
       @sub="onFloatSub(fb, $event)"
+      @toggle="onFloatToggle(fb, $event)"
+      @move="onFloatMove(fb, $event)"
     />
 
     <!-- 弹出面板（浮于内容之上） -->
@@ -77,7 +85,7 @@
 </template>
 
 <script setup>
-import { computed, markRaw, onMounted, onUnmounted, provide, ref } from 'vue'
+import { computed, markRaw, onMounted, onUnmounted, provide, reactive, ref } from 'vue'
 import dayjs from 'dayjs'
 import {
   Bell, BellFilled, Close, Loading, Refresh
@@ -93,6 +101,7 @@ import ProjectsView from './views/ProjectsView.vue'
 import NotesView from './views/NotesView.vue'
 import IdeasView from './views/IdeasView.vue'
 import FloatingButton from './components/FloatingButton.vue'
+import TodayTaskList from './components/TodayTaskList.vue'
 
 const loading = ref(true)
 const configured = ref(false)
@@ -100,7 +109,9 @@ const status = ref({ last_sync: null, last_error: null, pending: 0 })
 const syncing = ref(false)
 const activePanel = ref(null)
 const panelRefreshKey = ref(0)
+const timing = ref(false)
 let pollTimer = null
+let timingTimer = null
 
 const todayStr = computed(() => dayjs().format('M月D日 dddd'))
 
@@ -118,51 +129,87 @@ const subAction = ref(null)
 provide('subAction', subAction)
 
 function subActionHandler(key, action) {
-  const fb = floatButtons.find(b => b.key === key)
-  if (fb) onFloatOpen(fb)
+  // 今日任务的子按钮动作直接作用在按钮旁的精简列表上，不再弹大面板；
+  // 其他功能的子按钮仍然打开对应面板
+  if (key !== 'today') {
+    const fb = floatButtons.find(b => b.key === key)
+    if (fb) openPanel(fb)
+  }
   setTimeout(() => { subAction.value = { key, action } }, 50)
 }
 
 const floatButtons = [
-  { key: 'today', icon: '☑', label: '今日任务', color: '#409eff', x: 70, y: 220,
+  { key: 'today', icon: '☑', label: '今日任务', color: '#409eff', x: 130, y: 150,
     subs: [
       { icon: '＋', label: '添加', handler: () => subActionHandler('today', 'add') },
       { icon: '▲', label: '排序', handler: () => subActionHandler('today', 'sort') },
       { icon: '✓', label: '完成', handler: () => subActionHandler('today', 'done') },
     ] },
-  { key: 'time', icon: '⏱', label: '时间碎片', color: '#e6a23c', x: 200, y: 220,
+  { key: 'time', icon: '⏱', label: '时间碎片', color: '#e6a23c', x: 130, y: 245,
     subs: [
       { icon: '▶', label: '开始计时', handler: () => subActionHandler('time', 'start') },
       { icon: '▤', label: '报表', handler: () => subActionHandler('time', 'report') },
     ] },
-  { key: 'money', icon: '💰', label: '金钱', color: '#67c23a', x: 330, y: 220,
+  { key: 'money', icon: '💰', label: '金钱', color: '#67c23a', x: 130, y: 340,
     subs: [
       { icon: '＋', label: '记一笔', handler: () => subActionHandler('money', 'add') },
       { icon: '☷', label: '统计', handler: () => subActionHandler('money', 'summary') },
     ] },
-  { key: 'calendar', icon: '📅', label: '日历', color: '#909399', x: 460, y: 220,
+  { key: 'calendar', icon: '📅', label: '日历', color: '#909399', x: 130, y: 435,
     subs: [] },
-  { key: 'projects', icon: '📊', label: '项目', color: '#e6a23c', x: 70, y: 380,
+  { key: 'projects', icon: '📊', label: '项目', color: '#e6a23c', x: 130, y: 530,
     subs: [
       { icon: '◫', label: '看板', handler: () => subActionHandler('projects', 'board') },
       { icon: '▤', label: '甘特', handler: () => subActionHandler('projects', 'gantt') },
     ] },
+  { key: 'notes', icon: '📚', label: '知识库', color: '#13c2c2', x: 130, y: 625,
+    subs: [] },
+  { key: 'ideas', icon: '💡', label: '好想法', color: '#faad14', x: 130, y: 720,
+    subs: [] },
 ]
 const activePanelConfig = ref(null)
 const activeView = ref(null)
 
-function onFloatOpen(fb) {
-  // 所有按钮都弹出对应面板（含今日任务）
+// ---- 今日任务列表跟随「今日任务」按钮 ----
+const todayPos = reactive({ x: 130, y: 150 })
+const todayDockOpen = ref(false)
+function onFloatMove(fb, p) {
+  if (fb.key === 'today') {
+    todayPos.x = p.x
+    todayPos.y = p.y
+  }
+}
+function onFloatToggle(fb, opened) {
+  // 今日任务：展开/收起子按钮时，右侧任务列表同步显示/隐藏
+  if (fb.key === 'today') todayDockOpen.value = opened
+}
+const dockStyle = computed(() => {
+  // 面板顶边与按钮顶对齐，并夹在可视区域内
+  const top = Math.max(60, Math.min(todayPos.y - 28, window.innerHeight - 440))
+  return { left: todayPos.x + 90 + 'px', top: top + 'px' }
+})
+
+function openPanel(fb) {
   activePanel.value = fb.key
   activePanelConfig.value = fb
   activeView.value = markRaw(viewMap[fb.key] || TodayView)
 }
 
+function onFloatOpen(fb) {
+  // 有子按钮时，主按钮点击只展开/收起子按钮（由组件自己处理），不弹面板；
+  // 无子按钮（如日历）点击直接弹面板
+  if (fb.subs.length === 0) openPanel(fb)
+}
+
 function onFloatSub(fb, sub) {
-  // 子按钮动作：打开对应面板
-  activePanel.value = fb.key
-  activePanelConfig.value = fb
-  activeView.value = markRaw(viewMap[fb.key] || TodayView)
+  // 子按钮动作：打开对应面板（带 handler 的子按钮走 subActionHandler，这里是兜底）
+  openPanel(fb)
+}
+
+function closePanel() {
+  activePanel.value = null
+  activePanelConfig.value = null
+  activeView.value = null
 }
 
 // ---------- 到点浏览器提醒（保持不变）----------
@@ -217,6 +264,14 @@ async function fetchStatus() {
   } catch (e) { ElMessage.error(`获取状态失败：${e.message}`) }
   finally { loading.value = false }
 }
+
+// 计时状态：驱动「今日任务」按钮的计时动画
+async function checkTiming() {
+  if (!configured.value) return
+  try {
+    timing.value = !!(await api.getOngoingEvent())
+  } catch { /* 查询失败保持原状态 */ }
+}
 async function doSync() {
   syncing.value = true
   try {
@@ -231,9 +286,11 @@ onMounted(() => {
   fetchStatus()
   pollTimer = setInterval(() => { if (configured.value) fetchStatus() }, 30000)
   remindTimer = setInterval(checkReminders, 30000)
+  checkTiming()
+  timingTimer = setInterval(checkTiming, 5000)
 })
 onUnmounted(() => {
-  clearInterval(pollTimer); clearInterval(remindTimer)
+  clearInterval(pollTimer); clearInterval(remindTimer); clearInterval(timingTimer)
 })
 </script>
 
@@ -263,6 +320,19 @@ onUnmounted(() => {
   align-items: center;
 }
 .empty-bg { text-align: center; color: #c0c0c0; user-select: none; }
+/* 今日任务列表：固定在「今日任务」按钮右侧，位置由 dockStyle 跟随按钮 */
+.today-dock {
+  position: fixed;
+  z-index: 140;
+  width: 320px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+  padding: 12px 16px;
+}
 .empty-icon { font-size: 64px; margin-bottom: 12px; opacity: 0.5; }
 .empty-hint { font-size: 14px; }
 

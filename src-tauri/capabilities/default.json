@@ -3,9 +3,18 @@
   "identifier": "default",
   "description": "enables the default permissions",
   "windows": [
-    "main"
+    "main",
+    "popup",
+    "ball-*"
   ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:3210"
+    ]
+  },
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:event:allow-listen"
   ]
 }

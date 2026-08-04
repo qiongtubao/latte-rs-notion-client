@@ -227,6 +227,7 @@ mod tests {
             content: String::new(),
             tag,
             remind: false,
+            task_id: None,
             notion_page_id: None,
             dirty: true,
             deleted: false,

@@ -407,11 +407,12 @@ async fn list_events(
     )))
 }
 
-/// 开始事件；body 可选，提供 content/tag 时预填（任务联动计时用）
+/// 开始事件；body 可选，提供 content/tag 时预填（任务联动计时用），task_id 关联任务
 #[derive(Deserialize, Default)]
 struct StartEventBody {
     content: Option<String>,
     tag: Option<String>,
+    task_id: Option<String>,
 }
 
 async fn start_event(
@@ -435,9 +436,18 @@ async fn start_event(
     if db.ongoing_event().map_err(ApiError::internal)?.is_some() {
         return Err(ApiError::conflict("已有进行中事件"));
     }
+    if let Some(tid) = &body.task_id
+        && db.get_task(tid).map_err(ApiError::internal)?.is_none()
+    {
+        return Err(ApiError::bad_request("关联任务不存在"));
+    }
     let ev = db.create_event(now).map_err(ApiError::internal)?;
     if content.is_some() || tag.is_some() {
         db.update_event(&ev.id, content, tag, None, None, None)
+            .map_err(ApiError::internal)?;
+    }
+    if let Some(tid) = &body.task_id {
+        db.set_event_task_id(&ev.id, tid)
             .map_err(ApiError::internal)?;
     }
     let ev = db
@@ -1258,7 +1268,7 @@ async fn delete_idea(
 
 // ---------------- 今日任务 ----------------
 /// 任务完整对象（不含同步内部字段）
-fn task_json(t: &Task) -> Value {
+fn task_json(t: &Task, executed_secs: i64) -> Value {
     json!({
         "id": t.id,
         "date": t.date,
@@ -1269,7 +1279,11 @@ fn task_json(t: &Task) -> Value {
         "pomodoro_count": t.pomodoro_count,
         "estimated_minutes": t.estimated_minutes,
         "notes": t.notes,
+        "task_type": t.task_type,
+        "project_id": t.project_id,
+        "start_ts": t.start_ts,
         "done": t.done,
+        "executed_secs": executed_secs,
         "created_ts": t.created_ts,
         "updated_ts": t.updated_ts,
     })
@@ -1283,23 +1297,39 @@ fn parse_task_priority(s: &str) -> ApiResult<TaskPriority> {
 #[derive(Deserialize)]
 struct TasksQuery {
     date: Option<String>,
+    /// 为 1 时返回全部未完成任务（不限日期，无派生提醒）
+    unfinished: Option<i64>,
 }
 
 /// 指定日期的任务（缺省今天）：优先级 高>中>低，未完成在前，再按创建时间升序。
 /// 附带项目派生提醒任务（id 以 `proj:` 前缀，不落库）。
+/// `?unfinished=1` 时返回全部未完成任务（不限日期），不含派生提醒。
 async fn list_tasks(
     State(state): State<AppState>,
     Query(q): Query<TasksQuery>,
 ) -> ApiResult<Json<Value>> {
-    let date = date_param(q.date)?.format("%Y-%m-%d").to_string();
-    let mut tasks = lock_db(&state)?
-        .tasks_on(&date)
-        .map_err(ApiError::internal)?;
-    let derived = lock_db(&state)?
-        .project_derived_tasks(&date)
-        .map_err(ApiError::internal)?;
-    tasks.extend(derived);
-    Ok(Json(Value::Array(tasks.iter().map(task_json).collect())))
+    let now = now_ts();
+    let db = lock_db(&state)?;
+    let tasks = if q.unfinished == Some(1) {
+        db.unfinished_tasks().map_err(ApiError::internal)?
+    } else {
+        let date = date_param(q.date)?.format("%Y-%m-%d").to_string();
+        let mut tasks = db.tasks_on(&date).map_err(ApiError::internal)?;
+        let derived = db.project_derived_tasks(&date).map_err(ApiError::internal)?;
+        tasks.extend(derived);
+        tasks
+    };
+    let mut out = Vec::with_capacity(tasks.len());
+    for t in &tasks {
+        // 派生提醒（proj: 前缀）不落库，没有执行记录
+        let secs = if t.id.starts_with("proj:") {
+            0
+        } else {
+            db.task_executed_secs(&t.id, now).map_err(ApiError::internal)?
+        };
+        out.push(task_json(t, secs));
+    }
+    Ok(Json(Value::Array(out)))
 }
 
 #[derive(Deserialize)]
@@ -1311,6 +1341,9 @@ struct AddTaskBody {
     estimated_minutes: Option<i32>,
     notes: Option<String>,
     date: Option<String>,
+    task_type: Option<String>,
+    project_id: Option<String>,
+    start_ts: Option<i64>,
 }
 
 async fn add_task(
@@ -1328,7 +1361,13 @@ async fn add_task(
         .transpose()?
         .unwrap_or(TaskPriority::Mid);
     let date = date_param(body.date)?.format("%Y-%m-%d").to_string();
-    let task = lock_db(&state)?
+    let db = lock_db(&state)?;
+    if let Some(pid) = &body.project_id
+        && db.get_project(pid).map_err(ApiError::internal)?.is_none()
+    {
+        return Err(ApiError::bad_request("关联项目不存在"));
+    }
+    let task = db
         .add_task(
             &date,
             title,
@@ -1337,10 +1376,13 @@ async fn add_task(
             body.urgent.unwrap_or(false),
             body.estimated_minutes,
             body.notes.as_deref().unwrap_or(""),
+            body.task_type.as_deref().map(str::trim).unwrap_or(""),
+            body.project_id.as_deref(),
+            body.start_ts,
             now_ts(),
         )
         .map_err(ApiError::internal)?;
-    Ok(Json(task_json(&task)))
+    Ok(Json(task_json(&task, 0)))
 }
 
 #[derive(Deserialize)]
@@ -1354,6 +1396,11 @@ struct UpdateTaskBody {
     notes: Option<String>,
     done: Option<bool>,
     date: Option<String>,
+    task_type: Option<String>,
+    #[serde(default, deserialize_with = "de_nullable")]
+    project_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_nullable")]
+    start_ts: Option<Option<i64>>,
 }
 
 async fn update_task(
@@ -1381,6 +1428,11 @@ async fn update_task(
         })
         .transpose()?;
     let db = lock_db(&state)?;
+    if let Some(Some(pid)) = &body.project_id
+        && db.get_project(pid).map_err(ApiError::internal)?.is_none()
+    {
+        return Err(ApiError::bad_request("关联项目不存在"));
+    }
     let updated = db
         .update_task(
             &id,
@@ -1393,6 +1445,9 @@ async fn update_task(
             body.notes.as_deref(),
             body.done,
             date.as_deref(),
+            body.task_type.as_deref().map(str::trim),
+            body.project_id.as_ref().map(|o| o.as_deref()),
+            body.start_ts,
             now_ts(),
         )
         .map_err(ApiError::internal)?;
@@ -1403,7 +1458,10 @@ async fn update_task(
         .get_task(&id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("任务不存在"))?;
-    Ok(Json(task_json(&task)))
+    let secs = db
+        .task_executed_secs(&id, now_ts())
+        .map_err(ApiError::internal)?;
+    Ok(Json(task_json(&task, secs)))
 }
 
 async fn delete_task(
@@ -1435,6 +1493,8 @@ async fn pomodoro_task(
     // 创建 25 分钟的事件
     let ev = db.create_event(now).map_err(ApiError::internal)?;
     db.update_event(&ev.id, Some(&task.title), None, None, None, None)
+        .map_err(ApiError::internal)?;
+    db.set_event_task_id(&ev.id, &id)
         .map_err(ApiError::internal)?;
     db.increment_pomodoro(&id, now)
         .map_err(ApiError::internal)?;

@@ -8,7 +8,7 @@
     <button
       class="fab-main"
       :style="{ color: propsColor }"
-      :class="{ emphasized: emphasized }"
+      :class="{ emphasized: emphasized, timing: timing }"
       @mousedown="onDown"
       @click="onClick"
     >
@@ -16,7 +16,7 @@
       <span class="fab-tooltip">{{ label }}</span>
     </button>
 
-    <!-- 子按钮：围绕主按钮圆心，按数量均匀分布在左侧 150°，点击主按钮后显示 -->
+    <!-- 子按钮：在主按钮左侧扇形展开，点击主按钮后显示 -->
     <button
       v-for="(s, i) in subs"
       :key="i"
@@ -32,7 +32,7 @@
 </template>
 
 <script setup>
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 
 const props = defineProps({
   id: { type: String, required: true },
@@ -43,9 +43,11 @@ const props = defineProps({
   x: { type: Number, default: 60 },
   y: { type: Number, default: null },
   subs: { type: Array, default: () => [] },
+  // 有计时进行中：主按钮显示脉冲动画
+  timing: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['open', 'toggle', 'sub'])
+const emit = defineEmits(['open', 'toggle', 'sub', 'move'])
 const propsColor = computed(() => props.color)
 
 // ---- 位置持久化（localStorage）----
@@ -55,10 +57,13 @@ function loadPos() {
     const raw = localStorage.getItem(STORE_KEY)
     if (raw) {
       const p = JSON.parse(raw)
-      if (typeof p.x === 'number' && typeof p.y === 'number') return { x: p.x, y: p.y }
+      if (typeof p.x === 'number' && typeof p.y === 'number') {
+        // 子按钮在左侧展开，x 至少留出 ~100px 防止子按钮跑出屏幕
+        return { x: Math.max(100, p.x), y: Math.max(50, p.y) }
+      }
     }
   } catch { /* 忽略损坏数据 */ }
-  return { x: props.x, y: props.y ?? window.innerHeight - 120 }
+  return { x: Math.max(100, props.x), y: props.y ?? window.innerHeight - 120 }
 }
 const pos = reactive(loadPos())
 function savePos() {
@@ -67,16 +72,13 @@ function savePos() {
   } catch { /* 忽略存储失败 */ }
 }
 
-// ---- 子按钮位置：按数量均匀分布在左侧 150° 扇形 ----
+// ---- 子按钮位置：在主按钮左侧展开，以正左(180°)为中心上下各 30° 扇形 ----
 const SUB_RADIUS = 74
 function subPos(i) {
   const n = props.subs.length
-  if (n <= 1) {
-    return { left: '65px', top: '65px', transform: 'translate(-60px, 0)' }
-  }
-  const startDeg = -105
-  const endDeg = -15
-  const deg = startDeg + ((endDeg - startDeg) * i) / Math.max(1, n - 1)
+  const startDeg = -150 // 左上
+  const endDeg = -210   // 左下
+  const deg = n <= 1 ? -180 : startDeg + ((endDeg - startDeg) * i) / (n - 1)
   const rad = (deg * Math.PI) / 180
   return {
     left: (65 + SUB_RADIUS * Math.cos(rad)) + 'px',
@@ -106,9 +108,14 @@ function onDown(e) {
 }
 function onMove(e) {
   if (!dragging) return
+  const nx = e.clientX - ox
+  const ny = e.clientY - oy
+  // 移动阈值：未超过 4px 不算拖拽，避免手抖吞掉点击
+  if (!moved && Math.hypot(nx - pos.x, ny - pos.y) <= 4) return
   moved = true
-  pos.x = Math.max(40, Math.min(e.clientX - ox, window.innerWidth - 40))
-  pos.y = Math.max(50, Math.min(e.clientY - oy, window.innerHeight - 50))
+  pos.x = Math.max(100, Math.min(nx, window.innerWidth - 40))
+  pos.y = Math.max(50, Math.min(ny, window.innerHeight - 50))
+  emit('move', { x: pos.x, y: pos.y })
 }
 function onClick(e) {
   e.stopPropagation()
@@ -121,6 +128,8 @@ function handleSub(s) {
   if (s.handler) s.handler()
   else emit('sub', s)
 }
+// 挂载后上报一次初始位置，供外部（如今日任务列表）跟随定位
+onMounted(() => emit('move', { x: pos.x, y: pos.y }))
 defineExpose({ getPos: () => ({ ...pos }), getOpened: () => opened.value })
 </script>
 
@@ -132,6 +141,9 @@ defineExpose({ getPos: () => ({ ...pos }), getOpened: () => opened.value })
   height: 130px;
   margin-left: -65px;
   margin-top: -65px;
+  /* 容器本身不接收点击（相邻按钮的容器盒会互相重叠，遮挡下层按钮的子按钮），
+     只有主按钮和展开后的子按钮可点 */
+  pointer-events: none;
 }
 .fab-main {
   position: absolute;
@@ -144,6 +156,7 @@ defineExpose({ getPos: () => ({ ...pos }), getOpened: () => opened.value })
   border-radius: 50%;
   border: none;
   cursor: move;
+  pointer-events: auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -159,11 +172,20 @@ defineExpose({ getPos: () => ({ ...pos }), getOpened: () => opened.value })
   transform: scale(1.06);
   box-shadow: 0 6px 22px rgba(0,0,0,0.18);
 }
+/* 计时进行中：脉冲光圈动画 */
+.fab-main.timing {
+  animation: fab-pulse 1.6s ease-out infinite;
+}
+@keyframes fab-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(64, 158, 255, 0.55); }
+  70% { box-shadow: 0 0 0 16px rgba(64, 158, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(64, 158, 255, 0); }
+}
 .fab-tooltip {
   position: absolute;
-  bottom: -27px;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 64px;
+  top: 50%;
+  transform: translateY(-50%);
   white-space: nowrap;
   font-size: 10px;
   color: #fff;
