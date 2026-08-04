@@ -4,14 +4,36 @@
       <span class="pll-title">项目（{{ rows.length }}）</span>
       <span class="pll-view">
         <span :class="{ on: view === 'list' }" @click="view = 'list'">列表</span>
+        <span :class="{ on: view === 'board' }" @click="view = 'board'">看板</span>
         <span :class="{ on: view === 'gantt' }" @click="view = 'gantt'">甘特</span>
       </span>
-      <span class="pll-open" @click="openFull">打开看板 →</span>
+      <span class="pll-open" @click="openFull">打开完整面板 →</span>
     </div>
 
     <!-- 甘特图视图 -->
     <div v-if="view === 'gantt'" class="pll-gantt">
       <GanttChart :projects="projects" />
+    </div>
+
+    <!-- 看板视图：5 列状态，横向滚动 -->
+    <div v-else-if="view === 'board'" class="pll-board">
+      <div v-for="s in PROJECT_STATUSES" :key="s" class="pll-col">
+        <div class="pll-col-header" :style="{ color: statusColor(s) }">
+          {{ s }} {{ byStatus(s).length }}
+        </div>
+        <div v-if="byStatus(s).length === 0" class="pll-col-empty">空</div>
+        <div
+          v-for="p in byStatus(s)"
+          :key="p.id"
+          class="pll-card"
+          :style="{ borderLeftColor: statusColor(p.status) }"
+        >
+          <span class="pll-card-name" :title="p.name">{{ p.name }}</span>
+          <span v-if="p.deadline_ts" class="pll-deadline" :class="{ near: isNear(p.deadline_ts) }">
+            🕐 {{ fmtDeadline(p.deadline_ts) }}
+          </span>
+        </div>
+      </div>
     </div>
 
     <template v-else>
@@ -84,7 +106,7 @@
 </template>
 
 <script setup>
-import { computed, inject, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
@@ -109,6 +131,19 @@ const tasks = ref([])
 const loading = ref(false)
 const view = ref('list')
 const expanded = ref(new Set())
+
+// 看板：按状态分组（含已完成）
+function byStatus(s) {
+  return projects.value.filter((p) => p.status === s)
+}
+
+// 子按钮动作：◫看板 / ▤甘特 → 切换 dock 内视图（由悬浮按钮经 provide 下发）
+const subAction = inject('subAction')
+watch(subAction, (act) => {
+  if (!act || act.key !== 'projects') return
+  if (act.action === 'board') view.value = 'board'
+  else if (act.action === 'gantt') view.value = 'gantt'
+})
 
 function statusColor(s) {
   return PROJECT_STATUS_COLORS[s] || '#909399'
@@ -386,5 +421,46 @@ onMounted(load)
 }
 .pll-gantt {
   overflow-x: auto;
+}
+.pll-board {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.pll-col {
+  flex: 1 0 100px;
+  min-width: 100px;
+  background: #f8f9fb;
+  border-radius: 8px;
+  padding: 6px;
+}
+.pll-col-header {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  text-align: center;
+}
+.pll-col-empty {
+  font-size: 11px;
+  color: #c0c4cc;
+  text-align: center;
+  padding: 10px 0;
+}
+.pll-card {
+  background: #fff;
+  border: 1px solid #ebeef5;
+  border-left: 3px solid #909399;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+.pll-card-name {
+  display: block;
+  font-size: 12px;
+  color: #303133;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

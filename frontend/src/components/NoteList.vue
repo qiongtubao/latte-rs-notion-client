@@ -16,8 +16,8 @@
     <div v-if="!loading && flatNodes.length === 0 && !query" class="ntl-empty">知识库还是空的</div>
 
     <div v-else class="nte-body">
-      <!-- 左侧：目录树 / 搜索结果 -->
-      <div class="nte-tree">
+      <!-- 左侧：目录树 / 搜索结果（右键新建目录/文档） -->
+      <div class="nte-tree" @contextmenu.prevent="onTreeContextMenu($event, null)">
         <template v-if="query">
           <div v-if="searchRows.length === 0" class="nte-no-match">无匹配</div>
           <div
@@ -39,6 +39,7 @@
             :class="{ active: n.id === selectedId, dir: n.kind === 'dir' }"
             :style="{ paddingLeft: 8 + n.level * 14 + 'px' }"
             @click="onNodeClick(n)"
+            @contextmenu.prevent.stop="onTreeContextMenu($event, n)"
           >
             <span class="nte-arrow">{{ n.kind === 'dir' ? (expanded.has(n.id) ? '▼' : '▶') : '' }}</span>
             <span class="nte-icon">{{ n.kind === 'dir' ? '📁' : '📄' }}</span>
@@ -46,6 +47,20 @@
           </div>
         </template>
       </div>
+
+      <!-- 右键菜单：新建目录/文档 -->
+      <Teleport to="body">
+        <div
+          v-if="ctx.show"
+          class="nte-ctxmenu"
+          :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }"
+          @click.stop
+        >
+          <div class="nte-ctx-title">{{ ctxHint }}</div>
+          <div class="nte-ctx-item" @click="createNode('dir')">📁 新建目录</div>
+          <div class="nte-ctx-item" @click="createNode('doc')">📄 新建文档</div>
+        </div>
+      </Teleport>
 
       <!-- 右侧：文档内容 -->
       <div class="nte-content" v-loading="docLoading">
@@ -84,10 +99,10 @@
 </template>
 
 <script setup>
-import { computed, inject, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 
 const tree = ref([])
@@ -106,20 +121,75 @@ const draft = ref('')
 const saving = ref(false)
 const dirty = computed(() => doc.value && draft.value !== (doc.value.content_md || ''))
 
-// 拍平可见节点（目录展开状态决定子节点是否可见）
+// 拍平可见节点（目录展开状态决定子节点是否可见），parentId 供右键新建定位
 const flatNodes = computed(() => {
   const out = []
-  const walk = (nodes, level) => {
+  const walk = (nodes, level, parentId) => {
     for (const n of nodes || []) {
-      out.push({ id: n.id, kind: n.kind, title: n.title, level })
+      out.push({ id: n.id, kind: n.kind, title: n.title, level, parentId })
       if (n.kind === 'dir' && expanded.value.has(n.id) && n.children?.length) {
-        walk(n.children, level + 1)
+        walk(n.children, level + 1, n.id)
       }
     }
   }
-  walk(tree.value, 0)
+  walk(tree.value, 0, null)
   return out
 })
+
+// ---- 右键菜单：新建目录/文档 ----
+const ctx = reactive({ show: false, x: 0, y: 0, target: null })
+const ctxHint = computed(() => {
+  if (!ctx.target) return '在根目录下新建'
+  return ctx.target.kind === 'dir' ? `在「${ctx.target.title}」下新建` : '在同级新建'
+})
+
+function onTreeContextMenu(e, node) {
+  ctx.show = true
+  ctx.target = node
+  // 防止菜单超出视口
+  ctx.x = Math.min(e.clientX, window.innerWidth - 160)
+  ctx.y = Math.min(e.clientY, window.innerHeight - 130)
+}
+
+function closeCtx() {
+  ctx.show = false
+}
+
+async function createNode(kind) {
+  closeCtx()
+  // 目标为目录 → 建在其内；目标为文档 → 建在其同级；空白处 → 根目录
+  const parentId = !ctx.target
+    ? null
+    : ctx.target.kind === 'dir'
+      ? ctx.target.id
+      : ctx.target.parentId
+  const label = kind === 'dir' ? '目录' : '文档'
+  let title
+  try {
+    const res = await ElMessageBox.prompt(`请输入${label}名称`, `新建${label}`, {
+      inputPattern: /\S+/,
+      inputErrorMessage: '名称不能为空',
+    })
+    title = res.value.trim()
+  } catch {
+    return // 取消
+  }
+  try {
+    const created = await api.createNote({
+      parent_id: parentId,
+      kind,
+      title,
+      ...(kind === 'doc' ? { content_md: `# ${title}\n\n` } : {}),
+    })
+    await load()
+    // 展开父目录；新文档直接选中
+    if (parentId) expanded.value = new Set([...expanded.value, parentId])
+    if (created.kind === 'doc') selectDoc(created.id)
+    ElMessage.success(`${label}「${title}」已创建`)
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
 
 // 搜索：拍平全部节点（含路径），按标题匹配
 const searchRows = computed(() => {
@@ -228,7 +298,13 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  document.addEventListener('click', closeCtx)
+})
+onUnmounted(() => {
+  document.removeEventListener('click', closeCtx)
+})
 </script>
 
 <style scoped>
@@ -398,4 +474,36 @@ onMounted(load)
 .md-body :deep(table) { border-collapse: collapse; }
 .md-body :deep(th),
 .md-body :deep(td) { border: 1px solid #dcdfe6; padding: 4px 8px; }
+</style>
+
+<!-- 右键菜单 Teleport 到 body，样式不能 scoped -->
+<style>
+.nte-ctxmenu {
+  position: fixed;
+  z-index: 3000;
+  min-width: 140px;
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  padding: 4px;
+}
+.nte-ctx-title {
+  font-size: 11px;
+  color: #909399;
+  padding: 4px 10px;
+  border-bottom: 1px solid #f2f3f5;
+  margin-bottom: 2px;
+}
+.nte-ctx-item {
+  font-size: 13px;
+  color: #303133;
+  padding: 6px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.nte-ctx-item:hover {
+  background: #ecf5ff;
+  color: #409eff;
+}
 </style>

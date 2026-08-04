@@ -160,9 +160,11 @@ function subActionHandler(key, action) {
   // 精简列表能直接处理的动作不弹大面板：
   //   今日任务 - 添加/排序/完成/计时（「报表」走面板）
   //   金钱     - 记一笔（「统计」走面板）
+  //   项目     - 看板/甘特（dock 内切换视图）
   const dockOnly =
     (key === 'today' && action !== 'report') ||
-    (key === 'money' && action === 'add')
+    (key === 'money' && action === 'add') ||
+    (key === 'projects' && (action === 'board' || action === 'gantt'))
   if (!dockOnly) {
     const fb = floatButtons.value.find(b => b.key === key)
     if (fb) openPanel(fb)
@@ -401,7 +403,7 @@ onUnmounted(() => {
 
 /* 右侧滑入面板 */
 .side-panel {
-  position: fixed; top: 0; right: 0; bottom: 0; width: 440px; z-index: 160;
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(640px, 92vw); z-index: 160;
   background: #fff; border-left: 1px solid #e4e7ed;
   box-shadow: -4px 0 20px rgba(0,0,0,0.1);
   display: flex; flex-direction: column; overflow: hidden;
