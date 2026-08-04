@@ -10,6 +10,20 @@
         @keyup.enter="quickAdd"
         @keyup.esc="showAdd = false"
       />
+      <el-button
+        size="small"
+        :type="newImportant ? 'warning' : 'default'"
+        :plain="!newImportant"
+        title="重要"
+        @click="newImportant = !newImportant"
+      >重</el-button>
+      <el-button
+        size="small"
+        :type="newUrgent ? 'danger' : 'default'"
+        :plain="!newUrgent"
+        title="紧急"
+        @click="newUrgent = !newUrgent"
+      >急</el-button>
       <el-button size="small" type="primary" :loading="adding" @click="quickAdd">添加</el-button>
     </div>
 
@@ -26,7 +40,19 @@
     >
       <div class="ttl-line1">
         <el-checkbox :model-value="t.done" @change="toggleDone(t, true)" />
-        <span class="ttl-tag" :style="{ background: quadOf(t).color }">{{ quadOf(t).label }}</span>
+        <!-- 优先级标签：点击可修改重要/紧急 -->
+        <el-dropdown trigger="click" @command="(q) => setQuadrant(t, q)">
+          <span class="ttl-tag clickable" :style="{ background: quadOf(t).color }">
+            {{ quadOf(t).label }}
+          </span>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item v-for="(q, key) in QUADS" :key="key" :command="key">
+                <span class="ttl-tag" :style="{ background: q.color }">{{ q.label }}</span>
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <span class="ttl-title" :title="t.title">{{ t.title }}</span>
         <span v-if="isTiming(t)" class="ttl-timing">⏱ {{ elapsed }}</span>
         <span v-else-if="t.estimated_minutes" class="ttl-est">预估{{ t.estimated_minutes }}m</span>
@@ -97,6 +123,8 @@ const nowTs = ref(Math.floor(Date.now() / 1000))
 // 内联添加
 const showAdd = ref(false)
 const newTitle = ref('')
+const newImportant = ref(false)
+const newUrgent = ref(false)
 const adding = ref(false)
 const addInputRef = ref(null)
 
@@ -209,13 +237,32 @@ async function quickAdd() {
   if (!title) return
   adding.value = true
   try {
-    await api.createTask({ title })
+    await api.createTask({
+      title,
+      important: newImportant.value,
+      urgent: newUrgent.value,
+    })
     newTitle.value = ''
+    newImportant.value = false
+    newUrgent.value = false
     await load()
   } catch (e) {
     ElMessage.error(e.message)
   } finally {
     adding.value = false
+  }
+}
+
+// 修改任务象限（重要/紧急）
+async function setQuadrant(t, q) {
+  const important = q === 'q1' || q === 'q2'
+  const urgent = q === 'q1' || q === 'q3'
+  if (t.important === important && t.urgent === urgent) return
+  try {
+    await api.updateTask(t.id, { important, urgent })
+    await load()
+  } catch (e) {
+    ElMessage.error(e.message)
   }
 }
 
@@ -302,6 +349,12 @@ onUnmounted(() => {
   line-height: 1;
   padding: 3px 6px;
   border-radius: 4px;
+}
+.ttl-tag.clickable {
+  cursor: pointer;
+}
+.ttl-tag.clickable:hover {
+  filter: brightness(1.1);
 }
 .ttl-title {
   flex: 1;

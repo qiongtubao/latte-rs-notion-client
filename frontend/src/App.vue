@@ -36,8 +36,18 @@
     </main>
 
     <!-- 今日任务列表：默认隐藏，点击「今日任务」按钮随子按钮一起显示/隐藏，跟随按钮拖动 -->
-    <aside v-if="todayDockOpen" class="today-dock" :style="dockStyle">
+    <aside v-if="dockOpen.today" class="today-dock" :style="todayDockStyle">
       <TodayTaskList />
+    </aside>
+
+    <!-- 金钱列表：同上，跟随「金钱」按钮 -->
+    <aside v-if="dockOpen.money" class="today-dock" :style="moneyDockStyle">
+      <MoneyExpenseList />
+    </aside>
+
+    <!-- 日历列表：同上，跟随「日历」按钮 -->
+    <aside v-if="dockOpen.calendar" class="today-dock" :style="calendarDockStyle">
+      <CalendarDayList />
     </aside>
 
     <!-- 浮动按钮层 -->
@@ -94,7 +104,6 @@ import { ElMessage } from 'element-plus'
 import { api } from './api'
 import SetupView from './views/SetupView.vue'
 import TodayView from './views/TodayView.vue'
-import TimeView from './views/TimeView.vue'
 import MoneyView from './views/MoneyView.vue'
 import CalendarView from './views/CalendarView.vue'
 import ProjectsView from './views/ProjectsView.vue'
@@ -102,6 +111,8 @@ import NotesView from './views/NotesView.vue'
 import IdeasView from './views/IdeasView.vue'
 import FloatingButton from './components/FloatingButton.vue'
 import TodayTaskList from './components/TodayTaskList.vue'
+import MoneyExpenseList from './components/MoneyExpenseList.vue'
+import CalendarDayList from './components/CalendarDayList.vue'
 
 const loading = ref(true)
 const configured = ref(false)
@@ -118,7 +129,6 @@ const todayStr = computed(() => dayjs().format('M月D日 dddd'))
 // 视图映射：浮动按钮 key → 对应视图组件（面板内渲染）
 const viewMap = {
   today: TodayView,
-  time: TimeView,
   money: MoneyView,
   calendar: CalendarView,
   projects: ProjectsView,
@@ -129,9 +139,13 @@ const subAction = ref(null)
 provide('subAction', subAction)
 
 function subActionHandler(key, action) {
-  // 今日任务的子按钮动作直接作用在按钮旁的精简列表上，不再弹大面板；
-  // 其他功能的子按钮仍然打开对应面板
-  if (key !== 'today') {
+  // 精简列表能直接处理的动作不弹大面板：
+  //   今日任务 - 添加/排序/完成/计时（「报表」走面板）
+  //   金钱     - 记一笔（「统计」走面板）
+  const dockOnly =
+    (key === 'today' && action !== 'report') ||
+    (key === 'money' && action === 'add')
+  if (!dockOnly) {
     const fb = floatButtons.value.find(b => b.key === key)
     if (fb) openPanel(fb)
   }
@@ -144,64 +158,73 @@ const floatButtons = computed(() => [
       { icon: '＋', label: '添加', handler: () => subActionHandler('today', 'add') },
       { icon: '▲', label: '排序', handler: () => subActionHandler('today', 'sort') },
       { icon: '✓', label: '完成', handler: () => subActionHandler('today', 'done') },
+      { icon: '▤', label: '报表', handler: () => subActionHandler('today', 'report') },
       timing.value
         ? { icon: '⏹', label: '结束计时', handler: () => subActionHandler('today', 'stop-timing') }
         : { icon: '▶', label: '开始计时', handler: () => subActionHandler('today', 'timing') },
     ] },
-  { key: 'time', icon: '⏱', label: '时间碎片', color: '#e6a23c', x: 130, y: 245,
-    subs: [
-      { icon: '▶', label: '开始计时', handler: () => subActionHandler('time', 'start') },
-      { icon: '▤', label: '报表', handler: () => subActionHandler('time', 'report') },
-    ] },
-  { key: 'money', icon: '💰', label: '金钱', color: '#67c23a', x: 130, y: 340,
+  { key: 'money', icon: '💰', label: '金钱', color: '#67c23a', x: 130, y: 245,
     subs: [
       { icon: '＋', label: '记一笔', handler: () => subActionHandler('money', 'add') },
       { icon: '☷', label: '统计', handler: () => subActionHandler('money', 'summary') },
     ] },
-  { key: 'calendar', icon: '📅', label: '日历', color: '#909399', x: 130, y: 435,
+  { key: 'calendar', icon: '📅', label: '日历', color: '#909399', x: 130, y: 340,
     subs: [] },
-  { key: 'projects', icon: '📊', label: '项目', color: '#e6a23c', x: 130, y: 530,
+  { key: 'projects', icon: '📊', label: '项目', color: '#e6a23c', x: 130, y: 435,
     subs: [
       { icon: '◫', label: '看板', handler: () => subActionHandler('projects', 'board') },
       { icon: '▤', label: '甘特', handler: () => subActionHandler('projects', 'gantt') },
     ] },
-  { key: 'notes', icon: '📚', label: '知识库', color: '#13c2c2', x: 130, y: 625,
+  { key: 'notes', icon: '📚', label: '知识库', color: '#13c2c2', x: 130, y: 530,
     subs: [] },
-  { key: 'ideas', icon: '💡', label: '好想法', color: '#faad14', x: 130, y: 720,
+  { key: 'ideas', icon: '💡', label: '好想法', color: '#faad14', x: 130, y: 625,
     subs: [] },
 ])
 const activePanelConfig = ref(null)
 const activeView = ref(null)
 
-// ---- 今日任务列表跟随「今日任务」按钮 ----
-const todayPos = reactive({ x: 130, y: 150 })
-const todayDockOpen = ref(false)
+// ---- 精简列表跟随按钮（今日任务/金钱）----
+const dockPos = reactive({
+  today: { x: 130, y: 150 },
+  money: { x: 130, y: 245 },
+  calendar: { x: 130, y: 340 },
+})
+const dockOpen = reactive({ today: false, money: false, calendar: false })
 function onFloatMove(fb, p) {
-  if (fb.key === 'today') {
-    todayPos.x = p.x
-    todayPos.y = p.y
+  if (fb.key in dockPos) {
+    dockPos[fb.key].x = p.x
+    dockPos[fb.key].y = p.y
   }
 }
 function onFloatToggle(fb, opened) {
-  // 今日任务：展开/收起子按钮时，右侧任务列表同步显示/隐藏
-  if (fb.key === 'today') todayDockOpen.value = opened
+  // 展开/收起子按钮时，对应精简列表同步显示/隐藏
+  if (fb.key in dockOpen) dockOpen[fb.key] = opened
 }
-const dockStyle = computed(() => {
+function makeDockStyle(pos) {
   // 面板顶边与按钮顶对齐，并夹在可视区域内
-  const top = Math.max(60, Math.min(todayPos.y - 28, window.innerHeight - 440))
-  return { left: todayPos.x + 90 + 'px', top: top + 'px' }
-})
+  const top = Math.max(60, Math.min(pos.y - 28, window.innerHeight - 440))
+  return { left: pos.x + 90 + 'px', top: top + 'px' }
+}
+const todayDockStyle = computed(() => makeDockStyle(dockPos.today))
+const moneyDockStyle = computed(() => makeDockStyle(dockPos.money))
+const calendarDockStyle = computed(() => makeDockStyle(dockPos.calendar))
 
 function openPanel(fb) {
   activePanel.value = fb.key
   activePanelConfig.value = fb
   activeView.value = markRaw(viewMap[fb.key] || TodayView)
 }
+// 精简列表组件可通过 inject('openPanel')('xxx') 打开对应完整面板
+provide('openPanel', (key) => {
+  const fb = floatButtons.value.find(b => b.key === key)
+  if (fb) openPanel(fb)
+})
 
 function onFloatOpen(fb) {
   // 有子按钮时，主按钮点击只展开/收起子按钮（由组件自己处理），不弹面板；
-  // 无子按钮（如日历）点击直接弹面板
-  if (fb.subs.length === 0) openPanel(fb)
+  // 日历点击切换精简日历列表（完整日历从列表里进）；
+  // 其余无子按钮的（知识库/好想法）点击直接弹面板
+  if (fb.subs.length === 0 && fb.key !== 'calendar') openPanel(fb)
 }
 
 function onFloatSub(fb, sub) {

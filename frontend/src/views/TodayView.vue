@@ -69,6 +69,14 @@
       <el-tag v-if="ongoingEvent" size="small" type="success" style="margin-left: 8px">
         ⏱ {{ ongoingEvent.content || '进行中' }} {{ ongoingDuration }}
       </el-tag>
+      <el-button
+        v-if="ongoingEvent"
+        size="small"
+        type="danger"
+        plain
+        style="margin-left: 6px"
+        @click="stopOngoing"
+      >⏹ 结束</el-button>
     </el-card>
 
     <!-- 任务列表 -->
@@ -187,6 +195,36 @@
       </div>
     </el-card>
 
+    <!-- 时间报表（原「时间碎片」的统计功能） -->
+    <el-card shadow="never" class="report-card">
+      <template #header>
+        <div class="section-header">
+          <span>时间报表</span>
+          <div class="report-controls">
+            <el-radio-group v-model="period" size="small" @change="loadReport">
+              <el-radio-button value="day">日</el-radio-button>
+              <el-radio-button value="week">周</el-radio-button>
+              <el-radio-button value="month">月</el-radio-button>
+              <el-radio-button value="year">年</el-radio-button>
+            </el-radio-group>
+            <el-button-group>
+              <el-button size="small" @click="shiftReport(-1)">←</el-button>
+              <el-button size="small" @click="reportDate = today; loadReport()">今天</el-button>
+              <el-button size="small" @click="shiftReport(1)">→</el-button>
+            </el-button-group>
+          </div>
+        </div>
+      </template>
+      <div class="report-range">{{ fmtRange(report.range_start) }} ~ {{ fmtRange(report.range_end) }}</div>
+      <div class="report-total">总时长：<b>{{ fmtDuration(report.total_seconds) }}</b></div>
+      <div v-for="item in report.by_tag" :key="item.tag" class="report-row">
+        <el-tag :type="tagType(item.tag)" size="small" class="report-tag">{{ item.tag }}</el-tag>
+        <el-progress :percentage="item.percent" :stroke-width="14" class="report-bar" />
+        <span class="report-seconds">{{ fmtDuration(item.seconds) }}</span>
+      </div>
+      <el-empty v-if="!report.by_tag || report.by_tag.length === 0" description="该时间段没有数据" :image-size="60" />
+    </el-card>
+
     <!-- 编辑弹窗 -->
     <el-dialog v-model="editDialog" title="编辑任务" width="420px">
       <el-form label-width="70px">
@@ -246,6 +284,7 @@ import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Bell, Delete, EditPen, Timer, VideoPlay } from '@element-plus/icons-vue'
 import { api } from '../api'
+import { fmtDuration, tagType } from '../utils'
 
 const PRIORITIES = ['高', '中', '低']
 const PRIORITY_TYPES = { 高: 'danger', 中: 'warning', 低: 'info' }
@@ -298,6 +337,45 @@ function fmtDur(secs) {
 const ongoingEvent = ref(null)
 const ongoingDuration = ref('')
 let ongoingTimer = null
+
+async function stopOngoing() {
+  if (!ongoingEvent.value) return
+  try {
+    await api.stopEvent(ongoingEvent.value.id)
+    ElMessage.success('计时已结束')
+    await loadOngoing()
+    await load()
+    loadTimeline()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+// 时间报表（原「时间碎片」移植）
+const today = dayjs().format('YYYY-MM-DD')
+const period = ref('day')
+const reportDate = ref(today)
+const report = ref({ range_start: '', range_end: '', total_seconds: 0, by_tag: [] })
+
+async function loadReport() {
+  try {
+    report.value = await api.getTimeReport(period.value, reportDate.value)
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+function shiftReport(delta) {
+  const unit = { day: 'day', week: 'week', month: 'month', year: 'year' }[period.value]
+  reportDate.value = dayjs(reportDate.value).add(delta, unit).format('YYYY-MM-DD')
+  loadReport()
+}
+
+// 报表范围是 unix 秒，格式化成日期
+function fmtRange(v) {
+  const n = Number(v)
+  return Number.isFinite(n) ? dayjs.unix(n).format('YYYY-MM-DD') : v
+}
 
 // 今日时间轴
 const timeline = ref([])
@@ -627,6 +705,11 @@ watch(subAction, (act) => {
     quadrantFilter.value = modes[(idx + 1) % modes.length]
   } else if (act.action === 'done') {
     doneCollapsed.value = !doneCollapsed.value
+  } else if (act.action === 'report') {
+    nextTick(() => {
+      const el = document.querySelector('.panel-body .report-card')
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
   }
 })
 
@@ -636,6 +719,7 @@ onMounted(async () => {
   loadOngoing()
   loadTimeline()
   loadProjects()
+  loadReport()
 })
 
 onUnmounted(() => {
@@ -703,4 +787,14 @@ onUnmounted(() => {
 
 .expense-card { margin-top: 14px; }
 .expense-row { display: flex; gap: 10px; align-items: center; }
+
+.report-card { margin-top: 14px; }
+.section-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+.report-controls { display: flex; gap: 10px; align-items: center; }
+.report-range { color: #909399; font-size: 13px; margin-bottom: 6px; }
+.report-total { margin-bottom: 14px; }
+.report-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.report-tag { width: 48px; text-align: center; }
+.report-bar { flex: 1; }
+.report-seconds { width: 70px; text-align: right; font-size: 13px; color: #606266; }
 </style>

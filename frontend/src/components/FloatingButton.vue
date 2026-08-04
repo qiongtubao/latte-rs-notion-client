@@ -72,13 +72,14 @@ function savePos() {
   } catch { /* 忽略存储失败 */ }
 }
 
-// ---- 子按钮位置：在主按钮左侧展开，以正左(180°)为中心上下各 30° 扇形 ----
+// ---- 子按钮位置：在主按钮左侧展开，以正左(180°)为中心，固定 30° 间隔防止重叠 ----
 const SUB_RADIUS = 74
+const SUB_STEP_DEG = 30 // 30px 按钮在 74px 半径上需要 ≥25° 间隔
 function subPos(i) {
   const n = props.subs.length
-  const startDeg = -150 // 左上
-  const endDeg = -210   // 左下
-  const deg = n <= 1 ? -180 : startDeg + ((endDeg - startDeg) * i) / (n - 1)
+  const span = (n - 1) * SUB_STEP_DEG
+  const startDeg = -180 - span / 2 // 从侧下方往侧上方排
+  const deg = n <= 1 ? -180 : startDeg + SUB_STEP_DEG * i
   const rad = (deg * Math.PI) / 180
   return {
     left: (65 + SUB_RADIUS * Math.cos(rad)) + 'px',

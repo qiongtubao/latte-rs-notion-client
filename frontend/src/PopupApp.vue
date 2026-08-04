@@ -24,21 +24,18 @@ import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { Close, FullScreen } from '@element-plus/icons-vue'
 import TodayView from './views/TodayView.vue'
-import TimeView from './views/TimeView.vue'
 import MoneyView from './views/MoneyView.vue'
 import CalendarView from './views/CalendarView.vue'
 import ProjectsView from './views/ProjectsView.vue'
 
 const viewMap = {
   today: TodayView,
-  time: TimeView,
   money: MoneyView,
   calendar: CalendarView,
   projects: ProjectsView,
 }
 const LABELS = {
   today: '今日任务',
-  time: '时间碎片',
   money: '金钱',
   calendar: '日历',
   projects: '项目',
