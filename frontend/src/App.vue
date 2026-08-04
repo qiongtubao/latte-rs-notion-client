@@ -132,18 +132,21 @@ function subActionHandler(key, action) {
   // 今日任务的子按钮动作直接作用在按钮旁的精简列表上，不再弹大面板；
   // 其他功能的子按钮仍然打开对应面板
   if (key !== 'today') {
-    const fb = floatButtons.find(b => b.key === key)
+    const fb = floatButtons.value.find(b => b.key === key)
     if (fb) openPanel(fb)
   }
   setTimeout(() => { subAction.value = { key, action } }, 50)
 }
 
-const floatButtons = [
+const floatButtons = computed(() => [
   { key: 'today', icon: '☑', label: '今日任务', color: '#409eff', x: 130, y: 150,
     subs: [
       { icon: '＋', label: '添加', handler: () => subActionHandler('today', 'add') },
       { icon: '▲', label: '排序', handler: () => subActionHandler('today', 'sort') },
       { icon: '✓', label: '完成', handler: () => subActionHandler('today', 'done') },
+      timing.value
+        ? { icon: '⏹', label: '结束计时', handler: () => subActionHandler('today', 'stop-timing') }
+        : { icon: '▶', label: '开始计时', handler: () => subActionHandler('today', 'timing') },
     ] },
   { key: 'time', icon: '⏱', label: '时间碎片', color: '#e6a23c', x: 130, y: 245,
     subs: [
@@ -166,7 +169,7 @@ const floatButtons = [
     subs: [] },
   { key: 'ideas', icon: '💡', label: '好想法', color: '#faad14', x: 130, y: 720,
     subs: [] },
-]
+])
 const activePanelConfig = ref(null)
 const activeView = ref(null)
 

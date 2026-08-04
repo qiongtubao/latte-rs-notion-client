@@ -345,6 +345,7 @@ fn event_json(ev: &Event, now: i64) -> Value {
         "content": ev.content,
         "tag": tag,
         "remind": ev.remind,
+        "task_id": ev.task_id,
         "duration_seconds": (ev.end_ts.unwrap_or(now) - ev.start_ts).max(0),
     })
 }

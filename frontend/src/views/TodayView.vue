@@ -288,6 +288,7 @@ const editForm = reactive({
 })
 
 function fmtDur(secs) {
+  if (secs < 60) return `${secs}s`
   const h = Math.floor(secs / 3600)
   const m = Math.round((secs % 3600) / 60)
   return h > 0 ? `${h}h${m}m` : `${m}m`
