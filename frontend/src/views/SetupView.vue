@@ -26,10 +26,29 @@
         <el-form-item label="页面 URL">
           <el-input v-model="form.page_url" placeholder="https://www.notion.so/xxxx" />
         </el-form-item>
-        <el-alert v-if="error" :title="error" type="error" :closable="false" class="err" />
         <el-form-item>
+          <el-button type="default" :loading="testing" @click="testConfig">测试配置</el-button>
           <el-button type="primary" :loading="submitting" @click="submit">完成配置</el-button>
         </el-form-item>
+        <!-- 测试结果展示 -->
+        <el-alert v-if="testResult" :title="testResult.title" :type="testResult.type" :closable="false" show-icon class="err">
+          <template #default>
+            <div v-if="testResult.detail" style="margin-top:4px; font-size:13px; line-height:1.6;">{{ testResult.detail }}</div>
+            <div v-if="testResult.databases && testResult.databases.length" style="margin-top:4px; font-size:13px;">
+              已找到数据库：
+              <el-tag v-for="db in testResult.databases" :key="db.id" size="small" style="margin:2px 4px 2px 0">
+                {{ db.title }}
+              </el-tag>
+            </div>
+            <div v-if="testResult.missing && testResult.missing.length" style="margin-top:4px; font-size:13px;">
+              未找到数据库：
+              <el-tag v-for="m in testResult.missing" :key="m" type="warning" size="small" style="margin:2px 4px 2px 0">
+                {{ m }}
+              </el-tag>
+            </div>
+          </template>
+        </el-alert>
+        <el-alert v-if="error" :title="error" type="error" :closable="false" class="err" />
       </el-form>
     </el-card>
   </div>
@@ -45,7 +64,73 @@ const emit = defineEmits(['done'])
 const form = reactive({ token: '', page_url: '' })
 const error = ref('')
 const submitting = ref(false)
+const testing = ref(false)
+const testResult = ref(null)
 
+async function testConfig() {
+  if (!form.token.trim() || !form.page_url.trim()) {
+    error.value = '请填写 Token 和页面 URL'
+    return
+  }
+  error.value = ''
+  testResult.value = null
+  testing.value = true
+  try {
+    const res = await api.verifySetup(form.token.trim(), form.page_url.trim())
+    if (!res.token_valid) {
+      testResult.value = {
+        type: 'error',
+        title: 'Token 无效或无权访问',
+        detail: '请检查 Token 是否正确，以及 Integration 是否已连接到目标页面。',
+        databases: [],
+        missing: ['时间碎片', '金钱记录', '项目管理'],
+      }
+    } else if (res.error) {
+      // token 有效但对象不可访问/类型不对（如数据库位于工作区根目录）
+      testResult.value = {
+        type: 'error',
+        title: '无法访问该页面',
+        detail: res.error,
+        databases: [],
+        missing: ['时间碎片', '金钱记录', '项目管理'],
+      }
+    } else {
+      // token 有效且已定位到根页面
+      const climbed = res.is_database
+        ? '检测到你填的 URL 指向的是一个数据库，已自动向上定位到它的父页面。'
+        : ''
+      if (res.missing && res.missing.length) {
+        testResult.value = {
+          type: 'warning',
+          title: 'Token 有效，但部分数据库未找到',
+          detail: (climbed ? climbed + ' ' : '') +
+            '以下数据库未在根页面下找到，点击「完成配置」将自动创建缺失的数据库。',
+          databases: res.databases,
+          missing: res.missing,
+        }
+      } else {
+        testResult.value = {
+          type: 'success',
+          title: '配置正确！所有数据库已就绪',
+          detail: (climbed ? climbed + ' ' : '') +
+            'Token 有效，已找到全部 3 个数据库与知识库页面。',
+          databases: res.databases,
+          missing: [],
+        }
+      }
+    }
+  } catch (e) {
+    testResult.value = {
+      type: 'error',
+      title: '验证失败',
+      detail: e.message,
+      databases: [],
+      missing: ['时间碎片', '金钱记录', '项目管理'],
+    }
+  } finally {
+    testing.value = false
+  }
+}
 async function submit() {
   if (!form.token.trim() || !form.page_url.trim()) {
     error.value = '请填写 Token 和页面 URL'

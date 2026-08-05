@@ -210,6 +210,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks", get(list_tasks).post(add_task))
         .route("/api/tasks/{id}", put(update_task).delete(delete_task))
         .route("/api/events/ongoing", get(ongoing_event))
+        .route("/api/sync/pull", post(sync_pull))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_configured,
@@ -226,6 +227,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/status", get(get_status))
         .route("/api/setup", post(setup))
+        .route("/api/setup/verify", post(setup_verify))
         .merge(protected)
         .merge(ext)
         .with_state(state)
@@ -271,14 +273,15 @@ async fn setup(
     }
     let page_id = config::parse_page_id(&body.page_url)
         .ok_or_else(|| ApiError::bad_request("无法从 page_url 解析出 Notion page id"))?;
-    // 用新 token 临时建一个客户端去创建 3 个数据库
-    let ids = NotionClient::new(token)
-        .create_databases(&page_id)
+    // 用新 token 临时建一个客户端；「先查询已有数据库 → 复用 → 只为缺失的创建」，
+    // 与 verify 共用 discover 逻辑，避免用户手动建好的库被重复创建而报错
+    let (ids, resolved_page_id) = NotionClient::new(token)
+        .setup_databases(&page_id)
         .await
         .map_err(|e| {
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
-                format!("创建 Notion 数据库失败: {e:#}"),
+                format!("Notion 配置失败: {e:#}"),
             )
         })?;
     // 保留已有 AI 配置、外部 API token 与懒建的 database id，避免重新 setup 时被默认值覆盖
@@ -299,7 +302,8 @@ async fn setup(
     }
     let cfg = Config {
         token: token.to_string(),
-        parent_page_id: page_id,
+        // 用解析后的根页面 id（用户若粘了 database URL，已向上爬升到父页面）
+        parent_page_id: resolved_page_id,
         events_db_id: ids.events_db_id,
         expenses_db_id: ids.expenses_db_id,
         projects_db_id: ids.projects_db_id,
@@ -318,6 +322,42 @@ async fn setup(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// 验证配置：校验 token + 查询父页面下已有的 Latte 数据库，不创建任何对象。
+async fn setup_verify(
+    State(_state): State<AppState>,
+    Json(body): Json<SetupBody>,
+) -> ApiResult<Json<Value>> {
+    let token = body.token.trim();
+    if token.is_empty() {
+        return Err(ApiError::bad_request("token 不能为空"));
+    }
+    let page_id = config::parse_page_id(&body.page_url)
+        .ok_or_else(|| ApiError::bad_request("无法从 page_url 解析出 Notion page id"))?;
+    let result = NotionClient::new(token).verify_setup(&page_id).await;
+    // 统计已找到的数据库
+    let found_db_titles: Vec<&str> = result
+        .databases
+        .iter()
+        .map(|d| d.title.as_str())
+        .collect();
+    let missing: Vec<&str> = ["时间碎片", "金钱记录", "项目管理"]
+        .iter()
+        .filter(|t| !found_db_titles.contains(t))
+        .copied()
+        .collect();
+    Ok(Json(json!({
+        "token_valid": result.token_valid,
+        "databases": result.databases,
+        "notes_page_id": result.notes_page_id,
+        "missing": missing,
+        // 输入指向 database 时已自动爬升到父页面；前端据此提示用户
+        "is_database": result.is_database,
+        "resolved_page_id": result.resolved_page_id,
+        "error": result.error,
+        "ok": result.token_valid && result.error.is_none() && missing.is_empty(),
+    })))
+}
+
 async fn sync_now(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let outcome = sync_once(&state.db, &state.client, &state.config).await;
     let pending = pending_count(&state);
@@ -327,6 +367,38 @@ async fn sync_now(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         s.pending = pending;
     }
     Ok(Json(json!({ "ok": true, "pending": pending })))
+}
+
+/// 从 Notion 全量拉取 5 个 database 覆盖本地（单事务）。
+///
+/// 远端为事实来源：本地存在但远端没有的行被删除；已同步行的本地专属字段
+///（事件 remind/task_id、任务 pomodoro/estimated/notes）按 notion_page_id 保留。
+async fn sync_pull(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let cfg = state
+        .config
+        .lock()
+        .map(|c| c.clone())
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "配置锁不可用"))?;
+    let data = state.client.pull_all(&cfg).await.map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("从 Notion 拉取失败: {e:#}"),
+        )
+    })?;
+    let counts = {
+        let db = lock_db(&state)?;
+        db.pull_replace_all(&data).map_err(ApiError::internal)?
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "counts": {
+            "events": counts.events,
+            "expenses": counts.expenses,
+            "projects": counts.projects,
+            "ideas": counts.ideas,
+            "tasks": counts.tasks,
+        }
+    })))
 }
 
 // ---------------- 事件 ----------------

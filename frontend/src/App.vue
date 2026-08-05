@@ -24,6 +24,7 @@
           <el-icon><BellFilled v-if="remindOn" /><Bell v-else /></el-icon>
         </el-button>
         <el-button size="small" :loading="syncing" @click="doSync">同步</el-button>
+        <el-button size="small" :loading="pulling" @click="doPull">拉取</el-button>
       </div>
     </header>
 
@@ -115,7 +116,7 @@ import dayjs from 'dayjs'
 import {
   Bell, BellFilled, Close, Loading, Refresh
 } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from './api'
 import SetupView from './views/SetupView.vue'
 import TodayView from './views/TodayView.vue'
@@ -136,6 +137,7 @@ const loading = ref(true)
 const configured = ref(false)
 const status = ref({ last_sync: null, last_error: null, pending: 0 })
 const syncing = ref(false)
+const pulling = ref(false)
 const activePanel = ref(null)
 const panelRefreshKey = ref(0)
 const timing = ref(false)
@@ -333,6 +335,26 @@ async function doSync() {
     ElMessage.success(`同步完成，待同步 ${r.pending} 条`); await fetchStatus()
   } catch (e) { ElMessage.error(`同步失败：${e.message}`); await fetchStatus() }
   finally { syncing.value = false }
+}
+
+// 从 Notion 全量拉取覆盖本地：远端为事实来源，本地多余行会被删除
+async function doPull() {
+  try {
+    await ElMessageBox.confirm(
+      '将从 Notion 远端重新拉取全部数据并覆盖本地（本地多余的数据会被删除）。已同步行的本地专属字段（如提醒、番茄钟数）会保留。是否继续？',
+      '拉取并覆盖本地',
+      { confirmButtonText: '拉取', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch { return } // 用户取消
+  pulling.value = true
+  try {
+    const r = await api.pullFromNotion()
+    const c = r.counts || {}
+    ElMessage.success(`拉取完成：事件 ${c.events ?? 0} · 消费 ${c.expenses ?? 0} · 项目 ${c.projects ?? 0} · 想法 ${c.ideas ?? 0} · 任务 ${c.tasks ?? 0}`)
+    panelRefreshKey.value++ // 触发各列表刷新
+    await fetchStatus()
+  } catch (e) { ElMessage.error(`拉取失败：${e.message}`); await fetchStatus() }
+  finally { pulling.value = false }
 }
 function onSetupDone() { configured.value = true; fetchStatus() }
 

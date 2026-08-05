@@ -14,7 +14,8 @@ function unwrap(promise) {
 export const api = {
   getStatus: () => unwrap(http.get('/status')),
   setup: (token, page_url) => unwrap(http.post('/setup', { token, page_url })),
-  sync: () => unwrap(http.post('/sync')),
+  verifySetup: (token, page_url) => unwrap(http.post('/setup/verify', { token, page_url })),
+  pullFromNotion: () => unwrap(http.post('/sync/pull')),
 
   getEvents: (date) => unwrap(http.get('/events', { params: { date } })),
   createEvent: (data) => unwrap(http.post('/events', data)),

@@ -14,6 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 use chrono::{Local, NaiveDate, TimeZone};
 
+use crate::notion::PulledData;
 use crate::models::{
     Category, Event, Expense, ExtRecord, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus,
     Tag, Task, TaskPriority,
@@ -35,6 +36,16 @@ const TASK_COLS: &str =
     "id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted, task_type, project_id, start_ts";
 const EXT_RECORD_COLS: &str =
     "ns, id, title, props_json, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted";
+
+/// 拉取覆盖后的各类计数
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct PullCounts {
+    pub events: usize,
+    pub expenses: usize,
+    pub projects: usize,
+    pub ideas: usize,
+    pub tasks: usize,
+}
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
@@ -1503,6 +1514,137 @@ impl Db {
             }
         }
         Ok(())
+    }
+
+    // ---------- 远端拉取覆盖本地 ----------
+
+
+    /// 用远端拉取的全量数据覆盖本地 5 个表（单事务，失败回滚）。
+    ///
+    /// 对已同步过的行（按 notion_page_id 匹配）保留本地专属字段：
+    /// 事件的 remind/task_id、任务的 pomodoro_count/estimated_minutes/notes。
+    /// 其余字段以远端为准；本地存在但远端没有的行被删除（远端为事实来源）。
+    pub fn pull_replace_all(&self, data: &PulledData) -> Result<PullCounts> {
+        self.conn.execute_batch("BEGIN")?;
+        let res = (|| {
+            let events = self.replace_events(&data.events)?;
+            let expenses = self.replace_expenses(&data.expenses)?;
+            let projects = self.replace_projects(&data.projects)?;
+            let ideas = self.replace_ideas(&data.ideas)?;
+            let tasks = self.replace_tasks(&data.tasks)?;
+            Ok(PullCounts {
+                events,
+                expenses,
+                projects,
+                ideas,
+                tasks,
+            })
+        })();
+        match res {
+            Ok(c) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(c)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// 覆盖 events：保留旧行 remind/task_id，其余以远端为准
+    fn replace_events(&self, remote: &[Event]) -> Result<usize> {
+        let existing: HashMap<String, (bool, Option<String>)> = self
+            .conn
+            .prepare("SELECT notion_page_id, remind, task_id FROM events WHERE notion_page_id IS NOT NULL")?
+            .query_map([], |r| {
+                let npid: String = r.get(0)?;
+                let remind: i64 = r.get(1).unwrap_or(0);
+                let task_id: Option<String> = r.get(2).unwrap_or(None);
+                Ok((npid, (remind != 0, task_id)))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        self.conn.execute("DELETE FROM events", [])?;
+        for ev in remote {
+            let (remind, task_id) = ev
+                .notion_page_id
+                .as_ref()
+                .and_then(|id| existing.get(id).cloned())
+                .unwrap_or((false, None));
+            self.conn.execute(
+                "INSERT INTO events (id, start_ts, end_ts, content, tag, remind, task_id, notion_page_id, dirty, deleted)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,0)",
+                params![ev.id, ev.start_ts, ev.end_ts, ev.content, ev.tag.label(), remind, task_id, ev.notion_page_id],
+            )?;
+        }
+        Ok(remote.len())
+    }
+
+    fn replace_expenses(&self, remote: &[Expense]) -> Result<usize> {
+        self.conn.execute("DELETE FROM expenses", [])?;
+        for ex in remote {
+            self.conn.execute(
+                "INSERT INTO expenses (id, item, amount_cents, ts, category, notion_page_id, dirty, deleted)
+                 VALUES (?1,?2,?3,?4,?5,?6,0,0)",
+                params![ex.id, ex.item, ex.amount_cents, ex.ts, ex.category.label(), ex.notion_page_id],
+            )?;
+        }
+        Ok(remote.len())
+    }
+
+    fn replace_projects(&self, remote: &[Project]) -> Result<usize> {
+        self.conn.execute("DELETE FROM projects", [])?;
+        for p in remote {
+            self.conn.execute(
+                "INSERT INTO projects (id, name, status, start_ts, deadline_ts, note, notion_page_id, dirty, deleted)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,0,0)",
+                params![p.id, p.name, p.status.label(), p.start_ts, p.deadline_ts, p.note, p.notion_page_id],
+            )?;
+        }
+        Ok(remote.len())
+    }
+
+    fn replace_ideas(&self, remote: &[Idea]) -> Result<usize> {
+        self.conn.execute("DELETE FROM ideas", [])?;
+        for i in remote {
+            self.conn.execute(
+                "INSERT INTO ideas (id, content, tag, pinned, created_ts, updated_ts, notion_page_id, dirty, deleted)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,0,0)",
+                params![i.id, i.content, i.tag.label(), i.pinned, i.created_ts, i.updated_ts, i.notion_page_id],
+            )?;
+        }
+        Ok(remote.len())
+    }
+
+    /// 覆盖 tasks：保留旧行 pomodoro_count/estimated_minutes/notes，其余以远端为准
+    fn replace_tasks(&self, remote: &[Task]) -> Result<usize> {
+        let existing: HashMap<String, (i32, Option<i32>, String)> = self
+            .conn
+            .prepare("SELECT notion_page_id, pomodoro_count, estimated_minutes, notes FROM tasks WHERE notion_page_id IS NOT NULL")?
+            .query_map([], |r| {
+                let npid: String = r.get(0)?;
+                let pomo: i32 = r.get(1).unwrap_or(0);
+                let est: Option<i32> = r.get(2).unwrap_or(None);
+                let notes: String = r.get(3).unwrap_or_default();
+                Ok((npid, (pomo, est, notes)))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        self.conn.execute("DELETE FROM tasks", [])?;
+        for t in remote {
+            let (pomo, est, notes) = t
+                .notion_page_id
+                .as_ref()
+                .and_then(|id| existing.get(id).cloned())
+                .unwrap_or((0, None, String::new()));
+            self.conn.execute(
+                "INSERT INTO tasks (id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted, task_type, project_id, start_ts)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,0,?14,?15,?16)",
+                params![t.id, t.date, t.title, t.priority.label(), t.important, t.urgent, pomo, est, notes, t.done, t.created_ts, t.updated_ts, t.notion_page_id, t.task_type, t.project_id, t.start_ts],
+            )?;
+        }
+        Ok(remote.len())
     }
 }
 
