@@ -350,7 +350,7 @@ async function doPull() {
   try {
     const r = await api.pullFromNotion()
     const c = r.counts || {}
-    ElMessage.success(`拉取完成：事件 ${c.events ?? 0} · 消费 ${c.expenses ?? 0} · 项目 ${c.projects ?? 0} · 想法 ${c.ideas ?? 0} · 任务 ${c.tasks ?? 0}`)
+    ElMessage.success(`拉取完成：事件 ${c.events ?? 0} · 消费 ${c.expenses ?? 0} · 项目 ${c.projects ?? 0} · 想法 ${c.ideas ?? 0} · 任务 ${c.tasks ?? 0} · 知识库 ${c.notes ?? 0}`)
     panelRefreshKey.value++ // 触发各列表刷新
     await fetchStatus()
   } catch (e) { ElMessage.error(`拉取失败：${e.message}`); await fetchStatus() }

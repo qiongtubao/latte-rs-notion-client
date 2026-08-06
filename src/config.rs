@@ -17,9 +17,9 @@ pub struct Config {
     pub expenses_db_id: String,
     #[serde(default)]
     pub projects_db_id: String,
-    /// 知识库根页面 id（setup 时创建；旧配置缺失时由同步任务补建并回填）
+    /// 知识库 database id（setup 时创建；旧配置缺失时由同步任务补建并回填）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notes_root_page_id: Option<String>,
+    pub notes_db_id: Option<String>,
     /// 「好想法」database id（同步任务懒建并回填；None 表示尚未创建）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ideas_db_id: Option<String>,
@@ -149,24 +149,24 @@ mod tests {
     const HYPHEN: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
     #[test]
-    fn config_roundtrip_with_notes_root_page_id() {
+    fn config_roundtrip_with_notes_db_id() {
         let mut cfg = Config::default();
         // None 时不落盘，读取回来仍是 None
         let text = toml::to_string_pretty(&cfg).unwrap();
-        assert!(!text.contains("notes_root_page_id"));
+        assert!(!text.contains("notes_db_id"));
         assert!(!text.contains("ideas_db_id"));
         assert!(!text.contains("tasks_db_id"));
         let parsed: Config = toml::from_str(&text).unwrap();
-        assert_eq!(parsed.notes_root_page_id, None);
+        assert_eq!(parsed.notes_db_id, None);
         assert_eq!(parsed.ideas_db_id, None);
         assert_eq!(parsed.tasks_db_id, None);
         // Some 时正常往返
-        cfg.notes_root_page_id = Some("page-1".into());
+        cfg.notes_db_id = Some("db-notes".into());
         cfg.ideas_db_id = Some("db-1".into());
         cfg.tasks_db_id = Some("db-2".into());
         let text = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
-        assert_eq!(parsed.notes_root_page_id.as_deref(), Some("page-1"));
+        assert_eq!(parsed.notes_db_id.as_deref(), Some("db-notes"));
         assert_eq!(parsed.ideas_db_id.as_deref(), Some("db-1"));
         assert_eq!(parsed.tasks_db_id.as_deref(), Some("db-2"));
     }

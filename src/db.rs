@@ -45,6 +45,7 @@ pub struct PullCounts {
     pub projects: usize,
     pub ideas: usize,
     pub tasks: usize,
+    pub notes: usize,
 }
 
 impl Db {
@@ -175,6 +176,18 @@ impl Db {
         Self::add_column_if_missing(self, "tasks", "task_type", "TEXT NOT NULL DEFAULT ''")?;
         Self::add_column_if_missing(self, "tasks", "project_id", "TEXT")?;
         Self::add_column_if_missing(self, "tasks", "start_ts", "INTEGER")?;
+        // 知识库结构升级（页面树 -> database 行）：清空旧 notion_page_id 并置 dirty，
+        // 促使下次同步把笔记重新建到新的「📚 知识库」database。用 user_version 防重复执行
+        let uv: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if uv < 1 {
+            let _ = self
+                .conn
+                .execute("UPDATE notes SET notion_page_id = NULL, dirty = 1", []);
+            self.conn.execute_batch("PRAGMA user_version = 1")?;
+        }
         Ok(())
     }
 
@@ -1532,12 +1545,14 @@ impl Db {
             let projects = self.replace_projects(&data.projects)?;
             let ideas = self.replace_ideas(&data.ideas)?;
             let tasks = self.replace_tasks(&data.tasks)?;
+            let notes = self.replace_notes(&data.notes)?;
             Ok(PullCounts {
                 events,
                 expenses,
                 projects,
                 ideas,
                 tasks,
+                notes,
             })
         })();
         match res {
@@ -1642,6 +1657,19 @@ impl Db {
                 "INSERT INTO tasks (id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted, task_type, project_id, start_ts)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,0,?14,?15,?16)",
                 params![t.id, t.date, t.title, t.priority.label(), t.important, t.urgent, pomo, est, notes, t.done, t.created_ts, t.updated_ts, t.notion_page_id, t.task_type, t.project_id, t.start_ts],
+            )?;
+        }
+        Ok(remote.len())
+    }
+
+    /// 覆盖 notes：远端为事实来源，全量清空后插入（无本地专属字段需保留）
+    fn replace_notes(&self, remote: &[Note]) -> Result<usize> {
+        self.conn.execute("DELETE FROM notes", [])?;
+        for n in remote {
+            self.conn.execute(
+                "INSERT INTO notes (id, parent_id, kind, title, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,0)",
+                params![n.id, n.parent_id, n.kind.label(), n.title, n.content_md, n.created_ts, n.updated_ts, n.notion_page_id],
             )?;
         }
         Ok(remote.len())

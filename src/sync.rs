@@ -5,7 +5,7 @@
 //! - deleted = 1 → 归档远端（archived: true）后物理删除本地行
 //! - 单行失败保留 dirty，下轮重试，不影响其他行
 //! - 知识库（notes）按「父先子后」处理：父还没同步出 page id 的子行本轮跳过；
-//!   config 缺 notes_root_page_id 时先补建根页面并持久化
+//!   config 缺 notes_db_id 时先补建「📚 知识库」database（含自关联「父级」）并持久化
 //! - 好想法（ideas）：config 缺 ideas_db_id 时先补建「好想法」database 并持久化，
 //!   建不出则整批记 failed
 //! - 今日任务（tasks）：同 ideas，config 缺 tasks_db_id 时懒建「今日任务」database
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use chrono::Local;
 use tokio::sync::Notify;
 
@@ -167,11 +167,14 @@ async fn push_task(
     }
 }
 
-/// 知识库条目：父页面 id 仅在新建时用到
+/// 知识库条目：镜像为「📚 知识库」database 中的行（page）。
+/// notes_db_id 为知识库 database id；parent_notion_id 为父笔记的 Notion page id
+///（根级笔记为 None，relation 置空）。文档正文以本地为准全量替换 block。
 async fn push_note(
     client: &NotionClient,
     note: &Note,
-    parent_page_id: Option<&str>,
+    notes_db_id: &str,
+    parent_notion_id: Option<&str>,
 ) -> Result<PushResult> {
     if note.deleted {
         if let Some(pid) = &note.notion_page_id {
@@ -180,7 +183,7 @@ async fn push_note(
         Ok(PushResult::Archived)
     } else if let Some(pid) = &note.notion_page_id {
         client
-            .update_page(pid, &notion::note_title_properties(&note.title))
+            .update_page(pid, &notion::note_properties(&note.title, note.kind, parent_notion_id))
             .await?;
         // 文档内容以本地为准全量替换（doc 不会有子页面，删 block 是安全的）
         if note.kind == NoteKind::Doc {
@@ -190,8 +193,10 @@ async fn push_note(
         }
         Ok(PushResult::Updated)
     } else {
-        let parent = parent_page_id.ok_or_else(|| anyhow!("知识库父页面 id 缺失"))?;
-        let pid = client.create_child_page(parent, &note.title).await?;
+        // 新建行：parent 为 database_id；properties 含标题/类型/父级 relation
+        let pid = client
+            .create_page(notes_db_id, &notion::note_properties(&note.title, note.kind, parent_notion_id))
+            .await?;
         if note.kind == NoteKind::Doc && !note.content_md.is_empty() {
             client
                 .append_children(&pid, notion::md_to_blocks(&note.content_md))
@@ -573,52 +578,42 @@ async fn sync_notes(
     outcome: &mut SyncOutcome,
     record: &impl Fn(&mut SyncOutcome, Result<PushResult>, &str) -> Option<PushResult>,
 ) {
-    // 确保知识库根页面存在；旧配置缺失时补建并持久化
-    let root_id = match cfg_snap.notes_root_page_id.clone() {
-        Some(id) if !id.is_empty() => Some(id),
-        _ => match client
-            .create_child_page(&cfg_snap.parent_page_id, "📚 知识库")
-            .await
-        {
+    // 确保知识库 database 存在；旧配置缺失时补建（含自关联「父级」）并持久化
+    let notes_db_id = match cfg_snap.notes_db_id.clone() {
+        Some(id) if !id.is_empty() => id,
+        _ => match client.create_notes_db(&cfg_snap.parent_page_id).await {
             Ok(id) => {
                 if let Ok(mut c) = cfg.lock() {
-                    c.notes_root_page_id = Some(id.clone());
+                    c.notes_db_id = Some(id.clone());
                     if let Err(e) = config::save(&c) {
                         outcome.error = Some(format!("知识库: 配置写盘失败: {e:#}"));
                     }
                 }
-                Some(id)
+                id
             }
             Err(e) => {
                 outcome.failed += notes.len();
                 if outcome.error.is_none() {
-                    outcome.error = Some(format!("知识库: 创建根页面失败: {e:#}"));
+                    outcome.error = Some(format!("知识库: 创建数据库失败: {e:#}"));
                 }
-                None
+                return;
             }
         },
-    };
-    let Some(root_id) = root_id else {
-        return;
     };
 
     let all_map: HashMap<String, Note> = all_notes.into_iter().map(|n| (n.id.clone(), n)).collect();
     notes.sort_by_key(|n| note_depth(n, &all_map));
     for note in notes {
-        // 新建时解析 Notion 父页面：父 note 的 page id，否则根页面；
-        // 父还没同步出 page id 的本轮跳过（保留 dirty，下轮再来）
-        let parent = if note.deleted || note.notion_page_id.is_some() {
-            None
-        } else {
-            match note.parent_id.as_deref() {
-                Some(pid) => match all_map.get(pid).and_then(|p| p.notion_page_id.clone()) {
-                    Some(id) => Some(id),
-                    None => continue,
-                },
-                None => Some(root_id.clone()),
-            }
+        // 解析父级 Notion page id（用于 relation）：父 note 的 page id，根级笔记为 None
+        let parent_notion_id = match note.parent_id.as_deref() {
+            Some(pid) => all_map.get(pid).and_then(|p| p.notion_page_id.clone()),
+            None => None,
         };
-        let r = push_note(client, &note, parent.as_deref()).await;
+        // 新建且有父级，但父级尚未同步出 page id -> 本轮跳过（保留 dirty，下轮再来）
+        if note.notion_page_id.is_none() && note.parent_id.is_some() && parent_notion_id.is_none() {
+            continue;
+        }
+        let r = push_note(client, &note, &notes_db_id, parent_notion_id.as_deref()).await;
         if let Some(res) = record(outcome, r, "知识库")
             && let Ok(g) = db.lock()
         {

@@ -13,7 +13,13 @@
     </div>
 
     <!-- 空态 -->
-    <div v-if="!loading && flatNodes.length === 0 && !query" class="ntl-empty">知识库还是空的</div>
+      <div v-if="!loading && flatNodes.length === 0 && !query" class="ntl-empty">
+        知识库还是空的
+        <div class="ntl-empty-actions">
+          <el-button size="small" @click="createNode('dir', null)">📁 新建目录</el-button>
+          <el-button size="small" @click="createNode('doc', null)">📄 新建文档</el-button>
+        </div>
+      </div>
 
     <div v-else class="nte-body">
       <!-- 左侧：目录树 / 搜索结果（右键新建目录/文档） -->
@@ -155,14 +161,14 @@ function closeCtx() {
   ctx.show = false
 }
 
-async function createNode(kind) {
+async function createNode(kind, target = ctx.target) {
   closeCtx()
-  // 目标为目录 → 建在其内；目标为文档 → 建在其同级；空白处 → 根目录
-  const parentId = !ctx.target
+  // 目标为目录 -> 建在其内；目标为文档 -> 建在其同级；空白处 -> 根目录
+  const parentId = !target
     ? null
-    : ctx.target.kind === 'dir'
-      ? ctx.target.id
-      : ctx.target.parentId
+    : target.kind === 'dir'
+      ? target.id
+      : target.parentId
   const label = kind === 'dir' ? '目录' : '文档'
   let title
   try {
@@ -373,6 +379,12 @@ onUnmounted(() => {
   font-size: 13px;
   text-align: center;
   padding: 24px 0;
+}
+.ntl-empty-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  justify-content: center;
 }
 .nte-body {
   display: flex;

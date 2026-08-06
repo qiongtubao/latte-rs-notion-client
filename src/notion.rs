@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::models::{Category, Event, Expense, Idea, IdeaTag, Project, ProjectStatus, Tag, Task, TaskPriority};
+use crate::models::{Category, Event, Expense, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus, Tag, Task, TaskPriority};
 
 pub const BASE_URL: &str = "https://api.notion.com/v1";
 pub const NOTION_VERSION: &str = "2022-06-28";
@@ -25,7 +25,7 @@ pub struct DatabaseIds {
     pub events_db_id: String,
     pub expenses_db_id: String,
     pub projects_db_id: String,
-    pub notes_page_id: String,
+    pub notes_db_id: String,
 }
 
 /// 从 Notion 拉取并解析后的全量数据（覆盖本地用）
@@ -36,6 +36,7 @@ pub struct PulledData {
     pub projects: Vec<Project>,
     pub ideas: Vec<Idea>,
     pub tasks: Vec<Task>,
+    pub notes: Vec<Note>,
 }
 
 /// 验证/查询结果：token 是否有效、找到哪些数据库
@@ -45,8 +46,8 @@ pub struct SetupVerifyResult {
     pub token_valid: bool,
     /// 父页面下找到的数据库列表
     pub databases: Vec<FoundDatabase>,
-    /// 父页面下找到的知识库页面 id（None 表示未找到）
-    pub notes_page_id: Option<String>,
+    /// 找到的知识库 database id（None 表示未找到，未配置也不影响 setup）
+    pub notes_db_id: Option<String>,
     /// 输入的 page_id 实际指向一个 database（用户粘错了 URL），已自动向上定位父页面
     pub is_database: bool,
     /// 解析后真正作为根的页面 id（爬升后可能与输入不同）
@@ -174,7 +175,7 @@ impl NotionClient {
             .ok_or_else(|| anyhow!("Notion 响应缺少 database id"))
     }
 
-    /// 在指定 database 中新建 page，返回 page id
+    /// 在指定 database 中新建 page（行），返回 page id
     pub async fn create_page(&self, database_id: &str, properties: &Value) -> Result<String> {
         let body = json!({
             "parent": { "type": "database_id", "database_id": database_id },
@@ -190,6 +191,7 @@ impl NotionClient {
             .ok_or_else(|| anyhow!("Notion 响应缺少 page id"))
     }
 
+    /// 更新 page 的 properties（PATCH /pages/{id}）
     pub async fn update_page(&self, page_id: &str, properties: &Value) -> Result<()> {
         let body = json!({ "properties": properties });
         self.send(reqwest::Method::PATCH, &format!("/pages/{page_id}"), &body)
@@ -197,8 +199,6 @@ impl NotionClient {
             .context("更新 Notion 页面失败")?;
         Ok(())
     }
-
-    /// 补充 database 属性定义（同名同类型属性幂等，用于给旧 tasks 库补新增列）
     pub async fn update_database(&self, database_id: &str, properties: &Value) -> Result<()> {
         let body = json!({ "properties": properties });
         self.send(reqwest::Method::PATCH, &format!("/databases/{database_id}"), &body)
@@ -316,19 +316,6 @@ impl NotionClient {
         Ok(json!({ "results": all }))
     }
 
-    /// 提取子 block 的显示标题。
-    ///
-    /// `/blocks/{page_id}/children` 返回的是 block 对象（`object: "block"`），
-    /// 其中 `child_database` / `child_page` 两类 block 的标题分别内嵌在
-    /// `child_database.title` / `child_page.title`（字符串，非富文本数组）。
-    /// 其他类型 block 不代表 Latte 的库/页面，返回 None。
-    fn block_title(obj: &Value) -> Option<&str> {
-        match obj["type"].as_str() {
-            Some("child_database") => obj["child_database"]["title"].as_str(),
-            Some("child_page") => obj["child_page"]["title"].as_str(),
-            _ => None,
-        }
-    }
 
     /// 从 /search 返回的 database 对象中提取显示标题。
     ///
@@ -395,24 +382,6 @@ impl NotionClient {
         Ok(found)
     }
 
-    /// 在根页面的直接子对象里查找「📚 知识库」页面，返回其 id（None 表示未找到）。
-    ///
-    /// 知识库页面始终由 Latte 在根页面下创建，故只查直接子级即可。
-    async fn find_notes_page(&self, root_page_id: &str) -> Result<Option<String>> {
-        let resp = self.child_objects(root_page_id).await?;
-        if let Some(results) = resp["results"].as_array() {
-            for obj in results {
-                if let Some(title) = Self::block_title(obj) {
-                    if title.starts_with("📚 知识库") {
-                        if let Some(id) = obj["id"].as_str() {
-                            return Ok(Some(id.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
 
 
     /// 解析 page_id 实际指向的对象类型，必要时向上爬升到普通页面。
@@ -468,14 +437,14 @@ impl NotionClient {
     /// 验证配置：校验 token + 查询父页面下已有的 Latte 数据库。
     ///
     /// 即使 token 有效但父页面查询失败（如类型非页面），仍返回 `token_valid`，
-    /// 由调用方读取 `databases` / `notes_page_id` 判断缺失项。
+    /// 由调用方读取 `databases` / `notes_db_id` 判断缺失项。
     pub async fn verify_setup(&self, page_id: &str) -> SetupVerifyResult {
         let token_valid = self.verify_token().await.is_ok();
         if !token_valid {
             return SetupVerifyResult {
                 token_valid,
                 databases: Vec::new(),
-                notes_page_id: None,
+                notes_db_id: None,
                 is_database: false,
                 resolved_page_id: None,
                 error: Some("Token 无效或无权访问 Notion".into()),
@@ -488,7 +457,7 @@ impl NotionClient {
                 return SetupVerifyResult {
                     token_valid,
                     databases: Vec::new(),
-                    notes_page_id: None,
+                    notes_db_id: None,
                     is_database: false,
                     resolved_page_id: None,
                     error: Some(format!("{e:#}")),
@@ -502,7 +471,7 @@ impl NotionClient {
                 return SetupVerifyResult {
                     token_valid,
                     databases: Vec::new(),
-                    notes_page_id: None,
+                    notes_db_id: None,
                     is_database,
                     resolved_page_id: Some(root_page_id),
                     error: Some(format!("{e:#}")),
@@ -510,23 +479,23 @@ impl NotionClient {
             }
         };
         let mut databases = Vec::new();
+        let mut notes_db_id = None;
         for (id, title) in &found_dbs {
-            if ["时间碎片", "金钱记录", "项目管理"].contains(&title.as_str()) {
-                databases.push(FoundDatabase {
-                    title: title.clone(),
-                    id: id.clone(),
-                });
+            match title.as_str() {
+                "时间碎片" | "金钱记录" | "项目管理" => {
+                    databases.push(FoundDatabase {
+                        title: title.clone(),
+                        id: id.clone(),
+                    });
+                }
+                "📚 知识库" => notes_db_id = Some(id.clone()),
+                _ => {}
             }
         }
-        // 知识库页面：在根页面直接子级查找（始终由 Latte 创建在根页面下）
-        let notes_page_id = match self.find_notes_page(&root_page_id).await {
-            Ok(v) => v,
-            Err(_) => None,
-        };
         SetupVerifyResult {
             token_valid,
             databases,
-            notes_page_id,
+            notes_db_id,
             is_database,
             resolved_page_id: Some(root_page_id),
             error: None,
@@ -570,27 +539,17 @@ impl NotionClient {
             Some(v) => v.clone(),
             None => self.create_db_return(projects_db_body(&root_page_id)).await?,
         };
-        // 知识库页面：在根页面直接子级查找，找不到则在根页面下创建
-        let notes_page_id = match self.find_notes_page(&root_page_id).await? {
-            Some(id) => id,
-            None => {
-                let resp = self
-                    .send(
-                        reqwest::Method::POST,
-                        "/pages",
-                        &notes_root_body(&root_page_id),
-                    )
-                    .await
-                    .context("创建「📚 知识库」页面失败")?;
-                resp["id"].as_str().unwrap_or_default().to_string()
-            }
+        // 知识库 database：复用已存在的「📚 知识库」DB，否则新建并补自关联「父级」
+        let notes_db_id = match by_title.get("📚 知识库") {
+            Some(v) => v.clone(),
+            None => self.create_notes_db(&root_page_id).await?,
         };
         Ok((
             DatabaseIds {
                 events_db_id,
                 expenses_db_id,
                 projects_db_id,
-                notes_page_id,
+                notes_db_id,
             },
             root_page_id,
         ))
@@ -605,6 +564,19 @@ impl NotionClient {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Notion 响应缺少 database id"))
+    }
+
+    /// 创建「📚 知识库」database 并补自关联「父级」relation，返回 database id。
+    /// 建库时无自身 id，故自关联需建库后单独 PATCH。
+    pub async fn create_notes_db(&self, parent_page_id: &str) -> Result<String> {
+        let id = self
+            .create_db_return(notes_db_body(parent_page_id))
+            .await
+            .context("创建「📚 知识库」数据库失败")?;
+        self.update_database(&id, &notes_relation_schema(&id))
+            .await
+            .context("为知识库补建「父级」自关联失败")?;
+        Ok(id)
     }
 
     /// 查询一个 database 的全部 page（分页 `POST /databases/{id}/query`）
@@ -686,13 +658,57 @@ impl NotionClient {
             Some(id) => self.query_and_parse(id, parse_idea_page).await?,
             None => Vec::new(),
         };
+        // 知识库：查 database 行，按「父级」relation 回填本地 parent_id，
+        // 文档类型另拉页面 block 还原 content_md
+        let notes = match cfg.notes_db_id.as_ref() {
+            Some(id) => self.pull_notes(id).await?,
+            None => Vec::new(),
+        };
         Ok(PulledData {
             events,
             expenses,
             projects,
             ideas,
             tasks,
+            notes,
         })
+    }
+
+    /// 拉取知识库 database 的全部行并还原为本地 Note 树。
+    ///
+    /// 1. 查询 database 全部行 -> 解析 (Note, 父级 Notion page id)
+    /// 2. 建立 notion_page_id -> 本地 id 映射，回填每条 Note 的 parent_id
+    /// 3. 文档（Doc）类型另拉页面直属 block，用 blocks_to_md 还原 content_md
+    pub async fn pull_notes(&self, notes_db_id: &str) -> Result<Vec<Note>> {
+        let pages = self.query_database(notes_db_id).await?;
+        let mut parsed: Vec<(Note, Option<String>)> =
+            pages.iter().filter_map(parse_note_page).collect();
+        // notion_page_id -> 本地 id
+        let id_map: std::collections::HashMap<String, String> = parsed
+            .iter()
+            .filter_map(|(n, _)| {
+                n.notion_page_id.clone().map(|pid| (pid, n.id.clone()))
+            })
+            .collect();
+        let mut notes = Vec::with_capacity(parsed.len());
+        for (mut n, parent_notion_id) in parsed.drain(..) {
+            // 回填 parent_id
+            n.parent_id = parent_notion_id
+                .as_ref()
+                .and_then(|pid| id_map.get(pid).cloned());
+            // 文档类型：拉页面 block 还原正文
+            if n.kind == NoteKind::Doc {
+                if let Some(pid) = n.notion_page_id.as_ref() {
+                    if let Ok(blocks) = self.child_objects(pid).await {
+                        if let Some(results) = blocks["results"].as_array() {
+                            n.content_md = blocks_to_md(results);
+                        }
+                    }
+                }
+            }
+            notes.push(n);
+        }
+        Ok(notes)
     }
 }
 
@@ -920,15 +936,70 @@ pub fn task_properties(task: &Task, project_name: Option<&str>) -> Value {
     Value::Object(props)
 }
 
-/// 「📚 知识库」根页面（父页面下的普通子页面）
-pub fn notes_root_body(parent_page_id: &str) -> Value {
+/// 知识库 NoteKind -> Notion select 选项名（本地存 dir/doc，Notion 用中文更直观）
+pub fn note_kind_label(k: NoteKind) -> &'static str {
+    match k {
+        NoteKind::Dir => "目录",
+        NoteKind::Doc => "文档",
+    }
+}
+
+/// Notion select 选项名 -> NoteKind（未知值归为目录）
+pub fn note_kind_from_label(s: &str) -> NoteKind {
+    match s {
+        "文档" => NoteKind::Doc,
+        _ => NoteKind::Dir,
+    }
+}
+
+/// 「📚 知识库」database：名称(title)、类型(select 目录/文档)。
+/// 父级关系（自关联）需在建库后用 notes_relation_schema 单独 PATCH，因为建库时
+/// 尚无自身的 database id。
+pub fn notes_db_body(parent_page_id: &str) -> Value {
+    db_body(
+        parent_page_id,
+        "📚 知识库",
+        json!({
+            "名称": { "title": {} },
+            "类型": { "select": { "options": [
+                { "name": "目录", "color": "blue" },
+                { "name": "文档", "color": "green" }
+            ] } },
+        }),
+    )
+}
+
+/// 知识库自关联「父级」relation 属性的 schema（PATCH /databases/{id} 用）。
+/// database_id 指向自身，实现目录树层级。
+pub fn notes_relation_schema(db_id: &str) -> Value {
     json!({
-        "parent": { "type": "page_id", "page_id": parent_page_id },
-        "properties": note_title_properties("📚 知识库"),
+        "父级": {
+            "relation": {
+                "database_id": db_id,
+                "type": "single_property",
+                "single_property": {}
+            }
+        }
     })
 }
 
-/// 知识库页面的标题属性（普通子页面的 title 属性名固定为 "title"）
+/// 知识库行 -> Notion page properties。
+/// parent_notion_id 为父笔记的 Notion page id（根级笔记为 None，relation 置空）。
+pub fn note_properties(title: &str, kind: NoteKind, parent_notion_id: Option<&str>) -> Value {
+    let mut props = serde_json::Map::new();
+    props.insert("名称".into(), title_prop(title));
+    props.insert("类型".into(), select_prop(note_kind_label(kind)));
+    props.insert(
+        "父级".into(),
+        match parent_notion_id {
+            Some(id) => json!({ "relation": [{ "id": id }] }),
+            None => json!({ "relation": [] }),
+        },
+    );
+    Value::Object(props)
+}
+
+/// 普通子页面的标题属性（title 属性名固定为 "title"）；外部记录页面用
 pub fn note_title_properties(title: &str) -> Value {
     json!({ "title": title_prop(title) })
 }
@@ -1004,6 +1075,38 @@ pub fn md_to_blocks(md: &str) -> Vec<Value> {
         blocks.push(block);
     }
     blocks
+}
+
+/// Notion blocks -> Markdown（md_to_blocks 的逆函数，用于拉取知识库文档内容）。
+///
+/// 支持 heading 1/2/3、无序/有序列表、引用、代码块（带语言）、分隔线、段落；
+/// child_page/child_database 等非内容 block 跳过。一行一个 block，不合并富文本。
+pub fn blocks_to_md(blocks: &[Value]) -> String {
+    let mut lines = Vec::new();
+    for b in blocks {
+        let t = b["type"].as_str().unwrap_or("");
+        let md = match t {
+            "heading_1" => format!("# {}", read_plain(&b["heading_1"]["rich_text"])),
+            "heading_2" => format!("## {}", read_plain(&b["heading_2"]["rich_text"])),
+            "heading_3" => format!("### {}", read_plain(&b["heading_3"]["rich_text"])),
+            "bulleted_list_item" => {
+                format!("- {}", read_plain(&b["bulleted_list_item"]["rich_text"]))
+            }
+            "numbered_list_item" => {
+                format!("1. {}", read_plain(&b["numbered_list_item"]["rich_text"]))
+            }
+            "quote" => format!("> {}", read_plain(&b["quote"]["rich_text"])),
+            "code" => {
+                let lang = b["code"]["language"].as_str().unwrap_or("plain text");
+                format!("```{}\n{}\n```", lang, read_plain(&b["code"]["rich_text"]))
+            }
+            "divider" => "---".to_string(),
+            "paragraph" => read_plain(&b["paragraph"]["rich_text"]),
+            _ => continue, // child_page / child_database 等非内容 block 跳过
+        };
+        lines.push(md);
+    }
+    lines.join("\n")
 }
 
 /// 外部记录 → 页面内容 blocks：props 的 json 代码块 + content_md 转换结果。
@@ -1234,6 +1337,38 @@ pub fn parse_task_page(page: &Value) -> Option<(Task, Option<String>)> {
         deleted: false,
     };
     Some((task, project_name))
+}
+
+/// 解析「📚 知识库」database 的一个行 page。
+/// 返回 `(Note, 父级 Notion page id)`：父级 id 用于在 pull_notes 中按 notion_page_id
+/// 映射回本地 parent_id。文档正文（content_md）不在此解析，由 pull_notes 单独拉 block。
+pub fn parse_note_page(page: &Value) -> Option<(Note, Option<String>)> {
+    let props = &page["properties"];
+    let notion_page_id = page["id"].as_str()?.to_string();
+    let title = prop_title(props, "名称");
+    let kind = prop_select(props, "类型")
+        .map(|s| note_kind_from_label(&s))
+        .unwrap_or(NoteKind::Doc);
+    // 父级 relation：取第一个关联 page id
+    let parent_notion_id = props["父级"]["relation"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r["id"].as_str())
+        .map(String::from);
+    let created_ts = page_created_ts(page);
+    let note = Note {
+        id: Uuid::new_v4().to_string(),
+        parent_id: None, // 由 pull_notes 按 parent_notion_id 回填
+        kind,
+        title,
+        content_md: String::new(), // 由 pull_notes 为 Doc 单独拉取
+        created_ts,
+        updated_ts: created_ts,
+        notion_page_id: Some(notion_page_id),
+        dirty: false,
+        deleted: false,
+    };
+    Some((note, parent_notion_id))
 }
 
 #[cfg(test)]
@@ -1505,14 +1640,27 @@ mod tests {
     }
 
     #[test]
-    fn notes_root_body_is_child_page() {
-        let body = notes_root_body("parent-id");
+    fn notes_db_body_has_title_and_kind_select() {
+        let body = notes_db_body("parent-id");
         assert_eq!(body["parent"]["type"], "page_id");
         assert_eq!(body["parent"]["page_id"], "parent-id");
-        assert_eq!(
-            body["properties"]["title"]["title"][0]["text"]["content"],
-            "📚 知识库"
-        );
+        assert_eq!(body["title"][0]["text"]["content"], "📚 知识库");
+        assert!(body["properties"]["名称"]["title"].is_object());
+        let opts = body["properties"]["类型"]["select"]["options"].as_array().unwrap();
+        let names: Vec<&str> = opts.iter().map(|o| o["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["目录", "文档"]);
+    }
+
+    /// 防御：note_properties 写入标题/类型/父级 relation（无父级时 relation 为空数组）
+    #[test]
+    fn note_properties_with_and_without_parent() {
+        let p = note_properties("笔记", NoteKind::Doc, Some("parent-id"));
+        assert_eq!(p["名称"]["title"][0]["text"]["content"], "笔记");
+        assert_eq!(p["类型"]["select"]["name"], "文档");
+        assert_eq!(p["父级"]["relation"][0]["id"], "parent-id");
+        let p2 = note_properties("目录", NoteKind::Dir, None);
+        assert_eq!(p2["类型"]["select"]["name"], "目录");
+        assert!(p2["父级"]["relation"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1604,37 +1752,6 @@ mod tests {
             blocks[0]["code"]["rich_text"][0]["text"]["content"],
             "not json"
         );
-    }
-    /// 防御：block_title 从 child_database block 的 child_database.title 取标题
-    #[test]
-    fn block_title_reads_child_database() {
-        // /blocks/{page_id}/children 返回的 child_database block 结构
-        let obj = json!({
-            "object": "block",
-            "id": "d1",
-            "type": "child_database",
-            "child_database": { "title": "时间碎片" }
-        });
-        assert_eq!(NotionClient::block_title(&obj), Some("时间碎片"));
-    }
-
-    /// 防御：block_title 从 child_page block 取标题（知识库页面）
-    #[test]
-    fn block_title_reads_child_page() {
-        let obj = json!({
-            "object": "block",
-            "id": "p1",
-            "type": "child_page",
-            "child_page": { "title": "📚 知识库" }
-        });
-        assert_eq!(NotionClient::block_title(&obj), Some("📚 知识库"));
-    }
-
-    /// 防御：非库/页面 block（段落、列表等）返回 None，不会被误识别为 Latte 库
-    #[test]
-    fn block_title_none_for_other_blocks() {
-        let obj = json!({"object": "block", "id": "b1", "type": "paragraph"});
-        assert_eq!(NotionClient::block_title(&obj), None);
     }
 
     /// 防御：search_db_title 从 /search 返回的 database 对象的 title 富文本数组取标题
@@ -1755,6 +1872,60 @@ mod tests {
         let mut p2 = page.clone();
         p2["properties"]["项目"] = json!({ "rich_text": [] });
         assert_eq!(parse_task_page(&p2).unwrap().1, None);
+    }
+
+    /// 防御：blocks_to_md 还原 heading/列表/代码块/分隔线/段落，跳过 child_page
+    #[test]
+    fn blocks_to_md_roundtrip() {
+        let blocks = md_to_blocks("# 标题\n- 项目\n1. 步骤\n> 引用\n\n段落\n");
+        let md = blocks_to_md(&blocks);
+        assert!(md.contains("# 标题"));
+        assert!(md.contains("- 项目"));
+        assert!(md.contains("1. 步骤"));
+        assert!(md.contains("> 引用"));
+        assert!(md.contains("段落"));
+
+        // 代码块语言与内容还原
+        let blocks = md_to_blocks("```rust\nfn main() {}\n```\n");
+        assert_eq!(blocks_to_md(&blocks), "```rust\nfn main() {}\n```");
+
+        // child_page block 被跳过（不当作内容）
+        let cp = json!({"type": "child_page", "child_page": {"title": "子页"}});
+        let blocks = vec![cp, json!({"type":"paragraph","paragraph":{"rich_text":[{"plain_text":"x"}]}})];
+        assert_eq!(blocks_to_md(&blocks), "x");
+    }
+
+    /// 防御：parse_note_page 还原标题/类型/父级 relation
+    #[test]
+    fn parse_note_page_fields_and_parent() {
+        let page = json!({
+            "id": "n1",
+            "created_time": "2024-08-01T00:00:00.000Z",
+            "properties": {
+                "名称": { "title": [{"plain_text": "我的笔记"}] },
+                "类型": { "select": { "name": "文档" } },
+                "父级": { "relation": [{ "id": "parent-notion-id" }] }
+            }
+        });
+        let (n, parent) = parse_note_page(&page).unwrap();
+        assert_eq!(n.title, "我的笔记");
+        assert_eq!(n.kind, NoteKind::Doc);
+        assert_eq!(parent.as_deref(), Some("parent-notion-id"));
+        assert!(n.content_md.is_empty()); // 正文由 pull_notes 单独拉
+        assert!(n.parent_id.is_none()); // 由 pull_notes 回填
+
+        // 目录类型 + 无父级
+        let page2 = json!({
+            "id": "n2", "created_time": "2024-08-01T00:00:00.000Z",
+            "properties": {
+                "名称": { "title": [{"plain_text": "目录"}] },
+                "类型": { "select": { "name": "目录" } },
+                "父级": { "relation": [] }
+            }
+        });
+        let (n2, p2) = parse_note_page(&page2).unwrap();
+        assert_eq!(n2.kind, NoteKind::Dir);
+        assert_eq!(p2, None);
     }
 
     /// 防御：parse_notion_date_ts 同时支持 RFC3339 与纯日期

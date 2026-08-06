@@ -307,7 +307,7 @@ async fn setup(
         events_db_id: ids.events_db_id,
         expenses_db_id: ids.expenses_db_id,
         projects_db_id: ids.projects_db_id,
-        notes_root_page_id: Some(ids.notes_page_id),
+        notes_db_id: Some(ids.notes_db_id),
         ideas_db_id,
         tasks_db_id,
         api_token,
@@ -348,7 +348,7 @@ async fn setup_verify(
     Ok(Json(json!({
         "token_valid": result.token_valid,
         "databases": result.databases,
-        "notes_page_id": result.notes_page_id,
+        "notes_db_id": result.notes_db_id,
         "missing": missing,
         // 输入指向 database 时已自动爬升到父页面；前端据此提示用户
         "is_database": result.is_database,
@@ -397,6 +397,7 @@ async fn sync_pull(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             "projects": counts.projects,
             "ideas": counts.ideas,
             "tasks": counts.tasks,
+            "notes": counts.notes,
         }
     })))
 }
