@@ -389,7 +389,8 @@ onUnmounted(() => {
 .nte-body {
   display: flex;
   gap: 8px;
-  height: 340px;
+  height: calc(70vh - 52px);
+  min-height: 360px;
 }
 .nte-tree {
   width: 180px;

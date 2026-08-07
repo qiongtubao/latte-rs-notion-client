@@ -595,7 +595,7 @@ onMounted(loadTree)
 
 .tree-panel {
   flex: 0 0 280px;
-  max-height: 72vh;
+  max-height: 80vh;
   overflow: auto;
 }
 
@@ -645,7 +645,7 @@ onMounted(loadTree)
 
 .content-panel {
   flex: 1;
-  min-height: 400px;
+  min-height: 560px;
 }
 
 .doc-header {

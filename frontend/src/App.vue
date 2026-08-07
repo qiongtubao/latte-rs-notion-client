@@ -57,7 +57,7 @@
     </aside>
 
     <!-- 知识库：编辑器式布局（左目录右内容），更宽 -->
-    <aside v-if="dockOpen.notes" class="today-dock dock-wide" :style="notesDockStyle">
+    <aside v-if="dockOpen.notes" class="today-dock dock-notes" :style="notesDockStyle">
       <NoteList />
     </aside>
 
@@ -90,7 +90,7 @@
       <div v-if="activePanel" class="panel-overlay" @click="closePanel()" />
     </Transition>
     <Transition name="panel-slide">
-      <aside v-if="activePanel" class="side-panel">
+      <aside v-if="activePanel" class="side-panel" :class="{ 'side-panel-wide': activePanel === 'notes' }">
         <div class="panel-header">
           <span class="panel-title">{{ activePanelConfig?.label }}</span>
           <div class="panel-ops">
@@ -413,6 +413,10 @@ onUnmounted(() => {
 .today-dock.dock-wide {
   width: 560px;
 }
+/* 知识库 dock 更宽更高，便于文档阅读 */
+.today-dock.dock-notes {
+  width: min(860px, 92vw);
+}
 .empty-icon { font-size: 64px; margin-bottom: 12px; opacity: 0.5; }
 .empty-hint { font-size: 14px; }
 
@@ -429,6 +433,10 @@ onUnmounted(() => {
   background: #fff; border-left: 1px solid #e4e7ed;
   box-shadow: -4px 0 20px rgba(0,0,0,0.1);
   display: flex; flex-direction: column; overflow: hidden;
+}
+/* 知识库完整视图需要更宽以容纳目录树+内容 */
+.side-panel.side-panel-wide {
+  width: min(1080px, 95vw);
 }
 .panel-header {
   display: flex; align-items: center; justify-content: space-between;
