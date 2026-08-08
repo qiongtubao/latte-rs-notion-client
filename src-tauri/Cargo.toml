@@ -25,3 +25,4 @@ tauri = { version = "2.11.2", features = ["tray-icon", "image-png"] }
 tauri-plugin-log = "2"
 latte = { path = ".." }
 tokio = { version = "1", features = ["full"] }
+tauri-plugin-global-shortcut = "2"

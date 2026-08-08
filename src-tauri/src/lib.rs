@@ -17,6 +17,7 @@ use tauri::{
     tray::TrayIconBuilder,
     Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 const SERVER_URL: &str = "http://127.0.0.1:3210";
 /// 悬浮球 key 列表（与前端视图一一对应）
@@ -210,8 +211,28 @@ const FLOATING_UI_ENABLED: bool = false;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PopupKey::new(None))
         .setup(|app| {
+            // 全局快捷键：Alt+Q 呼出主窗口并唤起快速录入（即使窗口未聚焦/已隐藏）
+            use tauri_plugin_global_shortcut::{ShortcutEvent, ShortcutState};
+            use tauri::Emitter;
+            let _ = app.handle().global_shortcut().on_shortcut(
+                "Alt+Q",
+                |app, _shortcut, event: ShortcutEvent| {
+                    // event 即 GlobalHotKeyEvent（插件别名），仅按下时触发一次
+                    if event.state == ShortcutState::Pressed {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                        let _ = app.emit("latte-global-quick-entry", ());
+                    }
+                },
+            );
+
+
             // 主窗口关闭时仅隐藏（退出走托盘菜单），保证后台同步与到点提醒存活
             if let Some(main) = app.get_webview_window("main") {
                 let w = main.clone();

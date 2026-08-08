@@ -11,7 +11,7 @@
       <span class="brand">☕ Latte</span>
       <span class="top-date">{{ todayStr }}</span>
       <div class="top-right">
-        <el-button size="small" @click="openQuickEntry">⚡ 快录<span class="kbd-hint">Ctrl+K</span></el-button>
+        <el-button size="small" @click="openQuickEntry">⚡ 快录<span class="kbd-hint">Ctrl+K · Alt+Q</span></el-button>
         <!-- 全局搜索：远程子串匹配，选中后打开对应面板（知识库会定位到文档） -->
         <el-select
           v-model="searchPick"
@@ -128,6 +128,7 @@
     <!-- AI 快速录入：一句话 → 解析预览 → 确认创建 -->
     <el-dialog v-model="qeDialog" title="⚡ 快速录入" width="460px">
       <el-input
+        ref="qeInputRef"
         v-model="qeText"
         placeholder="午饭 25 / 明天下午3点开会提醒我 / 灵感：……"
         @keyup.enter="qeParse"
@@ -188,7 +189,7 @@
 </template>
 
 <script setup>
-import { computed, markRaw, onMounted, onUnmounted, provide, reactive, ref } from 'vue'
+import { computed, markRaw, nextTick, onMounted, onUnmounted, provide, reactive, ref } from 'vue'
 import dayjs from 'dayjs'
 import TodayView from './views/TodayView.vue'
 import MoneyView from './views/MoneyView.vue'
@@ -454,6 +455,7 @@ const qeText = ref('')
 const qeParsing = ref(false)
 const qeSaving = ref(false)
 const qeDraft = ref(null)
+const qeInputRef = ref(null)
 
 const QE_TYPE_LABELS = { expense: '💰 消费', event: '📅 日程事件', idea: '💡 想法', task: '☑ 任务' }
 const qeTypeLabel = computed(() => (qeDraft.value ? QE_TYPE_LABELS[qeDraft.value.type] || qeDraft.value.type : ''))
@@ -478,11 +480,12 @@ const qeFields = computed(() => {
       return []
   }
 })
-
 function openQuickEntry() {
   qeText.value = ''
   qeDraft.value = null
   qeDialog.value = true
+  // 弹窗渲染完成后聚焦输入框，便于全局快捷键唤出后直接打字
+  nextTick(() => qeInputRef.value?.focus?.())
 }
 
 // Ctrl/Cmd+K 全局唤起快速录入
@@ -619,16 +622,33 @@ async function doReset() {
 }
 function onSetupDone() { configured.value = true; fetchStatus() }
 
+// ---------- Tauri 全局快捷键（Alt+Q）→ 唤起快速录入 ----------
+// 仅桌面壳注入 Tauri 时生效；浏览器/纯 Web 下静默跳过
+let tauriUnlisten = null
+async function setupTauriQuickEntry() {
+  try {
+    // 动态导入：避免 Web 版打包时硬依赖 Tauri API
+    const { listen } = await import('@tauri-apps/api/event')
+    tauriUnlisten = await listen('latte-global-quick-entry', () => {
+      if (configured.value) openQuickEntry()
+    })
+  } catch {
+    tauriUnlisten = null
+  }
+}
+
 onMounted(() => {
   fetchStatus()
   pollTimer = setInterval(() => { if (configured.value) fetchStatus() }, 30000)
   checkTiming()
   timingTimer = setInterval(checkTiming, 5000)
   window.addEventListener('keydown', onGlobalKey)
+  setupTauriQuickEntry()
 })
 onUnmounted(() => {
   clearInterval(pollTimer); clearInterval(timingTimer)
   window.removeEventListener('keydown', onGlobalKey)
+  if (tauriUnlisten) tauriUnlisten()
 })
 </script>
 
