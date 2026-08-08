@@ -14,7 +14,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -36,6 +36,21 @@ pub struct AppState {
     pub client: Arc<NotionClient>,
     pub config: Arc<Mutex<Config>>,
     pub sync_status: Arc<Mutex<SyncStatus>>,
+    /// 进行中的番茄钟会话（内存态；进程重启即丢失，关联的计时事件不受影响）
+    pub pomodoro: Arc<Mutex<Option<PomodoroSession>>>,
+}
+
+/// 番茄钟时长（分钟）
+pub const POMODORO_MINUTES: i64 = 25;
+
+/// 一个进行中的番茄钟会话
+#[derive(Clone, Debug)]
+pub struct PomodoroSession {
+    pub event_id: String,
+    pub task_id: String,
+    pub task_title: String,
+    pub minutes: i64,
+    pub end_ts: i64,
 }
 
 // ---------------- 错误与工具 ----------------
@@ -183,6 +198,7 @@ pub fn router(state: AppState) -> Router {
             // 图片 base64 体积大，单独放宽 body limit 到 15MB
             post(recognize_events).layer(DefaultBodyLimit::max(15 * 1024 * 1024)),
         )
+        .route("/api/ai/quick-entry", post(ai_quick_entry))
         .route("/api/reports/time", get(time_report))
         .route("/api/expenses", get(list_expenses).post(add_expense))
         .route("/api/expenses/summary", get(expenses_summary))
@@ -207,10 +223,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ideas/{id}", put(update_idea).delete(delete_idea))
         .route("/api/tasks/rollover", post(rollover_tasks))
         .route("/api/tasks/{id}/pomodoro", post(pomodoro_task))
+        .route("/api/pomodoro", get(get_pomodoro))
+        .route("/api/pomodoro/cancel", post(cancel_pomodoro))
         .route("/api/tasks", get(list_tasks).post(add_task))
         .route("/api/tasks/{id}", put(update_task).delete(delete_task))
         .route("/api/events/ongoing", get(ongoing_event))
+        .route("/api/search", get(search_all))
+        .route("/api/reminders/toggle", post(toggle_reminders))
+        .route("/api/export", get(export_json))
+        .route("/api/export/csv", get(export_csv))
         .route("/api/sync/pull", post(sync_pull))
+        .route("/api/data/reset", post(reset_data))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_configured,
@@ -236,11 +259,11 @@ pub fn router(state: AppState) -> Router {
 // ---------------- 状态与初始化 ----------------
 
 async fn get_status(State(state): State<AppState>) -> Json<Value> {
-    let configured = state
+    let (configured, remind_enabled) = state
         .config
         .lock()
-        .map(|c| config::is_configured(&c))
-        .unwrap_or(false);
+        .map(|c| (config::is_configured(&c), c.remind_enabled))
+        .unwrap_or((false, false));
     let pending = pending_count(&state);
     let (last_sync, last_error) = match state.sync_status.lock() {
         Ok(mut s) => {
@@ -254,7 +277,29 @@ async fn get_status(State(state): State<AppState>) -> Json<Value> {
         "last_sync": last_sync,
         "last_error": last_error,
         "pending": pending,
+        "remind_enabled": remind_enabled,
     }))
+}
+
+#[derive(Deserialize)]
+struct RemindToggleBody {
+    enabled: bool,
+}
+
+/// 到点提醒总开关：更新共享配置并持久化；提醒由后端系统通知发出（页面关了也有效）
+async fn toggle_reminders(
+    State(state): State<AppState>,
+    Json(body): Json<RemindToggleBody>,
+) -> ApiResult<Json<Value>> {
+    {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "配置锁不可用"))?;
+        cfg.remind_enabled = body.enabled;
+        config::save(&cfg).map_err(ApiError::internal)?;
+    }
+    Ok(Json(json!({ "ok": true, "remind_enabled": body.enabled })))
 }
 
 #[derive(Deserialize)]
@@ -284,8 +329,8 @@ async fn setup(
                 format!("Notion 配置失败: {e:#}"),
             )
         })?;
-    // 保留已有 AI 配置、外部 API token 与懒建的 database id，避免重新 setup 时被默认值覆盖
-    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id) = state
+    // 保留已有 AI 配置、外部 API token、提醒开关与懒建的 database id，避免重新 setup 时被默认值覆盖
+    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id, remind_enabled) = state
         .config
         .lock()
         .map(|c| {
@@ -294,6 +339,7 @@ async fn setup(
                 c.api_token.clone(),
                 c.ideas_db_id.clone(),
                 c.tasks_db_id.clone(),
+                c.remind_enabled,
             )
         })
         .unwrap_or_default();
@@ -311,6 +357,7 @@ async fn setup(
         ideas_db_id,
         tasks_db_id,
         api_token,
+        remind_enabled,
         ai: ai_cfg,
     };
     config::save(&cfg).map_err(ApiError::internal)?;
@@ -400,6 +447,137 @@ async fn sync_pull(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             "notes": counts.notes,
         }
     })))
+}
+
+/// 清空本地全部业务数据（保留 Notion token/页面配置与 ext 命名空间凭证）。
+///
+/// 仅删本地，不动远端；之后由前端调用 /api/sync/pull 重新拉取。
+/// 未同步（dirty）的本地修改与仅本地保存的字段会丢失，前端需在确认框中明确告知。
+async fn reset_data(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    {
+        let db = lock_db(&state)?;
+        db.clear_all_data().map_err(ApiError::internal)?;
+    }
+    if let Ok(mut s) = state.sync_status.lock() {
+        s.pending = 0;
+        s.last_error = None;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+/// 全局搜索：?q=关键词，在知识库/任务/想法/事件/消费/项目里做子串匹配
+async fn search_all(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<Value>> {
+    let kw = q.q.trim();
+    if kw.is_empty() {
+        return Err(ApiError::bad_request("q 不能为空"));
+    }
+    let db = lock_db(&state)?;
+    let hits = db.search(kw).map_err(ApiError::internal)?;
+    let list: Vec<Value> = hits
+        .iter()
+        .map(|h| {
+            json!({
+                "kind": h.kind,
+                "id": h.id,
+                "title": h.title,
+                "snippet": h.snippet,
+                "sort_ts": h.sort_ts,
+            })
+        })
+        .collect();
+    Ok(Json(json!(list)))
+}
+
+// ---------------- 数据导出 ----------------
+
+/// 全量导出（JSON）：本地全部未删除的业务数据，供备份/迁移
+async fn export_json(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let now = now_ts();
+    let db = lock_db(&state)?;
+    let events = db.all_events().map_err(ApiError::internal)?;
+    let expenses = db.all_expenses().map_err(ApiError::internal)?;
+    let projects = db.all_projects().map_err(ApiError::internal)?;
+    let notes = db.all_notes().map_err(ApiError::internal)?;
+    let ideas = db.all_ideas(None).map_err(ApiError::internal)?;
+    let tasks = db.all_tasks().map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "exported_at": now,
+        "events": events.iter().map(|e| event_json(e, now)).collect::<Vec<_>>(),
+        "expenses": expenses.iter().map(expense_json).collect::<Vec<_>>(),
+        "projects": projects.iter().map(project_json).collect::<Vec<_>>(),
+        "notes": notes.iter().map(note_json).collect::<Vec<_>>(),
+        "ideas": ideas.iter().map(idea_json).collect::<Vec<_>>(),
+        "tasks": tasks.iter().map(|t| task_json(t, 0)).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct ExportCsvQuery {
+    entity: Option<String>,
+}
+
+/// unix 秒 → 本地 "YYYY-MM-DD HH:mm"
+fn fmt_local(ts: i64) -> String {
+    chrono::Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// CSV 单元格：整体加引号，内部引号双写
+fn csv_cell(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// CSV 导出（事件/消费）；带 BOM 方便 Excel 直接打开中文
+async fn export_csv(
+    State(state): State<AppState>,
+    Query(q): Query<ExportCsvQuery>,
+) -> ApiResult<Response> {
+    let db = lock_db(&state)?;
+    let mut out = String::from("\u{FEFF}");
+    match q.entity.as_deref() {
+        Some("events") => {
+            out.push_str("开始,结束,内容,标签\n");
+            for ev in db.all_events().map_err(ApiError::internal)? {
+                let end = ev.end_ts.map(fmt_local).unwrap_or_default();
+                out.push_str(&format!(
+                    "{},{},{},{}\n",
+                    csv_cell(&fmt_local(ev.start_ts)),
+                    csv_cell(&end),
+                    csv_cell(&ev.content),
+                    csv_cell(ev.tag.label()),
+                ));
+            }
+        }
+        Some("expenses") => {
+            out.push_str("时间,事项,分类,金额(元)\n");
+            for ex in db.all_expenses().map_err(ApiError::internal)? {
+                out.push_str(&format!(
+                    "{},{},{},{}\n",
+                    csv_cell(&fmt_local(ex.ts)),
+                    csv_cell(&ex.item),
+                    csv_cell(ex.category.label()),
+                    format!("{:.2}", ex.amount_cents as f64 / 100.0),
+                ));
+            }
+        }
+        _ => return Err(ApiError::bad_request("entity 应为 events|expenses")),
+    }
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+        out,
+    )
+        .into_response())
 }
 
 // ---------------- 事件 ----------------
@@ -569,6 +747,12 @@ async fn stop_event(
     };
     db.finish_event(&id, now, content, tag)
         .map_err(ApiError::internal)?;
+    // 结束的是番茄钟关联事件时，一并清掉倒计时会话
+    if let Ok(mut p) = state.pomodoro.lock()
+        && p.as_ref().is_some_and(|s| s.event_id == id)
+    {
+        *p = None;
+    }
     let ev = db
         .get_event(&id)
         .map_err(ApiError::internal)?
@@ -677,6 +861,61 @@ async fn recognize_events(
             }))
             .collect::<Vec<_>>(),
     })))
+}
+
+#[derive(Deserialize)]
+struct QuickEntryBody {
+    text: String,
+}
+
+/// AI 一句话快速录入：解析为结构化草稿，由前端确认后走普通创建接口落库
+async fn ai_quick_entry(
+    State(state): State<AppState>,
+    Json(body): Json<QuickEntryBody>,
+) -> ApiResult<Json<Value>> {
+    let text = body.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("text 不能为空"));
+    }
+    let ai_cfg = state
+        .config
+        .lock()
+        .map(|c| c.ai.clone())
+        .unwrap_or_default();
+    let entry = ai::quick_entry(&ai_cfg, text)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.message()))?;
+    Ok(Json(match &entry {
+        ai::QuickEntry::Expense {
+            item,
+            amount,
+            category,
+            ts,
+        } => json!({
+            "type": "expense", "item": item, "amount": amount,
+            "category": category.label(), "ts": ts,
+        }),
+        ai::QuickEntry::Event {
+            start_ts,
+            end_ts,
+            content,
+            tag,
+            remind,
+        } => json!({
+            "type": "event", "content": content, "tag": tag.label(),
+            "start_ts": start_ts, "end_ts": end_ts, "remind": remind,
+        }),
+        ai::QuickEntry::Idea { content, tag } => json!({
+            "type": "idea", "content": content, "tag": tag.label(),
+        }),
+        ai::QuickEntry::Task {
+            title,
+            date,
+            priority,
+        } => json!({
+            "type": "task", "title": title, "date": date, "priority": priority.label(),
+        }),
+    }))
 }
 
 // ---------------- 报表 ----------------
@@ -1551,36 +1790,90 @@ async fn delete_task(
 }
 
 /// 启动一个番茄钟：创建事件 + 递增任务番茄计数
+#[derive(Deserialize, Default)]
+struct PomodoroBody {
+    /// 时长（分钟），缺省 25，限制 1–180
+    minutes: Option<i64>,
+}
+
 async fn pomodoro_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<PomodoroBody>>,
 ) -> ApiResult<Json<Value>> {
+    let minutes = body
+        .and_then(|Json(b)| b.minutes)
+        .unwrap_or(POMODORO_MINUTES)
+        .clamp(1, 180);
     let now = now_ts();
-    let db = lock_db(&state)?;
-    let task = db
-        .get_task(&id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("任务不存在"))?;
-    if db.ongoing_event().map_err(ApiError::internal)?.is_some() {
-        return Err(ApiError::conflict("已有进行中事件，请先结束"));
+    let (session, pomodoro_count) = {
+        let db = lock_db(&state)?;
+        let task = db
+            .get_task(&id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("任务不存在"))?;
+        if db.ongoing_event().map_err(ApiError::internal)?.is_some() {
+            return Err(ApiError::conflict("已有进行中事件，请先结束"));
+        }
+        // 创建关联的计时事件（到点提醒走番茄钟会话，事件本身记录实际耗时）
+        let ev = db.create_event(now).map_err(ApiError::internal)?;
+        db.update_event(&ev.id, Some(&task.title), None, None, None, None)
+            .map_err(ApiError::internal)?;
+        db.set_event_task_id(&ev.id, &id)
+            .map_err(ApiError::internal)?;
+        db.increment_pomodoro(&id, now)
+            .map_err(ApiError::internal)?;
+        let task = db
+            .get_task(&id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("任务不存在"))?;
+        (
+            PomodoroSession {
+                event_id: ev.id,
+                task_id: id,
+                task_title: task.title,
+                minutes,
+                end_ts: now + minutes * 60,
+            },
+            task.pomodoro_count,
+        )
+    };
+    let event_id = session.event_id.clone();
+    let end_ts = session.end_ts;
+    // 登记会话：提醒循环到点发系统通知（页面关了也有效）
+    if let Ok(mut p) = state.pomodoro.lock() {
+        *p = Some(session);
     }
-    // 创建 25 分钟的事件
-    let ev = db.create_event(now).map_err(ApiError::internal)?;
-    db.update_event(&ev.id, Some(&task.title), None, None, None, None)
-        .map_err(ApiError::internal)?;
-    db.set_event_task_id(&ev.id, &id)
-        .map_err(ApiError::internal)?;
-    db.increment_pomodoro(&id, now)
-        .map_err(ApiError::internal)?;
-    let task = db
-        .get_task(&id)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("任务不存在"))?;
     Ok(Json(json!({
         "ok": true,
-        "event_id": ev.id,
-        "pomodoro_count": task.pomodoro_count,
+        "event_id": event_id,
+        "end_ts": end_ts,
+        "pomodoro_count": pomodoro_count,
     })))
+}
+
+/// 当前番茄钟会话（无则返回 null）；前端据此显示倒计时
+async fn get_pomodoro(State(state): State<AppState>) -> Json<Value> {
+    let now = now_ts();
+    let session = state.pomodoro.lock().ok().and_then(|p| p.clone());
+    Json(match session {
+        Some(s) => json!({
+            "event_id": s.event_id,
+            "task_id": s.task_id,
+            "task_title": s.task_title,
+            "end_ts": s.end_ts,
+            "remaining_secs": (s.end_ts - now).max(0),
+        }),
+        None => Value::Null,
+    })
+}
+
+/// 取消番茄钟倒计时（关联的计时事件继续走，仅不再到点提醒）
+async fn cancel_pomodoro(State(state): State<AppState>) -> Json<Value> {
+    if let Ok(mut p) = state.pomodoro.lock() {
+        *p = None;
+    }
+    Json(json!({ "ok": true }))
 }
 
 /// 当前进行中的事件
@@ -1839,6 +2132,7 @@ mod tests {
             client: Arc::new(NotionClient::new("")),
             config: Arc::new(Mutex::new(cfg)),
             sync_status: Arc::new(Mutex::new(SyncStatus::default())),
+            pomodoro: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2005,6 +2299,145 @@ mod tests {
         assert_eq!(body.as_array().unwrap().len(), 0);
         let (code, _) = call(&state, "DELETE", &format!("/api/events/{id}"), None).await;
         assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reset_clears_local_data() {
+        // 未配置 → 409
+        let state = test_state(false);
+        let (code, _) = call(&state, "POST", "/api/data/reset", None).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+
+        let state = test_state(true);
+        let now = now_ts();
+        let today = Local::now().format("%Y-%m-%d").to_string();
+
+        // 造两条本地数据：一条事件 + 一条消费
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/events",
+            Some(json!({"start_ts": now - 600, "end_ts": now, "content": "写代码", "tag": "工作"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/expenses",
+            Some(json!({"item": "午饭", "amount": 25.5, "category": "餐饮", "ts": now})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        // 未同步的行计入 pending
+        let (code, body) = call(&state, "GET", "/api/status", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["pending"], 2);
+
+        // 重置：本地数据清空、pending 归零；配置保留（仍 configured）
+        let (code, body) = call(&state, "POST", "/api/data/reset", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+
+        let (code, body) = call(&state, "GET", "/api/status", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["pending"], 0);
+
+        let (code, body) = call(&state, "GET", &format!("/api/events?date={today}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 0);
+        let (code, body) = call(&state, "GET", "/api/expenses/summary", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["month"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn export_endpoints_dump_local_data() {
+        let state = test_state(true);
+        let now = now_ts();
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/expenses",
+            Some(json!({"item": "午饭", "amount": 25.5, "category": "餐饮", "ts": now})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        // JSON 全量导出包含各实体数组
+        let (code, body) = call(&state, "GET", "/api/export", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body["exported_at"].is_number());
+        assert_eq!(body["expenses"].as_array().unwrap().len(), 1);
+        assert_eq!(body["expenses"][0]["item"], "午饭");
+        assert!(body["events"].is_array() && body["tasks"].is_array() && body["notes"].is_array());
+
+        // CSV：表头 + 一行数据；entity 非法 → 400
+        let (code, _) = call(&state, "GET", "/api/export/csv?entity=expenses", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = call(&state, "GET", "/api/export/csv?entity=x", None).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn search_across_entities() {
+        let state = test_state(true);
+
+        // 空关键词 → 400
+        let (code, _) = call(&state, "GET", "/api/search?q=%20", None).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        let now = now_ts();
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/expenses",
+            Some(json!({"item": "午饭", "amount": 25.5, "category": "餐饮", "ts": now})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/notes",
+            Some(json!({"kind": "doc", "title": "内存碎片", "content_md": "# 内存碎片\nactive 算法"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        // 命中标题（q=内存；两个汉字也要能搜到，这正是弃用 FTS5 trigram 的原因）
+        let (code, body) = call(&state, "GET", "/api/search?q=%E5%86%85%E5%AD%98", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let arr = body.as_array().unwrap();
+        assert!(arr.iter().any(|h| h["kind"] == "note" && h["title"] == "内存碎片"));
+
+        // 命中正文，且大小写不敏感
+        for q in ["active", "ACTIVE"] {
+            let (code, body) = call(&state, "GET", &format!("/api/search?q={q}"), None).await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(body.as_array().unwrap().iter().any(|h| h["kind"] == "note"));
+        }
+
+        // 命中消费记录（q=午饭）
+        let (_, body) = call(&state, "GET", "/api/search?q=%E5%8D%88%E9%A5%AD", None).await;
+        assert!(body.as_array().unwrap().iter().any(|h| h["kind"] == "expense"));
+
+        // 无命中 → 空数组（q=不存在的东西）
+        let (_, body) = call(
+            &state,
+            "GET",
+            "/api/search?q=%E4%B8%8D%E5%AD%98%E5%9C%A8%E7%9A%84%E4%B8%9C%E8%A5%BF",
+            None,
+        )
+        .await;
+        assert_eq!(body.as_array().unwrap().len(), 0);
+
+        // LIKE 特殊字符（%）不报错也无命中
+        let (code, body) = call(&state, "GET", "/api/search?q=100%25", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

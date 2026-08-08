@@ -48,6 +48,57 @@ pub struct PullCounts {
     pub notes: usize,
 }
 
+/// 一条全局搜索结果；kind 由查询方填充（note/task/idea/event/expense/project）
+#[derive(Clone, Debug)]
+pub struct SearchHit {
+    pub kind: &'static str,
+    pub id: String,
+    pub title: String,
+    pub snippet: String,
+    /// 排序用时间戳（事件开始/消费时间/更新时间等）
+    pub sort_ts: i64,
+}
+
+/// 增量拉取的 upsert 结果
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpsertKind {
+    Inserted,
+    Updated,
+    /// 本地有未推送修改，跳过（推送优先）
+    SkippedDirty,
+    /// 解析结果没有 notion_page_id，无法对应远端行
+    NoPageId,
+}
+
+/// 截断到最多 n 个字符，超出加省略号
+fn truncate_chars(text: &str, n: usize) -> String {
+    let mut chars = text.chars();
+    let s: String = chars.by_ref().take(n).collect();
+    if chars.next().is_some() { format!("{s}…") } else { s }
+}
+
+/// 从 body 提取 kw（已小写）前后各一段作为摘要；未命中则返回开头截断。
+/// 匹配位置在 lower 化文本上找，再按字符数映射回原文切片（避免 Unicode 切片 panic）。
+fn make_snippet(body: &str, kw_lower: &str) -> String {
+    let text = body.replace(['\n', '\r'], " ");
+    let lowered = text.to_lowercase();
+    let Some(byte_pos) = lowered.find(kw_lower) else {
+        return truncate_chars(&text, 60);
+    };
+    let char_pos = lowered[..byte_pos].chars().count();
+    let kw_len = kw_lower.chars().count();
+    let total = text.chars().count();
+    let start = char_pos.saturating_sub(20);
+    let end = (char_pos + kw_len + 40).min(total);
+    let window: String = text.chars().skip(start).take(end - start).collect();
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        window,
+        if end < total { "…" } else { "" }
+    )
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -158,6 +209,10 @@ impl Db {
                 notion_page_id TEXT,
                 dirty INTEGER DEFAULT 1,
                 deleted INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL DEFAULT ''
             );",
         )?;
         self.migrate()?;
@@ -376,6 +431,18 @@ impl Db {
         let sql = format!("SELECT {EVENT_COLS} FROM events WHERE dirty = 1 ORDER BY start_ts");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], Self::row_to_event)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 到点应提醒的事件：remind=1 且 start_ts 落在上一检查点 (since, now] 内
+    pub fn due_reminders(&self, since: i64, now: i64) -> Result<Vec<Event>> {
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events
+             WHERE deleted = 0 AND remind = 1 AND start_ts > ?1 AND start_ts <= ?2
+             ORDER BY start_ts"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since, now], Self::row_to_event)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1529,6 +1596,408 @@ impl Db {
         Ok(())
     }
 
+    /// 清空全部本地业务数据（单事务，失败回滚）。
+    ///
+    /// 删除 events/expenses/projects/notes/ideas/tasks/ext_records 的全部行；
+    /// 保留 ext_namespaces（对外 API 凭证）与 config 中的 Notion token/页面配置。
+    /// 用于「清空本地后重新从远端拉取」。
+    pub fn clear_all_data(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        let res = (|| {
+            for table in [
+                "events",
+                "expenses",
+                "projects",
+                "notes",
+                "ideas",
+                "tasks",
+                "ext_records",
+            ] {
+                let sql = format!("DELETE FROM {table}");
+                self.conn.execute(&sql, [])?;
+            }
+            // 增量拉取水位一并清空：下次增量相当于全量 upsert，可自愈
+            self.conn.execute("DELETE FROM sync_meta", [])?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// 全部未删除任务（数据导出走这个）
+    pub fn all_tasks(&self) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE deleted = 0 ORDER BY date DESC, created_ts DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_task)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 全部未删除事件（数据导出走这个）
+    pub fn all_events(&self) -> Result<Vec<Event>> {
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events WHERE deleted = 0 ORDER BY start_ts DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_event)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---------- 同步元数据（增量拉取水位等） ----------
+
+    pub fn get_meta(&self, k: &str) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT v FROM sync_meta WHERE k = ?1", params![k], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
+            params![k, v],
+        )?;
+        Ok(())
+    }
+
+    // ---------- 增量拉取 upsert ----------
+
+    /// 按 notion_page_id 找本地行的 (id, dirty)
+    fn row_id_dirty_by_page_id(&self, table: &str, page_id: &str) -> Result<Option<(String, bool)>> {
+        let sql = format!("SELECT id, dirty FROM {table} WHERE notion_page_id = ?1 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![page_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
+            })
+            .optional()?)
+    }
+
+    /// 增量拉取的事件 upsert：新行插入；已同步行更新（remind/task_id 本地专属字段保留）；
+    /// 本地 dirty 行跳过（推送优先，推完后远端即为最新，下轮增量自然拉平）
+    pub fn upsert_pulled_event(&self, ev: &Event) -> Result<UpsertKind> {
+        let Some(pid) = ev.notion_page_id.as_deref() else {
+            return Ok(UpsertKind::NoPageId);
+        };
+        match self.row_id_dirty_by_page_id("events", pid)? {
+            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+            Some((id, false)) => {
+                self.conn.execute(
+                    "UPDATE events SET start_ts=?2, end_ts=?3, content=?4, tag=?5 WHERE id=?1",
+                    params![id, ev.start_ts, ev.end_ts, ev.content, ev.tag.label()],
+                )?;
+                Ok(UpsertKind::Updated)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO events (id, start_ts, end_ts, content, tag, remind, task_id, notion_page_id, dirty, deleted)
+                     VALUES (?1,?2,?3,?4,?5,0,NULL,?6,0,0)",
+                    params![ev.id, ev.start_ts, ev.end_ts, ev.content, ev.tag.label(), pid],
+                )?;
+                Ok(UpsertKind::Inserted)
+            }
+        }
+    }
+
+    pub fn upsert_pulled_expense(&self, ex: &Expense) -> Result<UpsertKind> {
+        let Some(pid) = ex.notion_page_id.as_deref() else {
+            return Ok(UpsertKind::NoPageId);
+        };
+        match self.row_id_dirty_by_page_id("expenses", pid)? {
+            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+            Some((id, false)) => {
+                self.conn.execute(
+                    "UPDATE expenses SET item=?2, amount_cents=?3, ts=?4, category=?5 WHERE id=?1",
+                    params![id, ex.item, ex.amount_cents, ex.ts, ex.category.label()],
+                )?;
+                Ok(UpsertKind::Updated)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO expenses (id, item, amount_cents, ts, category, notion_page_id, dirty, deleted)
+                     VALUES (?1,?2,?3,?4,?5,?6,0,0)",
+                    params![ex.id, ex.item, ex.amount_cents, ex.ts, ex.category.label(), pid],
+                )?;
+                Ok(UpsertKind::Inserted)
+            }
+        }
+    }
+
+    pub fn upsert_pulled_project(&self, p: &Project) -> Result<UpsertKind> {
+        let Some(pid) = p.notion_page_id.as_deref() else {
+            return Ok(UpsertKind::NoPageId);
+        };
+        match self.row_id_dirty_by_page_id("projects", pid)? {
+            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+            Some((id, false)) => {
+                self.conn.execute(
+                    "UPDATE projects SET name=?2, status=?3, start_ts=?4, deadline_ts=?5, note=?6 WHERE id=?1",
+                    params![id, p.name, p.status.label(), p.start_ts, p.deadline_ts, p.note],
+                )?;
+                Ok(UpsertKind::Updated)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO projects (id, name, status, start_ts, deadline_ts, note, notion_page_id, dirty, deleted)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,0,0)",
+                    params![p.id, p.name, p.status.label(), p.start_ts, p.deadline_ts, p.note, pid],
+                )?;
+                Ok(UpsertKind::Inserted)
+            }
+        }
+    }
+
+    pub fn upsert_pulled_idea(&self, i: &Idea) -> Result<UpsertKind> {
+        let Some(pid) = i.notion_page_id.as_deref() else {
+            return Ok(UpsertKind::NoPageId);
+        };
+        match self.row_id_dirty_by_page_id("ideas", pid)? {
+            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+            Some((id, false)) => {
+                self.conn.execute(
+                    "UPDATE ideas SET content=?2, tag=?3, pinned=?4, created_ts=?5, updated_ts=?6 WHERE id=?1",
+                    params![id, i.content, i.tag.label(), i.pinned, i.created_ts, i.updated_ts],
+                )?;
+                Ok(UpsertKind::Updated)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO ideas (id, content, tag, pinned, created_ts, updated_ts, notion_page_id, dirty, deleted)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,0,0)",
+                    params![i.id, i.content, i.tag.label(), i.pinned, i.created_ts, i.updated_ts, pid],
+                )?;
+                Ok(UpsertKind::Inserted)
+            }
+        }
+    }
+
+    /// 任务 upsert：pomodoro_count/estimated_minutes/notes 为本地专属字段，更新时保留
+    pub fn upsert_pulled_task(&self, t: &Task) -> Result<UpsertKind> {
+        let Some(pid) = t.notion_page_id.as_deref() else {
+            return Ok(UpsertKind::NoPageId);
+        };
+        match self.row_id_dirty_by_page_id("tasks", pid)? {
+            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+            Some((id, false)) => {
+                // project_id 用 COALESCE：远端未关联项目（或按名找不到）时保留本地现状
+                self.conn.execute(
+                    "UPDATE tasks SET date=?2, title=?3, priority=?4, important=?5, urgent=?6, done=?7,
+                     created_ts=?8, updated_ts=?9, task_type=?10, project_id=COALESCE(?11, project_id), start_ts=?12 WHERE id=?1",
+                    params![
+                        id, t.date, t.title, t.priority.label(), t.important, t.urgent, t.done,
+                        t.created_ts, t.updated_ts, t.task_type, t.project_id, t.start_ts
+                    ],
+                )?;
+                Ok(UpsertKind::Updated)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO tasks (id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted, task_type, project_id, start_ts)
+                     VALUES (?1,?2,?3,?4,?5,?6,0,NULL,'',?7,?8,?9,?10,0,0,?11,?12,?13)",
+                    params![
+                        t.id, t.date, t.title, t.priority.label(), t.important, t.urgent, t.done,
+                        t.created_ts, t.updated_ts, t.notion_page_id, t.task_type, t.project_id, t.start_ts
+                    ],
+                )?;
+                Ok(UpsertKind::Inserted)
+            }
+        }
+    }
+
+    /// 笔记 upsert：parent_id 由调用方在两阶段处理（本批行的父子关系后补）
+    pub fn upsert_pulled_note(&self, n: &Note) -> Result<UpsertKind> {
+        let Some(pid) = n.notion_page_id.as_deref() else {
+            return Ok(UpsertKind::NoPageId);
+        };
+        match self.row_id_dirty_by_page_id("notes", pid)? {
+            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+            Some((id, false)) => {
+                self.conn.execute(
+                    "UPDATE notes SET kind=?2, title=?3, content_md=?4, created_ts=?5, updated_ts=?6 WHERE id=?1",
+                    params![id, n.kind.label(), n.title, n.content_md, n.created_ts, n.updated_ts],
+                )?;
+                Ok(UpsertKind::Updated)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO notes (id, parent_id, kind, title, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted)
+                     VALUES (?1,NULL,?2,?3,?4,?5,?6,?7,0,0)",
+                    params![n.id, n.kind.label(), n.title, n.content_md, n.created_ts, n.updated_ts, pid],
+                )?;
+                Ok(UpsertKind::Inserted)
+            }
+        }
+    }
+
+    /// 增量拉取第二阶段：按解析出的本地 parent_id 回填（仅未 dirty 的行）
+    pub fn set_pulled_note_parent(&self, page_id: &str, parent_id: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE notes SET parent_id = ?2 WHERE notion_page_id = ?1 AND dirty = 0 AND deleted = 0",
+            params![page_id, parent_id],
+        )?;
+        Ok(())
+    }
+
+    /// 按 notion_page_id 找笔记的本地 id（父级 relation 解析用）
+    pub fn note_id_by_page_id(&self, page_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .row_id_dirty_by_page_id("notes", page_id)?
+            .map(|(id, _)| id))
+    }
+
+    /// 按名称找项目 id（增量拉取任务时按「项目」名回填 project_id）
+    pub fn project_id_by_name(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM projects WHERE name = ?1 AND deleted = 0 LIMIT 1",
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    // ---------- 全局搜索 ----------
+
+    /// 全局搜索：在 6 类实体的标题/正文里做不区分大小写的子串匹配，按类分组返回。
+    ///
+    /// 没用 FTS5：trigram 分词要求查询词 ≥3 字符，两个汉字（如「内存」）就搜不到；
+    /// 本地数据量小，LIKE 子串匹配反而更准、实现更简单。
+    pub fn search(&self, kw: &str) -> Result<Vec<SearchHit>> {
+        let lower = kw.to_lowercase();
+        // 转义 LIKE 特殊字符（配合 ESCAPE '\'）
+        let pat = format!(
+            "%{}%",
+            lower
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        // 每类实体最多返回的条数，避免某类刷爆结果
+        const PER_KIND: i64 = 10;
+        let mut hits = Vec::new();
+        let mut collect = |kind: &'static str, sql: &str, make: &dyn Fn(&rusqlite::Row) -> rusqlite::Result<SearchHit>| -> Result<()> {
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map(params![pat, PER_KIND], make)?;
+            for h in rows.flatten() {
+                hits.push(SearchHit { kind, ..h });
+            }
+            Ok(())
+        };
+        collect(
+            "note",
+            "SELECT id, title, content_md, updated_ts FROM notes
+             WHERE deleted = 0 AND (LOWER(title) LIKE ?1 ESCAPE '\\' OR LOWER(content_md) LIKE ?1 ESCAPE '\\')
+             ORDER BY updated_ts DESC LIMIT ?2",
+            &|r| {
+                let title: String = r.get(1)?;
+                let body: String = r.get(2)?;
+                Ok(SearchHit {
+                    kind: "",
+                    id: r.get(0)?,
+                    snippet: make_snippet(&body, &lower),
+                    title,
+                    sort_ts: r.get(3)?,
+                })
+            },
+        )?;
+        collect(
+            "task",
+            "SELECT id, title, notes, COALESCE(created_ts, 0) FROM tasks
+             WHERE deleted = 0 AND (LOWER(title) LIKE ?1 ESCAPE '\\' OR LOWER(notes) LIKE ?1 ESCAPE '\\')
+             ORDER BY COALESCE(created_ts, 0) DESC LIMIT ?2",
+            &|r| {
+                let title: String = r.get(1)?;
+                let body: String = r.get(2)?;
+                Ok(SearchHit {
+                    kind: "",
+                    id: r.get(0)?,
+                    snippet: make_snippet(&body, &lower),
+                    title,
+                    sort_ts: r.get(3)?,
+                })
+            },
+        )?;
+        collect(
+            "idea",
+            "SELECT id, content, COALESCE(created_ts, 0) FROM ideas
+             WHERE deleted = 0 AND LOWER(content) LIKE ?1 ESCAPE '\\'
+             ORDER BY COALESCE(created_ts, 0) DESC LIMIT ?2",
+            &|r| {
+                let body: String = r.get(1)?;
+                Ok(SearchHit {
+                    kind: "",
+                    id: r.get(0)?,
+                    title: truncate_chars(&body, 20),
+                    snippet: make_snippet(&body, &lower),
+                    sort_ts: r.get(2)?,
+                })
+            },
+        )?;
+        collect(
+            "event",
+            "SELECT id, content, tag, start_ts FROM events
+             WHERE deleted = 0 AND (LOWER(content) LIKE ?1 ESCAPE '\\' OR LOWER(tag) LIKE ?1 ESCAPE '\\')
+             ORDER BY start_ts DESC LIMIT ?2",
+            &|r| {
+                let content: String = r.get(1)?;
+                Ok(SearchHit {
+                    kind: "",
+                    id: r.get(0)?,
+                    title: content.clone(),
+                    snippet: make_snippet(&content, &lower),
+                    sort_ts: r.get(3)?,
+                })
+            },
+        )?;
+        collect(
+            "expense",
+            "SELECT id, item, category, ts FROM expenses
+             WHERE deleted = 0 AND (LOWER(item) LIKE ?1 ESCAPE '\\' OR LOWER(category) LIKE ?1 ESCAPE '\\')
+             ORDER BY ts DESC LIMIT ?2",
+            &|r| {
+                let item: String = r.get(1)?;
+                Ok(SearchHit {
+                    kind: "",
+                    id: r.get(0)?,
+                    title: item.clone(),
+                    snippet: make_snippet(&item, &lower),
+                    sort_ts: r.get(3)?,
+                })
+            },
+        )?;
+        collect(
+            "project",
+            "SELECT id, name, note, COALESCE(start_ts, 0) FROM projects
+             WHERE deleted = 0 AND (LOWER(name) LIKE ?1 ESCAPE '\\' OR LOWER(note) LIKE ?1 ESCAPE '\\')
+             ORDER BY COALESCE(start_ts, 0) DESC LIMIT ?2",
+            &|r| {
+                let name: String = r.get(1)?;
+                let note: String = r.get(2)?;
+                Ok(SearchHit {
+                    kind: "",
+                    id: r.get(0)?,
+                    title: name,
+                    snippet: make_snippet(&note, &lower),
+                    sort_ts: r.get(3)?,
+                })
+            },
+        )?;
+        Ok(hits)
+    }
+
     // ---------- 远端拉取覆盖本地 ----------
 
 
@@ -1715,6 +2184,133 @@ mod tests {
         // 部分重叠
         assert_eq!(db.events_between(0, 150, 1000).unwrap().len(), 1);
         assert_eq!(db.events_between(250, 400, 1000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn due_reminders_window_semantics() {
+        let db = Db::in_memory().unwrap();
+        // remind=1 且 start_ts 落在 (since, now] 才命中
+        db.add_event_full(100, Some(200), "不带提醒", Tag::Work, false)
+            .unwrap();
+        db.add_event_full(300, Some(400), "到点提醒", Tag::Work, true)
+            .unwrap();
+        // 窗口之外：start_ts <= since 不补发
+        assert!(db.due_reminders(300, 500).unwrap().is_empty());
+        // 窗口之内（含边界 now）
+        let due = db.due_reminders(100, 300).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].content, "到点提醒");
+        // start_ts > now 不提前发
+        assert!(db.due_reminders(100, 299).unwrap().is_empty());
+    }
+
+    #[test]
+    fn meta_roundtrip_and_clear_resets() {
+        let db = Db::in_memory().unwrap();
+        assert_eq!(db.get_meta("incr:events").unwrap(), "");
+        db.set_meta("incr:events", "2026-08-01T00:00:00.000Z").unwrap();
+        db.set_meta("incr:events", "2026-08-02T00:00:00.000Z").unwrap();
+        assert_eq!(db.get_meta("incr:events").unwrap(), "2026-08-02T00:00:00.000Z");
+        db.clear_all_data().unwrap();
+        assert_eq!(db.get_meta("incr:events").unwrap(), "");
+    }
+
+    fn pulled_event(content: &str) -> Event {
+        Event {
+            id: Uuid::new_v4().to_string(),
+            start_ts: 100,
+            end_ts: Some(200),
+            content: content.into(),
+            tag: Tag::Work,
+            remind: false,
+            task_id: None,
+            notion_page_id: Some("p1".into()),
+            dirty: false,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn upsert_event_insert_update_skip_dirty() {
+        let db = Db::in_memory().unwrap();
+        // 新行插入（dirty=0）
+        assert_eq!(db.upsert_pulled_event(&pulled_event("远程事件")).unwrap(), UpsertKind::Inserted);
+        let (id, dirty) = db.row_id_dirty_by_page_id("events", "p1").unwrap().unwrap();
+        assert!(!dirty);
+
+        // 本地设了 remind（本地专属字段）且已推送；远端更新 → 覆盖内容但保留 remind
+        db.update_event(&id, None, None, None, None, Some(true)).unwrap();
+        db.clear_event_dirty(&id).unwrap();
+        assert_eq!(db.upsert_pulled_event(&pulled_event("远端改名")).unwrap(), UpsertKind::Updated);
+        let after = db.get_event(&id).unwrap().unwrap();
+        assert_eq!(after.content, "远端改名");
+        assert!(after.remind);
+        assert!(!after.dirty);
+
+        // 本地 dirty → 跳过（推送优先）
+        db.update_event(&id, Some("本地未推送"), None, None, None, None).unwrap();
+        assert_eq!(db.upsert_pulled_event(&pulled_event("远端又改")).unwrap(), UpsertKind::SkippedDirty);
+        assert_eq!(db.get_event(&id).unwrap().unwrap().content, "本地未推送");
+    }
+
+    #[test]
+    fn upsert_task_preserves_local_only_fields() {
+        let db = Db::in_memory().unwrap();
+        let task = |title: &str| Task {
+            id: Uuid::new_v4().to_string(),
+            date: "2026-08-08".into(),
+            title: title.into(),
+            priority: crate::models::TaskPriority::Mid,
+            important: false,
+            urgent: false,
+            pomodoro_count: 0,
+            estimated_minutes: None,
+            notes: String::new(),
+            task_type: String::new(),
+            project_id: None,
+            start_ts: None,
+            done: false,
+            created_ts: 100,
+            updated_ts: 100,
+            notion_page_id: Some("tp1".into()),
+            dirty: false,
+            deleted: false,
+        };
+        assert_eq!(db.upsert_pulled_task(&task("远程任务")).unwrap(), UpsertKind::Inserted);
+        let (id, _) = db.row_id_dirty_by_page_id("tasks", "tp1").unwrap().unwrap();
+        // 本地累计了番茄钟/备注（本地专属字段）
+        db.increment_pomodoro(&id, 1000).unwrap();
+        db.clear_task_dirty(&id).unwrap();
+        assert_eq!(db.upsert_pulled_task(&task("远端改名")).unwrap(), UpsertKind::Updated);
+        let after = db.get_task(&id).unwrap().unwrap();
+        assert_eq!(after.title, "远端改名");
+        assert_eq!(after.pomodoro_count, 1); // 本地字段保留
+        assert!(!after.dirty);
+    }
+
+    #[test]
+    fn upsert_note_two_phase_parent() {
+        let db = Db::in_memory().unwrap();
+        let note = |title: &str, pid: &str| Note {
+            id: Uuid::new_v4().to_string(),
+            parent_id: None,
+            kind: crate::models::NoteKind::Dir,
+            title: title.into(),
+            content_md: String::new(),
+            created_ts: 100,
+            updated_ts: 100,
+            notion_page_id: Some(pid.into()),
+            dirty: false,
+            deleted: false,
+        };
+        // 子先插入（parent 未解析），再插父，第二阶段回填
+        assert_eq!(db.upsert_pulled_note(&note("子", "np-child")).unwrap(), UpsertKind::Inserted);
+        assert_eq!(db.upsert_pulled_note(&note("父", "np-parent")).unwrap(), UpsertKind::Inserted);
+        let parent_local = db.note_id_by_page_id("np-parent").unwrap().unwrap();
+        db.set_pulled_note_parent("np-child", Some(&parent_local)).unwrap();
+        let child_local = db.note_id_by_page_id("np-child").unwrap().unwrap();
+        let child = db.get_note(&child_local).unwrap().unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(parent_local.as_str()));
     }
 
     #[test]

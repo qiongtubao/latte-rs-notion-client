@@ -4,11 +4,10 @@
 //! - 已有 notion_page_id → PATCH 更新
 //! - deleted = 1 → 归档远端（archived: true）后物理删除本地行
 //! - 单行失败保留 dirty，下轮重试，不影响其他行
-//! - 知识库（notes）按「父先子后」处理：父还没同步出 page id 的子行本轮跳过；
-//!   config 缺 notes_db_id 时先补建「📚 知识库」database（含自关联「父级」）并持久化
-//! - 好想法（ideas）：config 缺 ideas_db_id 时先补建「好想法」database 并持久化，
-//!   建不出则整批记 failed
-//! - 今日任务（tasks）：同 ideas，config 缺 tasks_db_id 时懒建「今日任务」database
+//! - 知识库（notes）按「父先子后」处理：父还没同步出 page id 的子行本轮跳过
+//! - 懒建 database（知识库/好想法/今日任务）：config 缺 id 时先全局搜索同名库复用，
+//!   搜不到才新建并持久化（避免 config 丢 id 后在远端重复建同名库，见 ensure_db_id）；
+//!   建不出则整批记 failed，下轮重试
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,7 +18,7 @@ use chrono::Local;
 use tokio::sync::Notify;
 
 use crate::config::{self, Config};
-use crate::db::Db;
+use crate::db::{Db, UpsertKind};
 use crate::models::{Event, Expense, ExtRecord, Idea, Note, NoteKind, Project, Task};
 use crate::notion::{self, NotionClient};
 
@@ -39,6 +38,8 @@ pub struct SyncStatus {
 #[derive(Default)]
 pub struct SyncOutcome {
     pub pushed: usize,
+    /// 增量拉取下来的行数（新增 + 更新）
+    pub pulled: usize,
     pub failed: usize,
     pub error: Option<String>,
 }
@@ -389,10 +390,260 @@ pub async fn sync_once(
     if !tasks.is_empty() {
         sync_tasks(db, client, cfg, &cfg_snap, tasks, &mut outcome, &record).await;
     }
+
+    // 增量拉取：远端的新增/修改自动下来（本地 dirty 行推送优先，跳过不覆盖）
+    pull_incremental(db, client, &cfg_snap, &mut outcome).await;
     outcome
 }
 
-/// 好想法同步：config 缺 ideas_db_id 时先补建「好想法」database 并持久化；
+// ---------------- 增量拉取 ----------------
+
+/// 增量拉取：把远端自上次水位以来的新增/修改同步到本地。
+///
+/// - 水位按 database 存 sync_meta（key `incr:{kind}`），取本批最大 last_edited_time；
+///   某库查询失败则水位不前移，下轮重试
+/// - 本地 dirty 行跳过（推送优先；推完后远端即最新，下轮自然拉平）
+/// - Notion 查询不返回已归档 page，远端删除/归档在此检测不到，靠全量拉取兜底
+async fn pull_incremental(
+    db: &Arc<Mutex<Db>>,
+    client: &NotionClient,
+    cfg_snap: &Config,
+    outcome: &mut SyncOutcome,
+) {
+    let fixed: [(&str, &str); 3] = [
+        ("events", &cfg_snap.events_db_id),
+        ("expenses", &cfg_snap.expenses_db_id),
+        ("projects", &cfg_snap.projects_db_id),
+    ];
+    for (kind, db_id) in fixed {
+        if !db_id.is_empty() {
+            pull_one_database(db, client, kind, db_id, outcome).await;
+        }
+    }
+    for (kind, db_id) in [
+        ("ideas", &cfg_snap.ideas_db_id),
+        ("tasks", &cfg_snap.tasks_db_id),
+        ("notes", &cfg_snap.notes_db_id),
+    ] {
+        if let Some(id) = db_id {
+            pull_one_database(db, client, kind, id, outcome).await;
+        }
+    }
+}
+
+async fn pull_one_database(
+    db: &Arc<Mutex<Db>>,
+    client: &NotionClient,
+    kind: &str,
+    db_id: &str,
+    outcome: &mut SyncOutcome,
+) {
+    let key = format!("incr:{kind}");
+    let since = db
+        .lock()
+        .ok()
+        .and_then(|g| g.get_meta(&key).ok())
+        .unwrap_or_default();
+    let pages = match client.query_database_since(db_id, &since).await {
+        Ok(p) => p,
+        Err(e) => {
+            if outcome.error.is_none() {
+                outcome.error = Some(format!("增量拉取 {kind}: {e:#}"));
+            }
+            return;
+        }
+    };
+    if pages.is_empty() {
+        return;
+    }
+    // ISO 时间字符串字典序即时间序
+    let max_edited = pages
+        .iter()
+        .filter_map(|p| p["last_edited_time"].as_str())
+        .max()
+        .map(str::to_string);
+
+    let mut applied = 0usize;
+    let mut apply = |kind_: &UpsertKind| {
+        if matches!(kind_, UpsertKind::Inserted | UpsertKind::Updated) {
+            applied += 1;
+        }
+    };
+
+    match kind {
+        "events" => {
+            for page in &pages {
+                if let Some(ev) = notion::parse_event_page(page)
+                    && let Ok(g) = db.lock()
+                {
+                    apply(&g.upsert_pulled_event(&ev).unwrap_or(UpsertKind::NoPageId));
+                }
+            }
+        }
+        "expenses" => {
+            for page in &pages {
+                if let Some(ex) = notion::parse_expense_page(page)
+                    && let Ok(g) = db.lock()
+                {
+                    apply(&g.upsert_pulled_expense(&ex).unwrap_or(UpsertKind::NoPageId));
+                }
+            }
+        }
+        "projects" => {
+            for page in &pages {
+                if let Some(p) = notion::parse_project_page(page)
+                    && let Ok(g) = db.lock()
+                {
+                    apply(&g.upsert_pulled_project(&p).unwrap_or(UpsertKind::NoPageId));
+                }
+            }
+        }
+        "ideas" => {
+            for page in &pages {
+                if let Some(i) = notion::parse_idea_page(page)
+                    && let Ok(g) = db.lock()
+                {
+                    apply(&g.upsert_pulled_idea(&i).unwrap_or(UpsertKind::NoPageId));
+                }
+            }
+        }
+        "tasks" => {
+            for page in &pages {
+                if let Some((mut t, proj_name)) = notion::parse_task_page(page) {
+                    // 按「项目」名回填 project_id；本地查不到时保留现状（upsert 内 COALESCE）
+                    if let Some(name) = proj_name {
+                        t.project_id = db
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.project_id_by_name(&name).ok().flatten());
+                    }
+                    if let Ok(g) = db.lock() {
+                        apply(&g.upsert_pulled_task(&t).unwrap_or(UpsertKind::NoPageId));
+                    }
+                }
+            }
+        }
+        "notes" => {
+            applied += pull_notes_incremental(db, client, &pages).await;
+        }
+        _ => {}
+    }
+
+    if let Some(wm) = max_edited
+        && let Ok(g) = db.lock()
+    {
+        let _ = g.set_meta(&key, &wm);
+    }
+    outcome.pulled += applied;
+}
+
+/// 知识库增量：两阶段（先 upsert 行，再回填父子关系）；文档另拉 block 还原正文
+async fn pull_notes_incremental(
+    db: &Arc<Mutex<Db>>,
+    client: &NotionClient,
+    pages: &[serde_json::Value],
+) -> usize {
+    let mut parsed: Vec<(Note, Option<String>)> =
+        pages.iter().filter_map(notion::parse_note_page).collect();
+    // 本批变更的文档拉取内容块
+    for (n, _) in parsed.iter_mut() {
+        if n.kind == NoteKind::Doc
+            && let Some(pid) = n.notion_page_id.clone()
+            && let Ok(blocks) = client.child_objects(&pid).await
+            && let Some(results) = blocks["results"].as_array()
+        {
+            n.content_md = notion::blocks_to_md(results);
+        }
+    }
+    // 阶段 1：upsert 行
+    let mut applied = 0usize;
+    for (n, _) in &parsed {
+        if let Ok(g) = db.lock()
+            && matches!(
+                g.upsert_pulled_note(n),
+                Ok(UpsertKind::Inserted | UpsertKind::Updated)
+            )
+        {
+            applied += 1;
+        }
+    }
+    // 阶段 2：父子关系回填（父级先查本批，再查本地库）
+    for (n, parent_npid) in &parsed {
+        let Some(child_pid) = n.notion_page_id.clone() else {
+            continue;
+        };
+        let parent_local = match parent_npid {
+            Some(pp) => {
+                let in_batch = parsed
+                    .iter()
+                    .find(|(m, _)| m.notion_page_id.as_deref() == Some(pp.as_str()))
+                    .map(|(m, _)| m.id.clone());
+                match in_batch {
+                    Some(id) => Some(id),
+                    None => db
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.note_id_by_page_id(pp).ok().flatten()),
+                }
+            }
+            None => None,
+        };
+        if let Ok(g) = db.lock() {
+            let _ = g.set_pulled_note_parent(&child_pid, parent_local.as_deref());
+        }
+    }
+    applied
+}
+
+/// 懒建 database 的公共逻辑：config 有 id 直接用；没有则先全局搜索同名库复用，
+/// 搜不到才新建；复用/新建成功后回填并持久化 config。
+///
+/// 搜索这步不能省：config 丢失 id（重装/换机/重配）时若直接新建，
+/// 会在远端留下多个同名 database，数据被分散到不同库里。
+/// 失败返回 None，由调用方把对应条目记 failed 下轮重试。
+async fn ensure_db_id(
+    client: &NotionClient,
+    cfg: &Arc<Mutex<Config>>,
+    configured: Option<&str>,
+    title: &str,
+    create: impl std::future::Future<Output = Result<String>>,
+    set_id: impl FnOnce(&mut Config, String),
+    outcome: &mut SyncOutcome,
+) -> Option<String> {
+    if let Some(id) = configured.filter(|id| !id.is_empty()) {
+        return Some(id.to_string());
+    }
+    let found = match client.find_db_by_title(title).await {
+        Ok(v) => v,
+        Err(e) => {
+            if outcome.error.is_none() {
+                outcome.error = Some(format!("{title}: 搜索已有 database 失败: {e:#}"));
+            }
+            return None;
+        }
+    };
+    let id = match found {
+        Some(id) => id,
+        None => match create.await {
+            Ok(id) => id,
+            Err(e) => {
+                if outcome.error.is_none() {
+                    outcome.error = Some(format!("{title}: 创建 database 失败: {e:#}"));
+                }
+                return None;
+            }
+        },
+    };
+    if let Ok(mut c) = cfg.lock() {
+        set_id(&mut c, id.clone());
+        if let Err(e) = config::save(&c) {
+            outcome.error = Some(format!("{title}: 配置写盘失败: {e:#}"));
+        }
+    }
+    Some(id)
+}
+
+/// 好想法同步：config 缺 ideas_db_id 时先搜索复用远端同名库，缺失才补建并持久化；
 /// 建不出则全部记 failed，下轮重试
 async fn sync_ideas(
     db: &Arc<Mutex<Db>>,
@@ -403,28 +654,18 @@ async fn sync_ideas(
     outcome: &mut SyncOutcome,
     record: &impl Fn(&mut SyncOutcome, Result<PushResult>, &str) -> Option<PushResult>,
 ) {
-    let db_id = match cfg_snap.ideas_db_id.clone() {
-        Some(id) if !id.is_empty() => Some(id),
-        _ => match client.create_ideas_db(&cfg_snap.parent_page_id).await {
-            Ok(id) => {
-                if let Ok(mut c) = cfg.lock() {
-                    c.ideas_db_id = Some(id.clone());
-                    if let Err(e) = config::save(&c) {
-                        outcome.error = Some(format!("好想法: 配置写盘失败: {e:#}"));
-                    }
-                }
-                Some(id)
-            }
-            Err(e) => {
-                outcome.failed += ideas.len();
-                if outcome.error.is_none() {
-                    outcome.error = Some(format!("好想法: 创建 database 失败: {e:#}"));
-                }
-                None
-            }
-        },
-    };
+    let db_id = ensure_db_id(
+        client,
+        cfg,
+        cfg_snap.ideas_db_id.as_deref(),
+        "好想法",
+        client.create_ideas_db(&cfg_snap.parent_page_id),
+        |c, id| c.ideas_db_id = Some(id),
+        outcome,
+    )
+    .await;
     let Some(db_id) = db_id else {
+        outcome.failed += ideas.len();
         return;
     };
     for idea in ideas {
@@ -441,7 +682,7 @@ async fn sync_ideas(
     }
 }
 
-/// 今日任务同步：config 缺 tasks_db_id 时先补建「今日任务」database 并持久化；
+/// 今日任务同步：config 缺 tasks_db_id 时先搜索复用远端同名库，缺失才补建并持久化；
 /// 建不出则全部记 failed，下轮重试
 async fn sync_tasks(
     db: &Arc<Mutex<Db>>,
@@ -452,28 +693,18 @@ async fn sync_tasks(
     outcome: &mut SyncOutcome,
     record: &impl Fn(&mut SyncOutcome, Result<PushResult>, &str) -> Option<PushResult>,
 ) {
-    let db_id = match cfg_snap.tasks_db_id.clone() {
-        Some(id) if !id.is_empty() => Some(id),
-        _ => match client.create_tasks_db(&cfg_snap.parent_page_id).await {
-            Ok(id) => {
-                if let Ok(mut c) = cfg.lock() {
-                    c.tasks_db_id = Some(id.clone());
-                    if let Err(e) = config::save(&c) {
-                        outcome.error = Some(format!("今日任务: 配置写盘失败: {e:#}"));
-                    }
-                }
-                Some(id)
-            }
-            Err(e) => {
-                outcome.failed += tasks.len();
-                if outcome.error.is_none() {
-                    outcome.error = Some(format!("今日任务: 创建 database 失败: {e:#}"));
-                }
-                None
-            }
-        },
-    };
+    let db_id = ensure_db_id(
+        client,
+        cfg,
+        cfg_snap.tasks_db_id.as_deref(),
+        "今日任务",
+        client.create_tasks_db(&cfg_snap.parent_page_id),
+        |c, id| c.tasks_db_id = Some(id),
+        outcome,
+    )
+    .await;
     let Some(db_id) = db_id else {
+        outcome.failed += tasks.len();
         return;
     };
     // 旧库补新增列（类型/项目/计划开始，幂等；失败不阻断，推送报错会下轮重试）
@@ -578,27 +809,21 @@ async fn sync_notes(
     outcome: &mut SyncOutcome,
     record: &impl Fn(&mut SyncOutcome, Result<PushResult>, &str) -> Option<PushResult>,
 ) {
-    // 确保知识库 database 存在；旧配置缺失时补建（含自关联「父级」）并持久化
-    let notes_db_id = match cfg_snap.notes_db_id.clone() {
-        Some(id) if !id.is_empty() => id,
-        _ => match client.create_notes_db(&cfg_snap.parent_page_id).await {
-            Ok(id) => {
-                if let Ok(mut c) = cfg.lock() {
-                    c.notes_db_id = Some(id.clone());
-                    if let Err(e) = config::save(&c) {
-                        outcome.error = Some(format!("知识库: 配置写盘失败: {e:#}"));
-                    }
-                }
-                id
-            }
-            Err(e) => {
-                outcome.failed += notes.len();
-                if outcome.error.is_none() {
-                    outcome.error = Some(format!("知识库: 创建数据库失败: {e:#}"));
-                }
-                return;
-            }
-        },
+    // 确保知识库 database 存在：config 缺 id 时先搜索复用远端同名库，缺失才补建
+    //（含自关联「父级」）并持久化
+    let notes_db_id = ensure_db_id(
+        client,
+        cfg,
+        cfg_snap.notes_db_id.as_deref(),
+        "📚 知识库",
+        client.create_notes_db(&cfg_snap.parent_page_id),
+        |c, id| c.notes_db_id = Some(id),
+        outcome,
+    )
+    .await;
+    let Some(notes_db_id) = notes_db_id else {
+        outcome.failed += notes.len();
+        return;
     };
 
     let all_map: HashMap<String, Note> = all_notes.into_iter().map(|n| (n.id.clone(), n)).collect();

@@ -105,7 +105,7 @@
 </template>
 
 <script setup>
-import { computed, inject, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -236,6 +236,7 @@ function onNodeClick(n) {
 }
 
 async function selectDoc(id) {
+  await flushAutosave() // 切换文档前保存上一篇的未落库修改
   selectedId.value = id
   editing.value = false
   docLoading.value = true
@@ -256,18 +257,31 @@ function toggleEdit() {
   editing.value = !editing.value
 }
 
-async function saveDoc() {
+async function saveDoc(auto = false) {
   if (!doc.value || !dirty.value) return
   saving.value = true
   try {
     const updated = await api.updateNote(doc.value.id, { content_md: draft.value })
     doc.value = { ...doc.value, content_md: updated.content_md ?? draft.value }
-    ElMessage.success('已保存')
+    if (!auto) ElMessage.success('已保存')
   } catch (e) {
     ElMessage.error('保存失败: ' + e.message)
   } finally {
     saving.value = false
   }
+}
+
+// 自动保存：编辑中停笔 3 秒落库；切换文档/卸载前先冲刷
+let autosaveTimer = null
+watch(draft, () => {
+  if (!editing.value || !dirty.value) return
+  clearTimeout(autosaveTimer)
+  autosaveTimer = setTimeout(() => saveDoc(true), 3000)
+})
+
+async function flushAutosave() {
+  clearTimeout(autosaveTimer)
+  if (editing.value && dirty.value) await saveDoc(true)
 }
 
 // 找到第一个文档（深度优先）
@@ -310,6 +324,8 @@ onMounted(() => {
 })
 onUnmounted(() => {
   document.removeEventListener('click', closeCtx)
+  clearTimeout(autosaveTimer)
+  if (editing.value && dirty.value) saveDoc(true) // 卸载前兜底保存
 })
 </script>
 

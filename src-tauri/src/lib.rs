@@ -204,6 +204,7 @@ fn create_floating_windows(app: &tauri::AppHandle) {
 /// 桌面悬浮球 UI 总开关。
 /// 目前暂停：Linux X11 无合成器时透明失效，球窗口退化成白色方块。
 /// 后期重启桌面开发时置为 true，并恢复 tauri.conf.json 里 main 窗口的 `"visible": false`。
+/// 注意：托盘与「关闭仅隐藏」不受此影响——它们一直启用，保证窗口关掉后提醒仍然存活。
 const FLOATING_UI_ENABLED: bool = false;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -211,44 +212,42 @@ pub fn run() {
     tauri::Builder::default()
         .manage(PopupKey::new(None))
         .setup(|app| {
-            if FLOATING_UI_ENABLED {
-                // 主窗口关闭时仅隐藏（退出走托盘菜单）
-                if let Some(main) = app.get_webview_window("main") {
-                    let w = main.clone();
-                    main.on_window_event(move |event| {
-                        if let WindowEvent::CloseRequested { api, .. } = event {
-                            api.prevent_close();
-                            let _ = w.hide();
-                        }
-                    });
-                }
-
-                // 系统托盘：打开主窗口 / 退出
-                let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
-                let quit = MenuItem::with_id(app, "quit", "退出 Latte", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&show, &quit])?;
-                let mut tray = TrayIconBuilder::new().menu(&menu).tooltip("Latte");
-                match app.default_window_icon() {
-                    Some(icon) => tray = tray.icon(icon.clone()),
-                    None => {
-                        if let Ok(img) = Image::from_bytes(include_bytes!("../icons/32x32.png")) {
-                            tray = tray.icon(img);
-                        }
+            // 主窗口关闭时仅隐藏（退出走托盘菜单），保证后台同步与到点提醒存活
+            if let Some(main) = app.get_webview_window("main") {
+                let w = main.clone();
+                main.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
                     }
-                }
-                tray.on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
-                        }
-                    }
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .build(app)?;
+                });
             }
+
+            // 系统托盘：打开主窗口 / 退出
+            let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出 Latte", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let mut tray = TrayIconBuilder::new().menu(&menu).tooltip("Latte");
+            match app.default_window_icon() {
+                Some(icon) => tray = tray.icon(icon.clone()),
+                None => {
+                    if let Ok(img) = Image::from_bytes(include_bytes!("../icons/32x32.png")) {
+                        tray = tray.icon(img);
+                    }
+                }
+            }
+            tray.on_menu_event(|app, event| match event.id().as_ref() {
+                "show" => {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                }
+                "quit" => app.exit(0),
+                _ => {}
+            })
+            .build(app)?;
 
             // 壳内启动 latte 本地服务；悬浮球 UI 开启时在服务就绪后创建悬浮球窗口
             let handle = app.handle().clone();

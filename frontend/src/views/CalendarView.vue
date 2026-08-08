@@ -118,6 +118,12 @@
               <el-tag v-if="row.tag" :type="tagType(row.tag)" size="small">{{ row.tag }}</el-tag>
             </template>
           </el-table-column>
+          <el-table-column label="操作" width="100">
+            <template #default="{ row }">
+              <el-button text type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+              <el-button text type="danger" size="small" @click="removeEvent(row)">删除</el-button>
+            </template>
+          </el-table-column>
         </el-table>
 
         <h4 class="mt">消费</h4>
@@ -134,8 +140,8 @@
       </div>
     </el-drawer>
 
-    <!-- 点击时间线创建事件 -->
-    <el-dialog v-model="createDialog" title="新建事件" width="460px">
+    <!-- 点击时间线创建 / 表格行编辑事件（共用同一对话框） -->
+    <el-dialog v-model="createDialog" :title="editingId ? '编辑事件' : '新建事件'" width="460px">
       <el-form label-width="80px">
         <el-form-item label="开始时间">
           <el-date-picker v-model="createForm.start_ts" type="datetime" style="width: 100%" value-format="X" />
@@ -232,7 +238,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import dayjs from 'dayjs'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 import { EVENT_TAGS, TAG_COLORS, fmtCents, fmtDuration, fmtHours, fmtMoney, fmtTime, tagType } from '../utils'
 
@@ -308,11 +314,13 @@ const nowTop = computed(() => {
   return ((nowTs.value - start) / 86400) * TOTAL_H
 })
 
-// ---------- 时间线点击创建 ----------
+// ---------- 时间线点击创建 / 表格行编辑 ----------
 
 const hoverTop = ref(null)
 const createDialog = ref(false)
 const creating = ref(false)
+// null = 新建；否则为正在编辑的事件 id（共用 createForm 与对话框）
+const editingId = ref(null)
 const createForm = reactive({ start_ts: null, end_ts: null, content: '', tag: '工作', remind: false })
 
 // y 坐标 → 当天分钟数（吸附 15 分钟）
@@ -335,6 +343,7 @@ function onTrackClick(e) {
   const rect = e.currentTarget.getBoundingClientRect()
   const snapped = yToSnappedMinutes(e.clientY - rect.top)
   const startTs = dayBounds.value.start + snapped * 60
+  editingId.value = null
   createForm.start_ts = String(startTs)
   createForm.end_ts = String(startTs + 3600)
   createForm.content = ''
@@ -343,24 +352,62 @@ function onTrackClick(e) {
   createDialog.value = true
 }
 
+// 表格「编辑」：用行数据填满表单；进行中事件 end_ts 为空，保存时传 null 保持进行中
+function openEdit(row) {
+  editingId.value = row.id
+  createForm.start_ts = String(row.start_ts)
+  createForm.end_ts = row.end_ts ? String(row.end_ts) : null
+  createForm.content = row.content || ''
+  createForm.tag = row.tag || '工作'
+  createForm.remind = !!row.remind
+  createDialog.value = true
+}
+
+async function removeEvent(row) {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除「${row.content || '(无内容)'}」（${fmtTime(row.start_ts)}）吗？已同步的事件会同时在 Notion 归档。`,
+      '删除事件',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch { return } // 用户取消
+  try {
+    await api.deleteEvent(row.id)
+    ElMessage.success('已删除')
+    await reloadDay()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
 async function saveCreate() {
   if (!createForm.content.trim()) {
     ElMessage.warning('请填写内容')
     return
   }
-  if (!createForm.start_ts || !createForm.end_ts) {
+  // 新建必须有结束时间；编辑时允许留空表示进行中
+  if (!createForm.start_ts || (!editingId.value && !createForm.end_ts)) {
     ElMessage.warning('请选择开始和结束时间')
+    return
+  }
+  if (createForm.end_ts && Number(createForm.end_ts) <= Number(createForm.start_ts)) {
+    ElMessage.warning('结束时间应晚于开始时间')
     return
   }
   creating.value = true
   try {
-    await api.createEvent({
+    const body = {
       start_ts: Number(createForm.start_ts),
-      end_ts: Number(createForm.end_ts),
+      end_ts: createForm.end_ts ? Number(createForm.end_ts) : null,
       content: createForm.content.trim(),
       tag: createForm.tag,
       remind: createForm.remind,
-    })
+    }
+    if (editingId.value) {
+      await api.updateEvent(editingId.value, body)
+    } else {
+      await api.createEvent(body)
+    }
     createDialog.value = false
     await reloadDay()
   } catch (e) {
@@ -527,7 +574,7 @@ function goToday() {
 }
 
 async function reloadDay() {
-  // 刷新当日明细 + 月历汇总（新建/识别添加后调用）
+  // 刷新当日明细 + 月历汇总（新建/编辑/删除/识别添加后调用）
   dayDetail.value = await api.getCalendarDay(selectedDate.value)
   loadCalendar()
 }

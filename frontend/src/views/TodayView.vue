@@ -69,6 +69,11 @@
       <el-tag v-if="ongoingEvent" size="small" type="success" style="margin-left: 8px">
         ⏱ {{ ongoingEvent.content || '进行中' }} {{ ongoingDuration }}
       </el-tag>
+      <!-- 番茄钟倒计时（后端会话驱动，页面关了到点也会收到系统通知） -->
+      <el-tag v-if="pomo" size="small" type="danger" effect="dark" style="margin-left: 6px">
+        🍅 {{ pomo.task_title }} 剩 {{ pomoRemaining }}
+        <el-icon style="margin-left: 4px; cursor: pointer" title="取消倒计时" @click="cancelPomo"><Close /></el-icon>
+      </el-tag>
       <el-button
         v-if="ongoingEvent"
         size="small"
@@ -118,7 +123,16 @@
               <el-icon title="项目派生提醒"><Bell /></el-icon>
             </template>
             <template v-else>
-              <el-icon title="番茄钟 25min" @click="startPomodoro(task)"><Timer /></el-icon>
+              <el-dropdown trigger="click" @command="(m) => startPomodoro(task, m)">
+                <el-icon title="番茄钟（可选时长）"><Timer /></el-icon>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item :command="15">🍅 15 分钟</el-dropdown-item>
+                    <el-dropdown-item :command="25">🍅 25 分钟</el-dropdown-item>
+                    <el-dropdown-item :command="45">🍅 45 分钟</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
               <el-icon title="开始计时" @click="startTiming(task)"><VideoPlay /></el-icon>
               <el-icon title="编辑" @click="openEdit(task)"><EditPen /></el-icon>
               <el-icon title="删除" class="op-danger" @click="removeTask(task)"><Delete /></el-icon>
@@ -282,7 +296,7 @@
 import { computed, inject, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, Bell, Delete, EditPen, Timer, VideoPlay } from '@element-plus/icons-vue'
+import { ArrowDown, Bell, Close, Delete, EditPen, Timer, VideoPlay } from '@element-plus/icons-vue'
 import { api } from '../api'
 import { fmtDuration, tagType } from '../utils'
 
@@ -344,6 +358,7 @@ async function stopOngoing() {
     await api.stopEvent(ongoingEvent.value.id)
     ElMessage.success('计时已结束')
     await loadOngoing()
+    await loadPomodoro() // 后端已清除关联的番茄钟会话
     await load()
     loadTimeline()
   } catch (e) {
@@ -524,12 +539,13 @@ async function toggleDone(task, done) {
   }
 }
 
-async function startPomodoro(task) {
+async function startPomodoro(task, minutes = 25) {
   try {
-    const res = await api.pomodoroTask(task.id)
-    ElMessage.success(`🍅 番茄钟已启动（第 ${res.pomodoro_count} 个）`)
+    const res = await api.pomodoroTask(task.id, minutes)
+    ElMessage.success(`🍅 番茄钟已启动（第 ${res.pomodoro_count} 个），${minutes} 分钟后系统通知`)
     await load()
     await loadOngoing()
+    await loadPomodoro()
   } catch (e) {
     if (e.status === 409) {
       ElMessage.warning('已有进行中事件，请先结束')
@@ -557,7 +573,7 @@ async function loadOngoing() {
   try {
     const ev = await api.getOngoingEvent()
     ongoingEvent.value = ev
-    if (ev) {
+    if (ev || pomo.value) {
       updateOngoingDuration()
       if (!ongoingTimer) {
         ongoingTimer = setInterval(updateOngoingDuration, 1000)
@@ -574,7 +590,49 @@ async function loadOngoing() {
   }
 }
 
+// ---------- 番茄钟倒计时（会话在后端，这里只做展示） ----------
+const pomo = ref(null)
+const pomoRemaining = ref('')
+
+async function loadPomodoro() {
+  try {
+    pomo.value = await api.getPomodoro()
+    if (pomo.value) {
+      updatePomoRemaining()
+      if (!ongoingTimer) {
+        ongoingTimer = setInterval(updateOngoingDuration, 1000)
+      }
+    } else {
+      pomoRemaining.value = ''
+    }
+  } catch { pomo.value = null }
+}
+
+function updatePomoRemaining() {
+  if (!pomo.value) return
+  const left = pomo.value.end_ts - Math.floor(Date.now() / 1000)
+  if (left <= 0) {
+    // 到点：后端已发系统通知并清除会话，本地同步清掉
+    pomo.value = null
+    pomoRemaining.value = ''
+    return
+  }
+  const m = Math.floor(left / 60)
+  const s = left % 60
+  pomoRemaining.value = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+
+async function cancelPomo() {
+  try {
+    await api.cancelPomodoro()
+    pomo.value = null
+    pomoRemaining.value = ''
+    ElMessage.success('已取消番茄钟倒计时')
+  } catch (e) { ElMessage.error(e.message) }
+}
+
 function updateOngoingDuration() {
+  updatePomoRemaining()
   if (!ongoingEvent.value) return
   const elapsed = Math.floor(Date.now() / 1000) - ongoingEvent.value.start_ts
   const h = Math.floor(elapsed / 3600)
@@ -717,6 +775,7 @@ onMounted(async () => {
   await rolloverYesterday()
   load()
   loadOngoing()
+  loadPomodoro()
   loadTimeline()
   loadProjects()
   loadReport()

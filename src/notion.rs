@@ -293,7 +293,7 @@ impl NotionClient {
     /// 避免重复创建」以及「测试配置」按钮的探测。标题读取规则：
     /// - database：`title[0].plain_text`（或 `.text.content`）
     /// - 普通页：`title.plain_text`
-    async fn child_objects(&self, page_id: &str) -> Result<Value> {
+    pub async fn child_objects(&self, page_id: &str) -> Result<Value> {
         let mut all: Vec<Value> = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -383,6 +383,17 @@ impl NotionClient {
     }
 
 
+
+    /// 按标题全局搜索 integration 可访问的 database，返回首个匹配的 id（无则 None）。
+    /// 供懒建路径「先复用、后创建」，避免 config 丢失 id 时在远端重复建同名库。
+    pub async fn find_db_by_title(&self, title: &str) -> Result<Option<String>> {
+        Ok(self
+            .find_latte_databases()
+            .await?
+            .into_iter()
+            .find(|(_, t)| t == title)
+            .map(|(id, _)| id))
+    }
 
     /// 解析 page_id 实际指向的对象类型，必要时向上爬升到普通页面。
     ///
@@ -596,6 +607,51 @@ impl NotionClient {
                 )
                 .await
                 .context("查询 Notion 数据库失败")?;
+            if let Some(results) = resp["results"].as_array() {
+                all.extend(results.iter().cloned());
+            }
+            match (resp["has_more"].as_bool(), resp["next_cursor"].as_str()) {
+                (Some(true), Some(c)) => cursor = Some(c.to_string()),
+                _ => break,
+            }
+        }
+        Ok(all)
+    }
+
+    /// 增量拉取的查询体：last_edited_time 升序 + 可选 since 过滤（纯函数，便于测试）
+    pub fn incremental_query_body(since: &str, cursor: Option<&str>) -> Value {
+        let mut body = json!({
+            "page_size": 100,
+            "sorts": [{ "timestamp": "last_edited_time", "direction": "ascending" }],
+        });
+        if !since.is_empty() {
+            body["filter"] = json!({
+                "timestamp": "last_edited_time",
+                "last_edited_time": { "after": since },
+            });
+        }
+        if let Some(c) = cursor {
+            body["start_cursor"] = json!(c);
+        }
+        body
+    }
+
+    /// 查询 database 中 last_edited_time 晚于 since 的 page（升序分页）。
+    /// since 为空串表示不带过滤（首次全量）。注意：Notion 不返回已归档 page，
+    /// 远端删除/归档无法在此检测，仍靠手动全量拉取兜底。
+    pub async fn query_database_since(&self, db_id: &str, since: &str) -> Result<Vec<Value>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let body = Self::incremental_query_body(since, cursor.as_deref());
+            let resp = self
+                .send(
+                    reqwest::Method::POST,
+                    &format!("/databases/{db_id}/query"),
+                    &body,
+                )
+                .await
+                .context("增量查询 Notion 数据库失败")?;
             if let Some(results) = resp["results"].as_array() {
                 all.extend(results.iter().cloned());
             }
@@ -1389,6 +1445,24 @@ mod tests {
             dirty: true,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn incremental_query_body_shape() {
+        // 无水位：不带 filter，带 last_edited_time 升序
+        let body = NotionClient::incremental_query_body("", None);
+        assert!(body.get("filter").is_none());
+        assert_eq!(
+            body["sorts"][0],
+            json!({ "timestamp": "last_edited_time", "direction": "ascending" })
+        );
+        // 有水位 + 分页游标
+        let body = NotionClient::incremental_query_body("2026-08-01T00:00:00.000Z", Some("cur-1"));
+        assert_eq!(
+            body["filter"]["last_edited_time"]["after"],
+            "2026-08-01T00:00:00.000Z"
+        );
+        assert_eq!(body["start_cursor"], "cur-1");
     }
 
     #[test]

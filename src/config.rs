@@ -29,8 +29,15 @@ pub struct Config {
     /// 外部 API（/api/ext）Bearer token；配置完成时自动生成，空串表示未生成
     #[serde(default)]
     pub api_token: String,
+    /// 到点提醒总开关（后端系统通知，D-Bus）；旧配置缺省视为开启
+    #[serde(default = "default_remind_enabled")]
+    pub remind_enabled: bool,
     #[serde(default)]
     pub ai: AiConfig,
+}
+
+fn default_remind_enabled() -> bool {
+    true
 }
 
 /// AI 图片识别配置（OpenAI 兼容代理，全部可选）

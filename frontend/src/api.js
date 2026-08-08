@@ -16,6 +16,9 @@ export const api = {
   setup: (token, page_url) => unwrap(http.post('/setup', { token, page_url })),
   verifySetup: (token, page_url) => unwrap(http.post('/setup/verify', { token, page_url })),
   pullFromNotion: () => unwrap(http.post('/sync/pull')),
+  resetLocalData: () => unwrap(http.post('/data/reset')),
+  toggleReminders: (enabled) => unwrap(http.post('/reminders/toggle', { enabled })),
+  search: (q) => unwrap(http.get('/search', { params: { q } })),
 
   getEvents: (date) => unwrap(http.get('/events', { params: { date } })),
   createEvent: (data) => unwrap(http.post('/events', data)),
@@ -60,6 +63,9 @@ export const api = {
   updateTask: (id, data) => unwrap(http.put(`/tasks/${id}`, data)),
   deleteTask: (id) => unwrap(http.delete(`/tasks/${id}`)),
   rolloverTasks: (from, to) => unwrap(http.post('/tasks/rollover', { from, to })),
-  pomodoroTask: (id) => unwrap(http.post(`/tasks/${id}/pomodoro`)),
+  pomodoroTask: (id, minutes) => unwrap(http.post(`/tasks/${id}/pomodoro`, minutes ? { minutes } : {})),
+  getPomodoro: () => unwrap(http.get('/pomodoro')),
+  cancelPomodoro: () => unwrap(http.post('/pomodoro/cancel')),
+  quickEntry: (text) => unwrap(http.post('/ai/quick-entry', { text })),
   getOngoingEvent: () => unwrap(http.get('/events/ongoing')),
 }

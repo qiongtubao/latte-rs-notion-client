@@ -11,6 +11,34 @@
       <span class="brand">☕ Latte</span>
       <span class="top-date">{{ todayStr }}</span>
       <div class="top-right">
+        <el-button size="small" @click="openQuickEntry">⚡ 快录<span class="kbd-hint">Ctrl+K</span></el-button>
+        <!-- 全局搜索：远程子串匹配，选中后打开对应面板（知识库会定位到文档） -->
+        <el-select
+          v-model="searchPick"
+          filterable
+          remote
+          clearable
+          :remote-method="doSearch"
+          :loading="searching"
+          placeholder="搜索…"
+          size="small"
+          class="top-search"
+          @change="onSearchPick"
+        >
+          <el-option-group v-for="g in searchGroups" :key="g.kind" :label="g.label">
+            <el-option
+              v-for="h in g.items"
+              :key="h.kind + ':' + h.id"
+              :value="h.kind + ':' + h.id"
+              :label="h.title || '(无标题)'"
+            >
+              <div class="srch-opt">
+                <span class="srch-title">{{ h.title || '(无标题)' }}</span>
+                <span class="srch-snippet">{{ h.snippet }}</span>
+              </div>
+            </el-option>
+          </el-option-group>
+        </el-select>
         <span class="sync-info">
           <template v-if="status.last_error">
             <span class="sync-error">{{ status.last_error }}</span>
@@ -25,6 +53,17 @@
         </el-button>
         <el-button size="small" :loading="syncing" @click="doSync">同步</el-button>
         <el-button size="small" :loading="pulling" @click="doPull">拉取</el-button>
+        <el-button size="small" type="danger" plain :loading="resetting" @click="doReset">重置</el-button>
+        <el-dropdown trigger="click" @command="downloadExport">
+          <el-button size="small">导出</el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="json">全量备份（JSON）</el-dropdown-item>
+              <el-dropdown-item command="events">事件（CSV）</el-dropdown-item>
+              <el-dropdown-item command="expenses">消费（CSV）</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </header>
 
@@ -37,33 +76,34 @@
     </main>
 
     <!-- 今日任务列表：默认隐藏，点击「今日任务」按钮随子按钮一起显示/隐藏，跟随按钮拖动 -->
+    <!-- 各 dock 统一挂 panelRefreshKey：拉取/重置/手动刷新后重建，避免停在旧数据或空态 -->
     <aside v-if="dockOpen.today" class="today-dock" :style="todayDockStyle">
-      <TodayTaskList />
+      <TodayTaskList :key="panelRefreshKey" />
     </aside>
 
     <!-- 金钱列表：同上，跟随「金钱」按钮 -->
     <aside v-if="dockOpen.money" class="today-dock" :style="moneyDockStyle">
-      <MoneyExpenseList />
+      <MoneyExpenseList :key="panelRefreshKey" />
     </aside>
 
     <!-- 日历列表：同上，跟随「日历」按钮 -->
     <aside v-if="dockOpen.calendar" class="today-dock" :style="calendarDockStyle">
-      <CalendarDayList />
+      <CalendarDayList :key="panelRefreshKey" />
     </aside>
 
     <!-- 项目列表/甘特图：同上，跟随「项目」按钮 -->
     <aside v-if="dockOpen.projects" class="today-dock dock-wide" :style="projectsDockStyle">
-      <ProjectList />
+      <ProjectList :key="panelRefreshKey" />
     </aside>
 
     <!-- 知识库：编辑器式布局（左目录右内容），更宽 -->
     <aside v-if="dockOpen.notes" class="today-dock dock-notes" :style="notesDockStyle">
-      <NoteList />
+      <NoteList :key="panelRefreshKey" />
     </aside>
 
     <!-- 好想法列表：同上，跟随「好想法」按钮 -->
     <aside v-if="dockOpen.ideas" class="today-dock" :style="ideasDockStyle">
-      <IdeaList />
+      <IdeaList :key="panelRefreshKey" />
     </aside>
 
     <!-- 浮动按钮层 -->
@@ -84,6 +124,30 @@
       @toggle="onFloatToggle(fb, $event)"
       @move="onFloatMove(fb, $event)"
     />
+
+    <!-- AI 快速录入：一句话 → 解析预览 → 确认创建 -->
+    <el-dialog v-model="qeDialog" title="⚡ 快速录入" width="460px">
+      <el-input
+        v-model="qeText"
+        placeholder="午饭 25 / 明天下午3点开会提醒我 / 灵感：……"
+        @keyup.enter="qeParse"
+      >
+        <template #append>
+          <el-button :loading="qeParsing" @click="qeParse">解析</el-button>
+        </template>
+      </el-input>
+      <div v-if="qeDraft" class="qe-preview">
+        <div class="qe-type">{{ qeTypeLabel }}</div>
+        <div v-for="f in qeFields" :key="f.k" class="qe-field">
+          <span class="qe-k">{{ f.k }}</span>
+          <span>{{ f.v }}</span>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="qeDialog = false">取消</el-button>
+        <el-button type="primary" :disabled="!qeDraft" :loading="qeSaving" @click="qeConfirm">确认创建</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 弹出面板（浮于内容之上） -->
     <Transition name="panel-fade">
@@ -135,9 +199,10 @@ import IdeaList from './components/IdeaList.vue'
 
 const loading = ref(true)
 const configured = ref(false)
-const status = ref({ last_sync: null, last_error: null, pending: 0 })
+const status = ref({ last_sync: null, last_error: null, pending: 0, remind_enabled: false })
 const syncing = ref(false)
 const pulling = ref(false)
+const resetting = ref(false)
 const activePanel = ref(null)
 const panelRefreshKey = ref(0)
 const timing = ref(false)
@@ -268,49 +333,171 @@ function closePanel() {
   activeView.value = null
 }
 
-// ---------- 到点浏览器提醒（保持不变）----------
-const remindOn = ref(localStorage.getItem('latte-remind') === '1')
-let remindTimer = null
-let lastCheck = dayjs().unix()
-
-function loadNotified() {
-  try {
-    const data = JSON.parse(localStorage.getItem('latte-notified') || '{}')
-    const today = dayjs().format('YYYY-MM-DD')
-    return data.date === today ? new Set(data.ids) : new Set()
-  } catch { return new Set() }
-}
-function saveNotified(set) {
-  localStorage.setItem('latte-notified',
-    JSON.stringify({ date: dayjs().format('YYYY-MM-DD'), ids: [...set] }))
-}
-async function checkReminders() {
-  if (!remindOn.value || !configured.value) return
-  if (!('Notification' in window) || Notification.permission !== 'granted') return
-  const today = dayjs().format('YYYY-MM-DD')
-  const now = dayjs().unix()
-  try {
-    const events = await api.getEvents(today)
-    const notified = loadNotified()
-    let changed = false
-    for (const ev of events) {
-      if (!ev.remind || notified.has(ev.id)) continue
-      if (ev.start_ts > lastCheck && ev.start_ts <= now) {
-        new Notification('Latte 提醒', { body: `该开始了：${ev.content || '(无内容)'}（${ev.tag || '未分类'}）` })
-        notified.add(ev.id); changed = true
-      }
-    }
-    if (changed) saveNotified(notified)
-  } catch {} finally { lastCheck = now }
-}
+// ---------- 到点提醒（后端系统通知，页面关了也有效） ----------
+// 开关状态以服务端 config 为准（status.remind_enabled），不再用浏览器 Notification
+const remindOn = computed(() => !!status.value.remind_enabled)
 async function toggleRemind() {
-  if (remindOn.value) { remindOn.value = false; localStorage.setItem('latte-remind', '0'); return }
-  if (!('Notification' in window)) { ElMessage.warning('当前浏览器不支持通知'); return }
-  const perm = await Notification.requestPermission()
-  if (perm === 'granted') {
-    remindOn.value = true; localStorage.setItem('latte-remind', '1')
-    lastCheck = dayjs().unix(); ElMessage.success('到点提醒已开启')
-  } else ElMessage.warning('通知权限被拒绝')
+  const target = !remindOn.value
+  try {
+    await api.toggleReminders(target)
+    status.value = { ...status.value, remind_enabled: target }
+    ElMessage.success(target ? '到点提醒已开启（系统通知）' : '到点提醒已关闭')
+  } catch (e) { ElMessage.error(`设置失败：${e.message}`) }
+}
+
+// ---------- 全局搜索 ----------
+const searchPick = ref(null)
+const searching = ref(false)
+const searchHits = ref([])
+// 搜索跳转目标（目前只有知识库文档深链）；NotesView 挂载时消费并清空
+const searchTarget = ref(null)
+provide('searchTarget', searchTarget)
+
+const KIND_META = {
+  note: { label: '知识库', panel: 'notes' },
+  task: { label: '任务', panel: 'today' },
+  idea: { label: '想法', panel: 'ideas' },
+  event: { label: '事件', panel: 'calendar' },
+  expense: { label: '消费', panel: 'money' },
+  project: { label: '项目', panel: 'projects' },
+}
+const searchGroups = computed(() =>
+  Object.entries(KIND_META)
+    .map(([kind, meta]) => ({ kind, label: meta.label, items: searchHits.value.filter(h => h.kind === kind) }))
+    .filter(g => g.items.length > 0)
+)
+
+// 防竞态：只采纳最后一次查询的结果
+let searchSeq = 0
+async function doSearch(q) {
+  const kw = (q || '').trim()
+  if (!kw) { searchHits.value = []; return }
+  const seq = ++searchSeq
+  searching.value = true
+  try {
+    const hits = await api.search(kw)
+    if (seq === searchSeq) searchHits.value = hits
+  } catch { /* 搜索失败静默，不打断输入 */ }
+  finally { if (seq === searchSeq) searching.value = false }
+}
+
+function onSearchPick(val) {
+  if (!val) return
+  const idx = val.indexOf(':')
+  const kind = val.slice(0, idx)
+  const id = val.slice(idx + 1)
+  const meta = KIND_META[kind]
+  searchPick.value = null
+  searchHits.value = []
+  if (!meta) return
+  if (kind === 'note') searchTarget.value = { kind: 'note', id }
+  const fb = floatButtons.value.find(b => b.key === meta.panel)
+  if (fb) openPanel(fb)
+  panelRefreshKey.value++ // 强制重挂载，让目标视图消费 searchTarget
+}
+
+// ---------- AI 快速录入 ----------
+const qeDialog = ref(false)
+const qeText = ref('')
+const qeParsing = ref(false)
+const qeSaving = ref(false)
+const qeDraft = ref(null)
+
+const QE_TYPE_LABELS = { expense: '💰 消费', event: '📅 日程事件', idea: '💡 想法', task: '☑ 任务' }
+const qeTypeLabel = computed(() => (qeDraft.value ? QE_TYPE_LABELS[qeDraft.value.type] || qeDraft.value.type : ''))
+const qeFields = computed(() => {
+  const d = qeDraft.value
+  if (!d) return []
+  const dt = (ts) => dayjs.unix(ts).format('MM-DD HH:mm')
+  switch (d.type) {
+    case 'expense':
+      return [{ k: '事项', v: d.item }, { k: '金额', v: `¥${d.amount}` }, { k: '分类', v: d.category }, { k: '时间', v: dt(d.ts) }]
+    case 'event':
+      return [
+        { k: '内容', v: d.content }, { k: '标签', v: d.tag },
+        { k: '开始', v: dt(d.start_ts) }, { k: '结束', v: d.end_ts ? dt(d.end_ts) : '（默认 1 小时）' },
+        { k: '提醒', v: d.remind ? '🔔 到点系统通知' : '无' },
+      ]
+    case 'idea':
+      return [{ k: '内容', v: d.content }, { k: '标签', v: d.tag }]
+    case 'task':
+      return [{ k: '标题', v: d.title }, { k: '日期', v: d.date }, { k: '优先级', v: d.priority }]
+    default:
+      return []
+  }
+})
+
+function openQuickEntry() {
+  qeText.value = ''
+  qeDraft.value = null
+  qeDialog.value = true
+}
+
+// Ctrl/Cmd+K 全局唤起快速录入
+function onGlobalKey(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault()
+    if (configured.value && !qeDialog.value) openQuickEntry()
+  }
+}
+
+// ---------- 数据导出 ----------
+async function downloadExport(kind) {
+  const url = kind === 'json' ? '/api/export' : `/api/export/csv?entity=${kind}`
+  try {
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const blob = await res.blob()
+    const a = document.createElement('a')
+    const stamp = dayjs().format('YYYYMMDD-HHmm')
+    a.href = URL.createObjectURL(blob)
+    a.download = kind === 'json' ? `latte-backup-${stamp}.json` : `latte-${kind}-${stamp}.csv`
+    a.click()
+    URL.revokeObjectURL(a.href)
+    ElMessage.success('导出成功')
+  } catch (e) {
+    ElMessage.error(`导出失败：${e.message}`)
+  }
+}
+
+async function qeParse() {
+  const text = qeText.value.trim()
+  if (!text) return
+  qeParsing.value = true
+  try {
+    qeDraft.value = await api.quickEntry(text)
+  } catch (e) {
+    qeDraft.value = null
+    ElMessage.error(e.status === 502 ? `${e.message}（请检查 latte-model-proxy 是否启动）` : e.message)
+  } finally {
+    qeParsing.value = false
+  }
+}
+
+async function qeConfirm() {
+  const d = qeDraft.value
+  if (!d) return
+  qeSaving.value = true
+  try {
+    if (d.type === 'expense') {
+      await api.createExpense({ item: d.item, amount: d.amount, category: d.category, ts: d.ts })
+    } else if (d.type === 'event') {
+      // 结束时间缺省按 1 小时（后端不接受无结束时间的补录事件）
+      await api.createEvent({ start_ts: d.start_ts, end_ts: d.end_ts ?? d.start_ts + 3600, content: d.content, tag: d.tag, remind: d.remind })
+    } else if (d.type === 'idea') {
+      await api.createIdea({ content: d.content, tag: d.tag })
+    } else if (d.type === 'task') {
+      await api.createTask({ title: d.title, date: d.date, priority: d.priority })
+    }
+    ElMessage.success(`${QE_TYPE_LABELS[d.type] || '记录'}已创建`)
+    qeDialog.value = false
+    panelRefreshKey.value++ // 触发各列表刷新
+    await fetchStatus()
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    qeSaving.value = false
+  }
 }
 
 async function fetchStatus() {
@@ -356,17 +543,40 @@ async function doPull() {
   } catch (e) { ElMessage.error(`拉取失败：${e.message}`); await fetchStatus() }
   finally { pulling.value = false }
 }
+
+// 清空本地全部数据后重新从 Notion 拉取：配置（token/页面）保留，
+// 但未同步的本地修改与仅本地保存的字段（提醒、番茄钟数等）会丢失
+async function doReset() {
+  try {
+    await ElMessageBox.confirm(
+      '将删除本地全部数据（事件、消费、项目、知识库、想法、任务），然后重新从 Notion 拉取。Notion 配置（token/页面）会保留；但未同步到 Notion 的本地修改、以及仅保存在本地的字段（事件提醒、番茄钟数、任务备注等）将永久丢失。是否继续？',
+      '清空本地并重拉',
+      { confirmButtonText: '清空并重拉', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch { return } // 用户取消
+  resetting.value = true
+  try {
+    await api.resetLocalData()
+    const r = await api.pullFromNotion()
+    const c = r.counts || {}
+    ElMessage.success(`已清空并重新拉取：事件 ${c.events ?? 0} · 消费 ${c.expenses ?? 0} · 项目 ${c.projects ?? 0} · 想法 ${c.ideas ?? 0} · 任务 ${c.tasks ?? 0} · 知识库 ${c.notes ?? 0}`)
+    panelRefreshKey.value++ // 触发各列表刷新
+    await fetchStatus()
+  } catch (e) { ElMessage.error(`重置失败：${e.message}`); await fetchStatus() }
+  finally { resetting.value = false }
+}
 function onSetupDone() { configured.value = true; fetchStatus() }
 
 onMounted(() => {
   fetchStatus()
   pollTimer = setInterval(() => { if (configured.value) fetchStatus() }, 30000)
-  remindTimer = setInterval(checkReminders, 30000)
   checkTiming()
   timingTimer = setInterval(checkTiming, 5000)
+  window.addEventListener('keydown', onGlobalKey)
 })
 onUnmounted(() => {
-  clearInterval(pollTimer); clearInterval(remindTimer); clearInterval(timingTimer)
+  clearInterval(pollTimer); clearInterval(timingTimer)
+  window.removeEventListener('keydown', onGlobalKey)
 })
 </script>
 
@@ -385,6 +595,8 @@ onUnmounted(() => {
 .brand { font-weight: 700; font-size: 16px; white-space: nowrap; color: #409eff; }
 .top-date { font-size: 13px; color: #909399; flex: 1; }
 .top-right { display: flex; align-items: center; gap: 10px; }
+.top-search { width: 200px; }
+.kbd-hint { font-size: 10px; color: #b0b6bf; margin-left: 4px; }
 .sync-info { font-size: 12px; color: #909399; }
 .sync-error { color: #f56c6c; }
 .pending-badge { margin-left: 4px; }
@@ -447,4 +659,16 @@ onUnmounted(() => {
 .panel-body { flex: 1; overflow-y: auto; padding: 12px 16px; }
 .panel-slide-enter-active, .panel-slide-leave-active { transition: transform 0.25s ease; }
 .panel-slide-enter-from, .panel-slide-leave-to { transform: translateX(100%); }
+</style>
+
+<!-- 搜索下拉内容 teleport 到 body，scoped 样式命中不到，单独非 scoped 块 -->
+<style>
+.srch-opt { display: flex; flex-direction: column; line-height: 1.4; padding: 2px 0; }
+.srch-title { font-size: 13px; color: #303133; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+.srch-snippet { font-size: 11px; color: #909399; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+/* 快速录入预览（el-dialog 同样 teleport 到 body） */
+.qe-preview { margin-top: 14px; border: 1px solid #e4e7ed; border-radius: 8px; padding: 10px 14px; background: #f8f9fb; }
+.qe-type { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+.qe-field { display: flex; gap: 12px; font-size: 13px; padding: 3px 0; }
+.qe-k { flex: 0 0 40px; color: #909399; }
 </style>
