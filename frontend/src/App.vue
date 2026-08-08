@@ -190,12 +190,6 @@
 <script setup>
 import { computed, markRaw, onMounted, onUnmounted, provide, reactive, ref } from 'vue'
 import dayjs from 'dayjs'
-import {
-  Bell, BellFilled, Close, Loading, Refresh
-} from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from './api'
-import SetupView from './views/SetupView.vue'
 import TodayView from './views/TodayView.vue'
 import MoneyView from './views/MoneyView.vue'
 import CalendarView from './views/CalendarView.vue'
@@ -203,6 +197,7 @@ import ProjectsView from './views/ProjectsView.vue'
 import NotesView from './views/NotesView.vue'
 import IdeasView from './views/IdeasView.vue'
 import DailyView from './views/DailyView.vue'
+import ReportView from './views/ReportView.vue'
 import FloatingButton from './components/FloatingButton.vue'
 import TodayTaskList from './components/TodayTaskList.vue'
 import MoneyExpenseList from './components/MoneyExpenseList.vue'
@@ -235,6 +230,7 @@ const viewMap = {
   notes: NotesView,
   ideas: IdeasView,
   daily: DailyView,
+  report: ReportView,
 }
 const subAction = ref(null)
 provide('subAction', subAction)
@@ -244,15 +240,6 @@ function subActionHandler(key, action) {
   //   今日任务 - 添加/排序/完成/计时（「报表」走面板）
   //   金钱     - 记一笔（「统计」走面板）
   //   项目     - 看板/甘特（dock 内切换视图）
-  const dockOnly =
-    (key === 'today' && action !== 'report') ||
-    (key === 'money' && action === 'add') ||
-    (key === 'projects' && (action === 'board' || action === 'gantt'))
-  if (!dockOnly) {
-    const fb = floatButtons.value.find(b => b.key === key)
-    if (fb) openPanel(fb)
-  }
-  setTimeout(() => { subAction.value = { key, action } }, 50)
 }
 
 const AI_PANEL_META = {
@@ -263,6 +250,12 @@ const AI_PANEL_META = {
   notes: { title: '🤖 写文档', placeholder: '比如：帮我写一篇 Rust 入门笔记，要点：所有权、生命周期、async' },
   ideas: { title: '🤖 捕捉灵感', placeholder: '比如：读《系统之美》时关于反馈环的思考；想做个小工具…' },
   daily: { title: '🤖 打卡建议', placeholder: '比如：想养成早起 + 每天阅读的习惯，给点坚持思路 / 推荐一些打卡项' },
+}
+
+// 打开「AI 总结」（日报/周报/月报）：report 不是浮动按钮，直接经 openPanel 打开面板
+function openReport() {
+  const fb = { key: 'report', label: 'AI 总结', subs: [] }
+  openPanel(fb)
 }
 const aiPanel = ref(null) // null = 关闭；否则为 panel key
 function openAiAssist(key) {
@@ -295,6 +288,7 @@ const floatButtons = computed(() => [
         ? { icon: '⏹', label: '结束计时', handler: () => subActionHandler('today', 'stop-timing') }
         : { icon: '▶', label: '开始计时', handler: () => subActionHandler('today', 'timing') },
       { icon: '🤖', label: 'AI 安排', handler: () => openAiAssist('today') },
+      { icon: '📝', label: 'AI 总结', handler: () => openReport() },
     ] },
   { key: 'money', icon: '💰', label: '金钱', color: '#67c23a', x: 130, y: 245,
     subs: [

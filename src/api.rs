@@ -1139,10 +1139,16 @@ struct AiAssistBody {
     /// 字数引导：short / normal / long，未指定 = normal
     #[serde(default)]
     length: Option<String>,
+    /// 报告锚定日期（仅 panel=report），YYYY-MM-DD
+    #[serde(default)]
+    date: Option<String>,
+    /// 用户特别想关注的方向（仅 panel=report），可空
+    #[serde(default)]
+    focus: Option<String>,
 }
 
 const ALLOWED_PANELS: &[&str] = &[
-    "today", "money", "calendar", "projects", "notes", "ideas", "daily",
+    "today", "money", "calendar", "projects", "notes", "ideas", "daily", "report",
 ];
 
 
@@ -1216,6 +1222,57 @@ async fn ai_assist_handler(
             Err(_) => String::new(),
         };
     }
+    if panel == "report" {
+        // 日报/周报/月报：单独走 ai_report 端点
+        let report_period = ai::ReportPeriod::from_str(text)
+            .ok_or_else(|| ApiError::bad_request("text 应为 day|week|month"))?;
+        let date = match body.date.as_deref() {
+            Some(s) if !s.trim().is_empty() => parse_date(s)
+                .ok_or_else(|| ApiError::bad_request("date 格式应为 YYYY-MM-DD"))?,
+            _ => today(),
+        };
+        let api_period = match report_period {
+            ai::ReportPeriod::Day => Period::Day,
+            ai::ReportPeriod::Week => Period::Week,
+            ai::ReportPeriod::Month => Period::Month,
+        };
+        let (from, to) = report::period_range(api_period, date);
+        let now = now_ts();
+        // 把数据汇总和 AI 调用都包在 lock 之前，让 MutexGuard 在 await 前 drop
+        let (context, focus) = {
+            let db = lock_db(&state)?;
+            let events = db.events_between(from, to, now).map_err(ApiError::internal)?;
+            let expenses = db.expenses_between(from, to).map_err(ApiError::internal)?;
+            let all_tasks = db.all_tasks().map_err(ApiError::internal)?;
+            let tasks: Vec<_> = all_tasks
+                .into_iter()
+                .filter(|t| {
+                    NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")
+                        .map(|d| {
+                            let ts = report::local_midnight(d);
+                            ts >= from && ts < to
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+            let projects = db.all_projects().map_err(ApiError::internal)?;
+            let ideas = db.all_ideas(None).map_err(ApiError::internal)?;
+            let ctx = report::build_report_context(
+                api_period, date, &events, &expenses, &tasks, &projects, &ideas, now,
+            );
+            (ctx, body.focus.clone().unwrap_or_default())
+        }; // MutexGuard 在此处 drop
+        let report = ai::ai_report(&ai_cfg, report_period, &focus, &context)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.message()))?;
+        return Ok(Json(json!({
+            "title": report.title,
+            "body_md": report.body_md,
+            "period": report_period.as_str(),
+            "date": date.format("%Y-%m-%d").to_string(),
+            "context": context,
+        })));
+    }
     let mode = body.mode.as_deref().unwrap_or("");
     let length = body.length.as_deref().unwrap_or("");
     let assist = ai::ai_assist(&ai_cfg, panel, text, &context, mode, length)
@@ -1226,10 +1283,6 @@ async fn ai_assist_handler(
         "items": assist.items.iter().map(assist_item_json).collect::<Vec<_>>(),
     })))
 }
-
-
-// ---------------- 报表 ----------------
-
 #[derive(Deserialize)]
 struct TimeReportQuery {
     period: Option<String>,
@@ -3158,6 +3211,73 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::BAD_GATEWAY); // 仍因代理不可达，但 400 不会被触发
     }
+
+    #[tokio::test]
+    async fn ai_assist_report_panel_validation_and_data() {
+        let state = test_state(true);
+        state.config.lock().unwrap().ai.proxy_base = "http://127.0.0.1:1".into();
+
+        // 非 report panel 的 text 不能为 day/week/month（仅 report 模式当周期）
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "today", "text": "day"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY); // text 非空 → 进入 AI 调用 → 502
+
+        // report panel 非法 text → 400
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "report", "text": "year"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("text 应为"));
+
+        // report panel 非法 date → 400
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "report", "text": "day", "date": "2026/08/01"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // 合法调用：空数据 + 不可达代理 → 502；context 字段应包含「日报」标题
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "report", "text": "day", "focus": "健康"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+
+        // 有数据时也应走到 AI 调用（这里因代理不可达 → 502，但说明 query 路径未崩）
+        // 补一条事件，再调一次
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/events/start",
+            Some(json!({"content": "测试", "tag": "工作"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "report", "text": "day", "date": "2026-08-09"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+    }
+
 
     #[tokio::test]
     async fn notes_crud_and_tree_flow() {

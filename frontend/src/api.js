@@ -72,6 +72,15 @@ export const api = {
     context: opts.context || '',
     mode: opts.mode || '',
     length: opts.length || '',
+    date: opts.date || '',
+    focus: opts.focus || '',
+  })),
+  // 日报/周报/月报：panel=report，text = day|week|month
+  aiReport: (period, opts = {}) => unwrap(http.post('/ai/assist', {
+    panel: 'report',
+    text: period,
+    date: opts.date || '',
+    focus: opts.focus || '',
   })),
 
   getDaily: () => unwrap(http.get('/daily')),

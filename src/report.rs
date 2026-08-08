@@ -201,6 +201,199 @@ pub fn fmt_md_hm(ts: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 把事件/消费/任务/项目/想法汇总成一段 markdown 报告。
+/// - 纯函数：所有输入（已过滤到 [from, to) 范围）由调用方提供
+/// - 输出可直接作为 AI 总结的「参考上下文」
+/// - 行数随数据量动态变化，但单段超过 50 条会被截断（避免 prompt 爆炸）
+pub fn build_report_context(
+    period: Period,
+    date: NaiveDate,
+    events: &[Event],
+    expenses: &[Expense],
+    tasks: &[crate::models::Task],
+    projects: &[crate::models::Project],
+    ideas: &[crate::models::Idea],
+    now: i64,
+) -> String {
+    use crate::models::{ProjectStatus, TaskPriority};
+    use std::collections::BTreeMap;
+
+    let (from, to) = period_range(period, date);
+    let mut out = String::new();
+    let title = match period {
+        Period::Day => format!("{} 日报", date.format("%Y-%m-%d")),
+        Period::Week => {
+            let monday = date - Duration::days(date.weekday().num_days_from_monday() as i64);
+            format!(
+                "{} 周报（第 {} 周）",
+                monday.format("%Y-%m-%d"),
+                monday.iso_week().week()
+            )
+        }
+        Period::Month => format!("{} 月报", date.format("%Y-%m")),
+        Period::Year => format!("{} 年报", date.year()),
+    };
+    out.push_str(&format!("# {title}\n\n"));
+    out.push_str(&format!(
+        "数据范围：{} ~ {}（本地时区）\n\n",
+        fmt_md_hm(from),
+        fmt_md_hm(to - 1)
+    ));
+
+    // ---- 时间投入 ----
+    let (tag_summaries, total_secs) = summarize_events(events, from, to, now);
+    out.push_str("## ⏱ 时间投入\n");
+    if total_secs == 0 {
+        out.push_str("无事件记录\n");
+    } else {
+        out.push_str(&format!("总时长 {}\n", fmt_duration(total_secs)));
+        for row in &tag_summaries {
+            if row.seconds > 0 {
+                out.push_str(&format!(
+                    "- {}：{}（{:.0}%）\n",
+                    row.tag.label(),
+                    fmt_duration(row.seconds),
+                    row.percent
+                ));
+            }
+        }
+    }
+    out.push('\n');
+
+    // ---- 消费 ----
+    out.push_str("## 💰 消费\n");
+    let total_cents = sum_expenses_in_range(expenses, from, to);
+    if total_cents == 0 {
+        out.push_str("无消费记录\n");
+    } else {
+        // 按分类汇总
+        let mut by_cat: BTreeMap<&'static str, i64> = BTreeMap::new();
+        for e in expenses.iter().filter(|e| e.ts >= from && e.ts < to) {
+            *by_cat.entry(e.category.label()).or_insert(0) += e.amount_cents;
+        }
+        out.push_str(&format!("总支出 ¥{}\n", fmt_yuan(total_cents)));
+        for (cat, cents) in by_cat.iter() {
+            let pct = if total_cents > 0 {
+                *cents as f64 / total_cents as f64 * 100.0
+            } else {
+                0.0
+            };
+            out.push_str(&format!(
+                "- {cat}：¥{}（{pct:.0}%）\n",
+                fmt_yuan(*cents)
+            ));
+        }
+    }
+    out.push('\n');
+
+    // ---- 任务 ----
+    out.push_str("## ☑ 任务\n");
+    if tasks.is_empty() {
+        out.push_str("无任务\n");
+    } else {
+        let done: Vec<_> = tasks.iter().filter(|t| t.done).collect();
+        let pending: Vec<_> = tasks.iter().filter(|t| !t.done).collect();
+        let total_pomo: i32 = tasks.iter().map(|t| t.pomodoro_count).sum();
+        out.push_str(&format!(
+            "完成 {} / 共 {}（总番茄 {}）\n",
+            done.len(),
+            tasks.len(),
+            total_pomo
+        ));
+        // 最多列 8 条待办 + 5 条已完成
+        if !pending.is_empty() {
+            out.push_str("待办：\n");
+            for t in pending.iter().take(8) {
+                out.push_str(&format!(
+                    "- [ ] {}（{}）{}\n",
+                    t.title,
+                    match t.priority {
+                        TaskPriority::High => "高",
+                        TaskPriority::Mid => "中",
+                        TaskPriority::Low => "低",
+                    },
+                    if t.project_id.is_some() { "[项目]" } else { "" }
+                ));
+            }
+            if pending.len() > 8 {
+                out.push_str(&format!("- …其余 {} 条\n", pending.len() - 8));
+            }
+        }
+        if !done.is_empty() {
+            out.push_str("已完成：\n");
+            for t in done.iter().take(5) {
+                out.push_str(&format!("- [x] {}\n", t.title));
+            }
+            if done.len() > 5 {
+                out.push_str(&format!("- …其余 {} 条\n", done.len() - 5));
+            }
+        }
+    }
+    out.push('\n');
+
+    // ---- 项目 ----
+    out.push_str("## 📊 项目\n");
+    if projects.is_empty() {
+        out.push_str("无项目\n");
+    } else {
+        // 按状态分组
+        let mut groups: BTreeMap<&'static str, Vec<&crate::models::Project>> = BTreeMap::new();
+        for p in projects {
+            let key = match p.status {
+                ProjectStatus::Todo => "待启动",
+                ProjectStatus::Doing => "进行中",
+                ProjectStatus::Done => "已完成",
+                ProjectStatus::Paused => "暂停",
+                ProjectStatus::Backlog => "待规划",
+            };
+            groups.entry(key).or_default().push(p);
+        }
+        for (status, list) in groups.iter() {
+            out.push_str(&format!("{status}（{}）：\n", list.len()));
+            for p in list.iter().take(6) {
+                let deadline = p
+                    .deadline_ts
+                    .map(|d| format!("（截止 {}）", fmt_md_hm(d)))
+                    .unwrap_or_default();
+                out.push_str(&format!("- {}{deadline}\n", p.name));
+            }
+            if list.len() > 6 {
+                out.push_str(&format!("- …其余 {} 个\n", list.len() - 6));
+            }
+        }
+    }
+    out.push('\n');
+
+    // ---- 想法（最多 8 条置顶 + 5 条最新）----
+    out.push_str("## 💡 想法\n");
+    if ideas.is_empty() {
+        out.push_str("无想法\n");
+    } else {
+        let pinned: Vec<_> = ideas.iter().filter(|i| i.pinned).take(8).collect();
+        let recent: Vec<_> = ideas.iter().take(5).collect();
+        if !pinned.is_empty() {
+            out.push_str("置顶：\n");
+            for i in pinned {
+                out.push_str(&format!("- ⭐ [{}] {}\n", i.tag.label(), i.content));
+            }
+        }
+        if !recent.is_empty() {
+            out.push_str("最新：\n");
+            for i in recent {
+                if i.pinned {
+                    continue;
+                }
+                out.push_str(&format!("- [{}] {}\n", i.tag.label(), i.content));
+            }
+        }
+    }
+    out.push('\n');
+
+    // 单段超过 50 条（防 prompt 爆炸）— 当前实现各分段已限制条目数，作为兜底
+    out
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +584,102 @@ mod tests {
         assert_eq!(days_in_month(2026, 2), 28);
         assert_eq!(days_in_month(2024, 2), 29);
         assert_eq!(days_in_month(2026, 12), 31);
+    }
+    #[test]
+    fn build_report_context_smoke_with_seed() {
+        use crate::models::{Category, Event, Expense, Idea, IdeaTag, Project, ProjectStatus, Tag, Task, TaskPriority};
+        // 范围：2026-08-09 当天 [00:00, 次日 00:00)
+        let date = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+        let from = local_midnight(date);
+        let to = local_midnight(date + Duration::days(1));
+
+        // 事件：工作 1h + 看书 30m
+        let events = vec![
+            Event { id: "e1".into(), start_ts: from + 9 * 3600, end_ts: Some(from + 10 * 3600), content: "晨会".into(), tag: Tag::Work, remind: false, task_id: None, notion_page_id: None, dirty: false, deleted: false },
+            Event { id: "e2".into(), start_ts: from + 20 * 3600, end_ts: Some(from + 20 * 3600 + 30 * 60), content: "夜读".into(), tag: Tag::Reading, remind: false, task_id: None, notion_page_id: None, dirty: false, deleted: false },
+        ];
+        // 消费：餐饮 25
+        let expenses = vec![
+            Expense { id: "x1".into(), item: "午饭".into(), amount_cents: 2500, ts: from + 12 * 3600, category: Category::Food, notion_page_id: None, dirty: false, deleted: false },
+        ];
+        // 任务：1 完成 + 1 待办
+        let tasks = vec![
+            Task { id: "t1".into(), date: "2026-08-09".into(), title: "写周报".into(), priority: TaskPriority::High, important: false, urgent: false, pomodoro_count: 2, estimated_minutes: None, notes: "".into(), task_type: "".into(), project_id: None, start_ts: None, done: true, created_ts: 0, updated_ts: 0, notion_page_id: None, dirty: false, deleted: false },
+            Task { id: "t2".into(), date: "2026-08-09".into(), title: "回邮件".into(), priority: TaskPriority::Mid, important: false, urgent: false, pomodoro_count: 0, estimated_minutes: None, notes: "".into(), task_type: "".into(), project_id: Some("p1".into()), start_ts: None, done: false, created_ts: 0, updated_ts: 0, notion_page_id: None, dirty: false, deleted: false },
+        ];
+        let projects = vec![
+            Project { id: "p1".into(), name: "体重管理".into(), status: ProjectStatus::Doing, start_ts: Some(from), deadline_ts: Some(from + 30 * 86400), note: "".into(), notion_page_id: None, dirty: false, deleted: false },
+        ];
+        let ideas = vec![
+            Idea { id: "i1".into(), content: "读《系统之美》".into(), tag: IdeaTag::Reading, pinned: true, created_ts: 0, updated_ts: 0, notion_page_id: None, dirty: false, deleted: false },
+        ];
+        let now = to;
+        let out = build_report_context(Period::Day, date, &events, &expenses, &tasks, &projects, &ideas, now);
+        // 标题
+        assert!(out.contains("# 2026-08-09 日报"), "应包含日报标题：{out}");
+        // 时间投入：工作 1h00m + 看书 0h30m
+        assert!(out.contains("总时长 1h30m"), "应汇总事件总时长：{out}");
+        assert!(out.contains("工作：1h00m"), "工作标签 1h00m：{out}");
+        assert!(out.contains("看书：30m00s") || out.contains("看书：0h30m"), "看书标签 30m：{out}");
+        // 消费
+        assert!(out.contains("总支出 ¥25.00"));
+        assert!(out.contains("餐饮：¥25.00（100%）"));
+        // 任务
+        assert!(out.contains("完成 1 / 共 2"));
+        assert!(out.contains("总番茄 2"));
+        assert!(out.contains("- [ ] 回邮件（中）[项目]"));
+        assert!(out.contains("- [x] 写周报"));
+        // 项目
+        assert!(out.contains("📊 项目"));
+        assert!(out.contains("进行中（1）"));
+        assert!(out.contains("- 体重管理"));
+        // 想法
+        assert!(out.contains("💡 想法"));
+        assert!(out.contains("⭐ [读书] 读《系统之美》"));
+    }
+
+    #[test]
+    fn build_report_context_empty_data_still_writes_headers() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+        let now = local_midnight(date + Duration::days(1));
+        let out = build_report_context(Period::Day, date, &[], &[], &[], &[], &[], now);
+        assert!(out.contains("# 2026-08-09 日报"));
+        assert!(out.contains("无事件记录"));
+        assert!(out.contains("无消费记录"));
+        assert!(out.contains("无任务"));
+        assert!(out.contains("无项目"));
+        assert!(out.contains("无想法"));
+    }
+
+    #[test]
+    fn build_report_context_week_uses_monday_range() {
+        // 2026-08-09 是周日；周报起点应为 2026-08-03（周一）
+        let date = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+        let now = local_midnight(date);
+        let out = build_report_context(Period::Week, date, &[], &[], &[], &[], &[], now);
+        assert!(out.contains("# 2026-08-03 周报"), "周报应从周一开始：{out}");
+    }
+
+    #[test]
+    fn build_report_context_truncates_long_task_lists() {
+        use crate::models::{Task, TaskPriority};
+        let date = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+        let now = local_midnight(date);
+        let tasks: Vec<Task> = (0..15)
+            .map(|i| Task {
+                id: format!("t{i}"), date: "2026-08-09".into(),
+                title: format!("待办 {i}"), priority: TaskPriority::Mid,
+                important: false, urgent: false, pomodoro_count: 0,
+                estimated_minutes: None, notes: "".into(), task_type: "".into(),
+                project_id: None, start_ts: None, done: false,
+                created_ts: 0, updated_ts: 0, notion_page_id: None,
+                dirty: false, deleted: false,
+            })
+            .collect();
+        let out = build_report_context(Period::Day, date, &[], &[], &tasks, &[], &[], now);
+        assert!(out.contains("- [ ] 待办 0"));
+        assert!(out.contains("- [ ] 待办 7"), "应取前 8 条");
+        assert!(!out.contains("- [ ] 待办 8"), "第 9 条不应出现");
+        assert!(out.contains("…其余 7 条"), "应标注截断");
     }
 }

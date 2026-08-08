@@ -30,7 +30,6 @@ pub enum AiError {
     /// 模型返回无法解析
     BadFormat,
 }
-
 impl AiError {
     pub fn message(&self) -> String {
         match self {
@@ -687,6 +686,131 @@ pub async fn ai_assist(
     parse_assist(content, now).ok_or(AiError::BadFormat)
 }
 
+// ---------------- AI 日报 / 周报 / 月报 总结 ----------------
+
+/// 周期（与 [report::Period] 复用，AI 报告用同一组语义）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportPeriod {
+    Day,
+    Week,
+    Month,
+}
+
+impl ReportPeriod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReportPeriod::Day => "day",
+            ReportPeriod::Week => "week",
+            ReportPeriod::Month => "month",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "day" | "日" => Some(Self::Day),
+            "week" | "周" => Some(Self::Week),
+            "month" | "月" => Some(Self::Month),
+            _ => None,
+        }
+    }
+}
+
+/// AI 报告返回的最终结果：标题 + markdown 正文
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiReport {
+    pub title: String,
+    pub body_md: String,
+}
+
+/// 拼接系统 prompt：角色 + 输出 schema
+pub fn build_report_prompt(period: ReportPeriod, focus: &str) -> String {
+    let period_label = match period {
+        ReportPeriod::Day => "日",
+        ReportPeriod::Week => "周",
+        ReportPeriod::Month => "月",
+    };
+    let focus_hint = if focus.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n用户特别想关注：{focus}")
+    };
+    format!(
+        "你是一位资深个人效率助理。请根据【数据汇总】输出一份「{period_label}报」总结。\
+         要求：1) 严格只返回一个 JSON 对象（不要围栏、不要其他文字）；\
+         2) 字段：title（不超过 30 字的标题）、body_md（markdown 正文，使用二级/三级标题、列表、要点）。\
+         正文结构建议：\n\
+         - ## 本期概览（2-3 句：最关键的收获 / 数字）\n\
+         - ## ⏱ 时间投入（解读：哪类事占了大头，是否符合预期）\n\
+         - ## 💰 消费（解读：是否超支 / 值得调整的方向）\n\
+         - ## ☑ 任务（完成率解读 + 未完成项的下一步建议）\n\
+         - ## 📊 项目（进展、卡点、下周/月重点）\n\
+         - ## 💡 想法 / 灵感（值得深挖的）\n\
+         - ## 下一步建议（具体可执行的 3-5 条）{focus_hint}"
+    )
+}
+
+/// 构造 AI 报告请求体（chat/completions）。`context` 是后端汇总的 markdown
+pub fn build_report_request_body(
+    cfg: &AiConfig,
+    period: ReportPeriod,
+    focus: &str,
+    context: &str,
+) -> Value {
+    json!({
+        "model": cfg.model,
+        "messages": [
+            { "role": "system", "content": build_report_prompt(period, focus) },
+            { "role": "user", "content": format!("【数据汇总】\n{context}") },
+        ],
+    })
+}
+
+/// 解析模型回复：[title, body_md]；缺字段时返回 None
+pub fn parse_report(text: &str) -> Option<AiReport> {
+    let value: Value = serde_json::from_str(strip_fence(text)).ok()?;
+    let title = value["title"].as_str()?.trim().to_string();
+    let body_md = value["body_md"].as_str()?.trim().to_string();
+    if title.is_empty() || body_md.is_empty() {
+        return None;
+    }
+    Some(AiReport { title, body_md })
+}
+
+
+/// 调用 OpenAI 兼容代理生成报告。`context` 是后端预汇总的 markdown
+pub async fn ai_report(
+    cfg: &AiConfig,
+    period: ReportPeriod,
+    focus: &str,
+    context: &str,
+) -> Result<AiReport, AiError> {
+    let http = reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .map_err(|e| AiError::Unavailable(e.to_string()))?;
+    let url = format!("{}/v1/chat/completions", cfg.proxy_base.trim_end_matches('/'));
+    let body = build_report_request_body(cfg, period, focus, context);
+    let mut req = http.post(&url).json(&body);
+    if !cfg.api_key.is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AiError::Unavailable(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(AiError::Unavailable(format!("HTTP {status}")));
+    }
+    let value: Value = resp
+        .json()
+        .await
+        .map_err(|e| AiError::Unavailable(e.to_string()))?;
+    let content = value["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or(AiError::BadFormat)?;
+    parse_report(content).ok_or(AiError::BadFormat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,5 +1196,62 @@ mod tests {
         let out = parse_assist(text2, fixed_now()).unwrap();
         assert!(out.items.is_empty());
         assert_eq!(out.summary, "先想个大纲");
+    }
+    // ---- report ----
+
+    #[test]
+    fn report_period_from_str_recognizes_zh_and_en() {
+        assert_eq!(ReportPeriod::from_str("day"), Some(ReportPeriod::Day));
+        assert_eq!(ReportPeriod::from_str("周"), Some(ReportPeriod::Week));
+        assert_eq!(ReportPeriod::from_str("month"), Some(ReportPeriod::Month));
+        assert_eq!(ReportPeriod::from_str("year"), None);
+        assert_eq!(ReportPeriod::from_str(""), None);
+    }
+
+    #[test]
+    fn report_prompt_mentions_period_and_focus() {
+        let p = build_report_prompt(ReportPeriod::Week, "");
+        assert!(p.contains("周报"));
+        assert!(!p.contains("用户特别想关注"));
+        let p2 = build_report_prompt(ReportPeriod::Month, "开源贡献");
+        assert!(p2.contains("月报"));
+        assert!(p2.contains("用户特别想关注：开源贡献"));
+    }
+
+    #[test]
+    fn report_parse_basic() {
+        let text = "{\"title\":\"本周高效推进\",\"body_md\":\"## 本期概览\\n完成率 80%。\"}";
+        let r = parse_report(text).unwrap();
+        assert_eq!(r.title, "本周高效推进");
+        assert!(r.body_md.contains("完成率 80%"));
+    }
+
+    #[test]
+    fn report_parse_strips_fence() {
+        let text = "```json\n{\"title\":\"T\",\"body_md\":\"B\"}\n```";
+        let r = parse_report(text).unwrap();
+        assert_eq!(r.title, "T");
+        assert_eq!(r.body_md, "B");
+    }
+
+    #[test]
+    fn report_parse_rejects_missing_or_empty() {
+        assert!(parse_report("garbage").is_none());
+        assert!(parse_report(r#"{"title":"X"}"#).is_none()); // 缺 body_md
+        assert!(parse_report(r#"{"body_md":"B"}"#).is_none()); // 缺 title
+        assert!(parse_report(r#"{"title":"","body_md":"B"}"#).is_none()); // 空 title
+        assert!(parse_report(r#"{"title":"X","body_md":""}"#).is_none()); // 空 body
+    }
+
+    #[test]
+    fn report_request_body_includes_context() {
+        let cfg = AiConfig { model: "m1".into(), ..AiConfig::default() };
+        let body = build_report_request_body(&cfg, ReportPeriod::Day, "读书", "## 时间\n- 工作 1h");
+        assert_eq!(body["model"], "m1");
+        let user_msg = body["messages"][1]["content"].as_str().unwrap();
+        assert!(user_msg.contains("【数据汇总】"));
+        assert!(user_msg.contains("## 时间"));
+        let sys_msg = body["messages"][0]["content"].as_str().unwrap();
+        assert!(sys_msg.contains("读书"));
     }
 }
