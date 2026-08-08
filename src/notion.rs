@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::models::{Category, Event, Expense, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus, Tag, Task, TaskPriority};
+use crate::models::{Category, DailyKind, Event, Expense, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus, PulledDailyEntry, Tag, Task, TaskPriority};
 
 pub const BASE_URL: &str = "https://api.notion.com/v1";
 pub const NOTION_VERSION: &str = "2022-06-28";
@@ -37,6 +37,7 @@ pub struct PulledData {
     pub ideas: Vec<Idea>,
     pub tasks: Vec<Task>,
     pub notes: Vec<Note>,
+    pub daily: Vec<PulledDailyEntry>,
 }
 
 /// 验证/查询结果：token 是否有效、找到哪些数据库
@@ -175,9 +176,15 @@ impl NotionClient {
             .ok_or_else(|| anyhow!("Notion 响应缺少 database id"))
     }
 
+    /// 在父页面下懒建「✅ 每日打卡」database，返回 database id
+    pub async fn create_daily_db(&self, parent_page_id: &str) -> Result<String> {
+        self.create_db_return(daily_db_body(parent_page_id))
+            .await
+            .context("创建「✅ 每日打卡」数据库失败")
+    }
+
     /// 在指定 database 中新建 page（行），返回 page id
-    pub async fn create_page(&self, database_id: &str, properties: &Value) -> Result<String> {
-        let body = json!({
+    pub async fn create_page(&self, database_id: &str, properties: &Value) -> Result<String> {        let body = json!({
             "parent": { "type": "database_id", "database_id": database_id },
             "properties": properties,
         });
@@ -720,6 +727,16 @@ impl NotionClient {
             Some(id) => self.pull_notes(id).await?,
             None => Vec::new(),
         };
+        // 每日打卡条目：item 由 db 层按名称解析/补建
+        let daily = match cfg.daily_db_id.as_ref() {
+            Some(id) => self
+                .query_database(id)
+                .await?
+                .iter()
+                .filter_map(parse_daily_entry_page)
+                .collect(),
+            None => Vec::new(),
+        };
         Ok(PulledData {
             events,
             expenses,
@@ -727,6 +744,7 @@ impl NotionClient {
             ideas,
             tasks,
             notes,
+            daily,
         })
     }
 
@@ -930,6 +948,68 @@ pub fn idea_properties(idea: &Idea) -> Value {
         "标签": select_prop(idea.tag.label()),
         "置顶": checkbox_prop(idea.pinned),
         "时间": date_prop(idea.created_ts),
+    })
+}
+
+/// 「✅ 每日打卡」database：名称(title)、日期(date)、类型(select 打卡/记录)、完成(checkbox)、数值(number)。
+/// 一行 = 某天某打卡项的一条打卡/记录；打卡项定义本身只在本地，远端行内嵌名称。
+pub fn daily_db_body(parent_page_id: &str) -> Value {
+    let kind_labels: Vec<&str> = DailyKind::ALL.iter().map(|k| k.label()).collect();
+    db_body(
+        parent_page_id,
+        "✅ 每日打卡",
+        json!({
+            "名称": { "title": {} },
+            "日期": { "date": {} },
+            "类型": { "select": { "options": select_options(&kind_labels) } },
+            "完成": { "checkbox": {} },
+            "数值": { "number": {} },
+        }),
+    )
+}
+
+/// 每日条目 → Notion page properties（item 名称/类型内嵌；无数值时省略「数值」属性，
+/// Notion 不接受 null 属性值）
+pub fn daily_entry_properties(
+    item_name: &str,
+    kind: DailyKind,
+    date: &str,
+    done: bool,
+    value: Option<f64>,
+) -> Value {
+    let mut props = json!({
+        "名称": title_prop(item_name),
+        "日期": { "date": { "start": date } },
+        "类型": select_prop(kind.label()),
+        "完成": checkbox_prop(done),
+    });
+    if let Some(v) = value {
+        props["数值"] = number_prop(v);
+    }
+    props
+}
+
+/// 解析「✅ 每日打卡」database 的一个 page；item 由 db 层按名称解析/补建
+pub fn parse_daily_entry_page(page: &Value) -> Option<PulledDailyEntry> {
+    let props = &page["properties"];
+    let notion_page_id = page["id"].as_str()?.to_string();
+    let item_name = prop_title(props, "名称");
+    if item_name.is_empty() {
+        return None;
+    }
+    // 日期取 date.start 前 10 位（YYYY-MM-DD）；缺失的行不要
+    let date_raw = props["日期"]["date"]["start"].as_str()?;
+    let date = date_raw.get(..10)?.to_string();
+    Some(PulledDailyEntry {
+        notion_page_id,
+        item_name,
+        kind: prop_select(props, "类型")
+            .and_then(|s| DailyKind::from_label(&s))
+            .unwrap_or(DailyKind::Habit),
+        date,
+        done: prop_checkbox(props, "完成"),
+        value: prop_number(props, "数值"),
+        created_ts: page_created_ts(page),
     })
 }
 
@@ -1463,6 +1543,19 @@ mod tests {
             "2026-08-01T00:00:00.000Z"
         );
         assert_eq!(body["start_cursor"], "cur-1");
+    }
+
+    #[test]
+    fn daily_entry_properties_omits_number_when_none() {
+        // 习惯打卡无数值：「数值」属性必须省略（Notion 不接受 null 属性值）
+        let props = daily_entry_properties("早起", DailyKind::Habit, "2026-08-08", true, None);
+        assert!(props.get("数值").is_none());
+        assert_eq!(props["完成"]["checkbox"], true);
+        assert_eq!(props["日期"]["date"]["start"], "2026-08-08");
+        // 数值记录：正常带上
+        let props = daily_entry_properties("体重", DailyKind::Metric, "2026-08-08", true, Some(65.5));
+        assert_eq!(props["数值"]["number"], 65.5);
+        assert_eq!(props["类型"]["select"]["name"], "记录");
     }
 
     #[test]

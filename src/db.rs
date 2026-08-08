@@ -16,8 +16,8 @@ use chrono::{Local, NaiveDate, TimeZone};
 
 use crate::notion::PulledData;
 use crate::models::{
-    Category, Event, Expense, ExtRecord, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus,
-    Tag, Task, TaskPriority,
+    Category, DailyEntry, DailyItem, DailyKind, Event, Expense, ExtRecord, Idea, IdeaTag, Note,
+    NoteKind, Project, ProjectStatus, PulledDailyEntry, Tag, Task, TaskPriority,
 };
 
 pub struct Db {
@@ -36,6 +36,8 @@ const TASK_COLS: &str =
     "id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted, task_type, project_id, start_ts";
 const EXT_RECORD_COLS: &str =
     "ns, id, title, props_json, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted";
+const DAILY_ENTRY_COLS: &str =
+    "id, item_id, date, done, value, notion_page_id, dirty, deleted, created_ts";
 
 /// 拉取覆盖后的各类计数
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -46,6 +48,7 @@ pub struct PullCounts {
     pub ideas: usize,
     pub tasks: usize,
     pub notes: usize,
+    pub daily: usize,
 }
 
 /// 一条全局搜索结果；kind 由查询方填充（note/task/idea/event/expense/project）
@@ -213,6 +216,26 @@ impl Db {
             CREATE TABLE IF NOT EXISTS sync_meta (
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS daily_items (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('打卡','记录')),
+                name TEXT NOT NULL,
+                unit TEXT NOT NULL DEFAULT '',
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS daily_entries (
+                id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                value REAL,
+                notion_page_id TEXT,
+                dirty INTEGER NOT NULL DEFAULT 1,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER NOT NULL,
+                UNIQUE(item_id, date)
             );",
         )?;
         self.migrate()?;
@@ -1556,6 +1579,296 @@ impl Db {
         Ok(())
     }
 
+    // ---------- 每日打卡 / 记录 ----------
+
+    fn row_to_daily_item(row: &Row) -> rusqlite::Result<DailyItem> {
+        Ok(DailyItem {
+            id: row.get(0)?,
+            kind: DailyKind::from_label(&row.get::<_, String>(1)?).unwrap_or(DailyKind::Habit),
+            name: row.get(2)?,
+            unit: row.get(3)?,
+            archived: row.get::<_, i64>(4)? != 0,
+            created_ts: row.get(5)?,
+        })
+    }
+
+    fn row_to_daily_entry(row: &Row) -> rusqlite::Result<DailyEntry> {
+        Ok(DailyEntry {
+            id: row.get(0)?,
+            item_id: row.get(1)?,
+            date: row.get(2)?,
+            done: row.get::<_, i64>(3)? != 0,
+            value: row.get(4)?,
+            notion_page_id: row.get(5)?,
+            dirty: row.get::<_, i64>(6)? != 0,
+            deleted: row.get::<_, i64>(7)? != 0,
+            created_ts: row.get(8)?,
+        })
+    }
+
+    /// 全部打卡项（默认不含已归档）
+    pub fn daily_items(&self, include_archived: bool) -> Result<Vec<DailyItem>> {
+        let sql = if include_archived {
+            "SELECT id, kind, name, unit, archived, created_ts FROM daily_items ORDER BY created_ts"
+        } else {
+            "SELECT id, kind, name, unit, archived, created_ts FROM daily_items WHERE archived = 0 ORDER BY created_ts"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], Self::row_to_daily_item)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn get_daily_item(&self, id: &str) -> Result<Option<DailyItem>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, kind, name, unit, archived, created_ts FROM daily_items WHERE id = ?1",
+                params![id],
+                Self::row_to_daily_item,
+            )
+            .optional()?)
+    }
+
+    pub fn create_daily_item(&self, kind: DailyKind, name: &str, unit: &str, now: i64) -> Result<DailyItem> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO daily_items (id, kind, name, unit, created_ts) VALUES (?1,?2,?3,?4,?5)",
+            params![id, kind.label(), name, unit, now],
+        )?;
+        Ok(DailyItem {
+            id,
+            kind,
+            name: name.to_string(),
+            unit: unit.to_string(),
+            archived: false,
+            created_ts: now,
+        })
+    }
+
+    pub fn update_daily_item(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        unit: Option<&str>,
+        archived: Option<bool>,
+    ) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(n) = name {
+            sets.push("name = ?");
+            values.push(Box::new(n.to_string()));
+        }
+        if let Some(u) = unit {
+            sets.push("unit = ?");
+            values.push(Box::new(u.to_string()));
+        }
+        if let Some(a) = archived {
+            sets.push("archived = ?");
+            values.push(Box::new(a));
+        }
+        if sets.is_empty() {
+            return Ok(self.get_daily_item(id)?.is_some());
+        }
+        let sql = format!("UPDATE daily_items SET {} WHERE id = ?", sets.join(", "));
+        values.push(Box::new(id.to_string()));
+        let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+    }
+
+    /// 按 名称+类型 找打卡项 id（拉取解析用）
+    pub fn daily_item_id_by_name(&self, kind: DailyKind, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM daily_items WHERE kind = ?1 AND name = ?2 LIMIT 1",
+                params![kind.label(), name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// 按名称找打卡项，没有就补建（拉取远端条目时自动接上本地定义）
+    pub fn ensure_daily_item(&self, kind: DailyKind, name: &str, now: i64) -> Result<String> {
+        match self.daily_item_id_by_name(kind, name)? {
+            Some(id) => Ok(id),
+            None => Ok(self.create_daily_item(kind, name, "", now)?.id),
+        }
+    }
+
+    pub fn daily_entry_for(&self, item_id: &str, date: &str) -> Result<Option<DailyEntry>> {
+        let sql = format!("SELECT {DAILY_ENTRY_COLS} FROM daily_entries WHERE item_id = ?1 AND date = ?2 AND deleted = 0");
+        Ok(self
+            .conn
+            .query_row(&sql, params![item_id, date], Self::row_to_daily_entry)
+            .optional()?)
+    }
+
+    /// 打卡/记录（每天每项一条）：已存在则更新 done/value 并置 dirty（保留 id 与 page id）
+    pub fn upsert_daily_entry(
+        &self,
+        item_id: &str,
+        date: &str,
+        done: bool,
+        value: Option<f64>,
+        now: i64,
+    ) -> Result<DailyEntry> {
+        if let Some(mut e) = self.daily_entry_for(item_id, date)? {
+            self.conn.execute(
+                "UPDATE daily_entries SET done = ?2, value = ?3, dirty = 1 WHERE id = ?1",
+                params![e.id, done, value],
+            )?;
+            e.done = done;
+            e.value = value;
+            e.dirty = true;
+            return Ok(e);
+        }
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO daily_entries (id, item_id, date, done, value, dirty, created_ts)
+             VALUES (?1,?2,?3,?4,?5,1,?6)",
+            params![id, item_id, date, done, value, now],
+        )?;
+        Ok(DailyEntry {
+            id,
+            item_id: item_id.to_string(),
+            date: date.to_string(),
+            done,
+            value,
+            notion_page_id: None,
+            dirty: true,
+            deleted: false,
+            created_ts: now,
+        })
+    }
+
+    /// 某日期区间内的条目（含起止，按日期升序）
+    pub fn daily_entries_between(&self, from_date: &str, to_date: &str) -> Result<Vec<DailyEntry>> {
+        let sql = format!(
+            "SELECT {DAILY_ENTRY_COLS} FROM daily_entries
+             WHERE deleted = 0 AND date >= ?1 AND date <= ?2 ORDER BY date, created_ts"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from_date, to_date], Self::row_to_daily_entry)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 某打卡项所有已打卡日期（降序，算连续天数用）
+    pub fn daily_done_dates(&self, item_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT date FROM daily_entries WHERE item_id = ?1 AND done = 1 AND deleted = 0 ORDER BY date DESC",
+        )?;
+        let rows = stmt.query_map(params![item_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 某数值指标最近一次的记录值
+    pub fn daily_last_value(&self, item_id: &str) -> Result<Option<f64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM daily_entries WHERE item_id = ?1 AND value IS NOT NULL AND deleted = 0 ORDER BY date DESC LIMIT 1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn dirty_daily_entries(&self) -> Result<Vec<DailyEntry>> {
+        let sql = format!("SELECT {DAILY_ENTRY_COLS} FROM daily_entries WHERE dirty = 1 ORDER BY date");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::row_to_daily_entry)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_daily_entry_page_id(&self, id: &str, page_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE daily_entries SET notion_page_id = ?2, dirty = 0 WHERE id = ?1",
+            params![id, page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_daily_entry_dirty(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE daily_entries SET dirty = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn purge_daily_entry(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM daily_entries WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// 删除条目（已同步的软删等归档，未同步的硬删）
+    pub fn delete_daily_entry(&self, id: &str) -> Result<()> {
+        self.soft_or_hard_delete("daily_entries", id)
+    }
+
+    /// 全量拉取覆盖：条目全清重建（打卡项定义保留，未知的按名称自动补建）
+    fn replace_daily_entries(&self, remote: &[PulledDailyEntry], now: i64) -> Result<usize> {
+        self.conn.execute("DELETE FROM daily_entries", [])?;
+        for p in remote {
+            let item_id = self.ensure_daily_item(p.kind, &p.item_name, now)?;
+            self.conn.execute(
+                "INSERT INTO daily_entries (id, item_id, date, done, value, notion_page_id, dirty, deleted, created_ts)
+                 VALUES (?1,?2,?3,?4,?5,?6,0,0,?7)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    item_id,
+                    p.date,
+                    p.done,
+                    p.value,
+                    p.notion_page_id,
+                    p.created_ts
+                ],
+            )?;
+        }
+        Ok(remote.len())
+    }
+
+    /// 增量拉取的条目 upsert：本地 dirty 跳过（推送优先）；同日已有条目则更新并接上 page id
+    pub fn upsert_pulled_daily_entry(&self, p: &PulledDailyEntry, now: i64) -> Result<UpsertKind> {
+        let item_id = self.ensure_daily_item(p.kind, &p.item_name, now)?;
+        match self.row_id_dirty_by_page_id("daily_entries", &p.notion_page_id)? {
+            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+            Some((id, false)) => {
+                self.conn.execute(
+                    "UPDATE daily_entries SET item_id=?2, date=?3, done=?4, value=?5 WHERE id=?1",
+                    params![id, item_id, p.date, p.done, p.value],
+                )?;
+                Ok(UpsertKind::Updated)
+            }
+            None => {
+                // 远端条目对应的本地同日条目可能已存在（本地先建的）
+                if let Some(e) = self.daily_entry_for(&item_id, &p.date)? {
+                    if e.dirty {
+                        return Ok(UpsertKind::SkippedDirty);
+                    }
+                    self.conn.execute(
+                        "UPDATE daily_entries SET done=?2, value=?3, notion_page_id=?4 WHERE id=?1",
+                        params![e.id, p.done, p.value, p.notion_page_id],
+                    )?;
+                    return Ok(UpsertKind::Updated);
+                }
+                self.conn.execute(
+                    "INSERT INTO daily_entries (id, item_id, date, done, value, notion_page_id, dirty, deleted, created_ts)
+                     VALUES (?1,?2,?3,?4,?5,?6,0,0,?7)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        item_id,
+                        p.date,
+                        p.done,
+                        p.value,
+                        p.notion_page_id,
+                        p.created_ts
+                    ],
+                )?;
+                Ok(UpsertKind::Inserted)
+            }
+        }
+    }
+
     // ---------- 删除公共逻辑 ----------
 
     /// 待同步（dirty = 1）行总数
@@ -1569,6 +1882,7 @@ impl Db {
             "ext_records",
             "ideas",
             "tasks",
+            "daily_entries",
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table} WHERE dirty = 1");
             total += self.conn.query_row(&sql, [], |r| r.get::<_, i64>(0))?;
@@ -1612,6 +1926,8 @@ impl Db {
                 "ideas",
                 "tasks",
                 "ext_records",
+                "daily_entries",
+                "daily_items",
             ] {
                 let sql = format!("DELETE FROM {table}");
                 self.conn.execute(&sql, [])?;
@@ -2015,6 +2331,7 @@ impl Db {
             let ideas = self.replace_ideas(&data.ideas)?;
             let tasks = self.replace_tasks(&data.tasks)?;
             let notes = self.replace_notes(&data.notes)?;
+            let daily = self.replace_daily_entries(&data.daily, Local::now().timestamp())?;
             Ok(PullCounts {
                 events,
                 expenses,
@@ -2022,6 +2339,7 @@ impl Db {
                 ideas,
                 tasks,
                 notes,
+                daily,
             })
         })();
         match res {

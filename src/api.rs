@@ -22,8 +22,8 @@ use crate::ai;
 use crate::config::{self, Config};
 use crate::db::Db;
 use crate::models::{
-    Category, Event, Expense, ExtRecord, Idea, IdeaTag, Note, NoteKind, Project, ProjectStatus,
-    Tag, Task, TaskPriority,
+    Category, DailyEntry, DailyKind, Event, Expense, ExtRecord, Idea, IdeaTag, Note, NoteKind,
+    Project, ProjectStatus, Tag, Task, TaskPriority,
 };
 use crate::notion::NotionClient;
 use crate::report::{self, Period};
@@ -232,6 +232,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/reminders/toggle", post(toggle_reminders))
         .route("/api/export", get(export_json))
         .route("/api/export/csv", get(export_csv))
+        .route("/api/daily", get(daily_overview))
+        .route("/api/daily/items", post(add_daily_item))
+        .route("/api/daily/items/{id}", put(update_daily_item))
+        .route("/api/daily/entry", post(upsert_daily_entry_api))
+        .route("/api/daily/history", get(daily_history))
         .route("/api/sync/pull", post(sync_pull))
         .route("/api/data/reset", post(reset_data))
         .route_layer(middleware::from_fn_with_state(
@@ -330,7 +335,7 @@ async fn setup(
             )
         })?;
     // 保留已有 AI 配置、外部 API token、提醒开关与懒建的 database id，避免重新 setup 时被默认值覆盖
-    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id, remind_enabled) = state
+    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id, daily_db_id, remind_enabled) = state
         .config
         .lock()
         .map(|c| {
@@ -339,6 +344,7 @@ async fn setup(
                 c.api_token.clone(),
                 c.ideas_db_id.clone(),
                 c.tasks_db_id.clone(),
+                c.daily_db_id.clone(),
                 c.remind_enabled,
             )
         })
@@ -356,6 +362,7 @@ async fn setup(
         notes_db_id: Some(ids.notes_db_id),
         ideas_db_id,
         tasks_db_id,
+        daily_db_id,
         api_token,
         remind_enabled,
         ai: ai_cfg,
@@ -445,6 +452,7 @@ async fn sync_pull(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             "ideas": counts.ideas,
             "tasks": counts.tasks,
             "notes": counts.notes,
+            "daily": counts.daily,
         }
     })))
 }
@@ -494,6 +502,204 @@ async fn search_all(
         })
         .collect();
     Ok(Json(json!(list)))
+}
+
+// ---------------- 每日打卡 / 记录 ----------------
+
+fn daily_entry_json(e: &DailyEntry) -> Value {
+    json!({
+        "id": e.id,
+        "item_id": e.item_id,
+        "date": e.date,
+        "done": e.done,
+        "value": e.value,
+    })
+}
+
+/// 连续打卡天数：今天没打从昨天起数（今天打了算今天）
+fn daily_streak(dates_desc: &[String], today: NaiveDate) -> i64 {
+    let set: std::collections::HashSet<&str> = dates_desc.iter().map(|s| s.as_str()).collect();
+    let today_s = today.to_string();
+    let mut day = if set.contains(today_s.as_str()) {
+        today
+    } else {
+        today - Duration::days(1)
+    };
+    let mut streak = 0i64;
+    while set.contains(day.to_string().as_str()) {
+        streak += 1;
+        day -= Duration::days(1);
+    }
+    streak
+}
+
+/// 今日总览：各打卡项 + 今日状态 + 连续天数/最近值
+async fn daily_overview(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let today = today();
+    let today_s = today.to_string();
+    let db = lock_db(&state)?;
+    let items = db.daily_items(false).map_err(ApiError::internal)?;
+    let mut out = Vec::new();
+    for item in items {
+        let entry = db
+            .daily_entry_for(&item.id, &today_s)
+            .map_err(ApiError::internal)?;
+        let streak = if item.kind == DailyKind::Habit {
+            db.daily_done_dates(&item.id)
+                .map(|d| daily_streak(&d, today))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let last_value = if item.kind == DailyKind::Metric {
+            db.daily_last_value(&item.id).map_err(ApiError::internal)?
+        } else {
+            None
+        };
+        out.push(json!({
+            "id": item.id,
+            "kind": item.kind.label(),
+            "name": item.name,
+            "unit": item.unit,
+            "today_done": entry.as_ref().map(|e| e.done).unwrap_or(false),
+            "today_value": entry.and_then(|e| e.value),
+            "streak": streak,
+            "last_value": last_value,
+        }));
+    }
+    Ok(Json(json!({ "date": today_s, "items": out })))
+}
+
+#[derive(Deserialize)]
+struct AddDailyItemBody {
+    kind: String,
+    name: String,
+    unit: Option<String>,
+}
+
+async fn add_daily_item(
+    State(state): State<AppState>,
+    Json(body): Json<AddDailyItemBody>,
+) -> ApiResult<Json<Value>> {
+    let kind = DailyKind::from_label(&body.kind)
+        .ok_or_else(|| ApiError::bad_request("kind 应为：打卡|记录"))?;
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name 不能为空"));
+    }
+    let db = lock_db(&state)?;
+    let unit = body.unit.as_deref().unwrap_or("").trim();
+    let item = db
+        .create_daily_item(kind, name, unit, now_ts())
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "id": item.id,
+        "kind": item.kind.label(),
+        "name": item.name,
+        "unit": item.unit,
+    })))
+}
+
+#[derive(Deserialize)]
+struct UpdateDailyItemBody {
+    name: Option<String>,
+    unit: Option<String>,
+    archived: Option<bool>,
+}
+
+async fn update_daily_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateDailyItemBody>,
+) -> ApiResult<Json<Value>> {
+    if let Some(n) = body.name.as_deref()
+        && n.trim().is_empty()
+    {
+        return Err(ApiError::bad_request("name 不能为空"));
+    }
+    let db = lock_db(&state)?;
+    let updated = db
+        .update_daily_item(&id, body.name.as_deref(), body.unit.as_deref(), body.archived)
+        .map_err(ApiError::internal)?;
+    if !updated {
+        return Err(ApiError::not_found("打卡项不存在"));
+    }
+    let item = db
+        .get_daily_item(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("打卡项不存在"))?;
+    Ok(Json(json!({
+        "id": item.id,
+        "kind": item.kind.label(),
+        "name": item.name,
+        "unit": item.unit,
+        "archived": item.archived,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DailyCheckBody {
+    item_id: String,
+    date: Option<String>,
+    done: Option<bool>,
+    value: Option<f64>,
+}
+
+/// 打卡（习惯）/ 记录（数值）共用一个落点：习惯传 done，数值传 value
+async fn upsert_daily_entry_api(
+    State(state): State<AppState>,
+    Json(body): Json<DailyCheckBody>,
+) -> ApiResult<Json<Value>> {
+    let date = match &body.date {
+        Some(d) => parse_date(d).ok_or_else(|| ApiError::bad_request("date 格式应为 YYYY-MM-DD"))?,
+        None => today(),
+    };
+    if let Some(v) = body.value
+        && !v.is_finite()
+    {
+        return Err(ApiError::bad_request("value 非法"));
+    }
+    let db = lock_db(&state)?;
+    let item = db
+        .get_daily_item(&body.item_id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("打卡项不存在"))?;
+    // 数值记录隐含 done=1；习惯打卡 done 缺省 true
+    let (done, value) = match item.kind {
+        DailyKind::Metric => (true, body.value),
+        DailyKind::Habit => (body.done.unwrap_or(true), None),
+    };
+    if item.kind == DailyKind::Metric && value.is_none() {
+        return Err(ApiError::bad_request("记录类打卡项需要 value"));
+    }
+    let entry = db
+        .upsert_daily_entry(&item.id, &date.to_string(), done, value, now_ts())
+        .map_err(ApiError::internal)?;
+    Ok(Json(daily_entry_json(&entry)))
+}
+
+#[derive(Deserialize)]
+struct DailyHistoryQuery {
+    days: Option<i64>,
+}
+
+/// 最近 N 天的全部条目（前端自己组织格子/趋势）
+async fn daily_history(
+    State(state): State<AppState>,
+    Query(q): Query<DailyHistoryQuery>,
+) -> ApiResult<Json<Value>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    let to = today();
+    let from = to - Duration::days(days - 1);
+    let db = lock_db(&state)?;
+    let entries = db
+        .daily_entries_between(&from.to_string(), &to.to_string())
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "from": from.to_string(),
+        "to": to.to_string(),
+        "entries": entries.iter().map(daily_entry_json).collect::<Vec<_>>(),
+    })))
 }
 
 // ---------------- 数据导出 ----------------
@@ -2379,6 +2585,62 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         let (code, _) = call(&state, "GET", "/api/export/csv?entity=x", None).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn daily_check_and_record_flow() {
+        let state = test_state(true);
+        // 建习惯 + 数值指标
+        let (code, body) = call(&state, "POST", "/api/daily/items", Some(json!({"kind": "打卡", "name": "早起"}))).await;
+        assert_eq!(code, StatusCode::OK);
+        let habit = body["id"].as_str().unwrap().to_string();
+        let (code, body) = call(&state, "POST", "/api/daily/items", Some(json!({"kind": "记录", "name": "体重", "unit": "kg"}))).await;
+        assert_eq!(code, StatusCode::OK);
+        let metric = body["id"].as_str().unwrap().to_string();
+        // 非法 kind / 空名 → 400
+        let (code, _) = call(&state, "POST", "/api/daily/items", Some(json!({"kind": "x", "name": "y"}))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, _) = call(&state, "POST", "/api/daily/items", Some(json!({"kind": "打卡", "name": "  "}))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // 习惯打卡（缺省 done=true）→ 总览 today_done + streak=1
+        let (code, body) = call(&state, "POST", "/api/daily/entry", Some(json!({"item_id": habit}))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["done"], true);
+        let (_, body) = call(&state, "GET", "/api/daily", None).await;
+        let h = body["items"].as_array().unwrap().iter().find(|i| i["id"] == habit).unwrap().clone();
+        assert_eq!(h["today_done"], true);
+        assert_eq!(h["streak"], 1);
+
+        // 取消打卡 → streak=0
+        let (code, _) = call(&state, "POST", "/api/daily/entry", Some(json!({"item_id": habit, "done": false}))).await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, body) = call(&state, "GET", "/api/daily", None).await;
+        let h = body["items"].as_array().unwrap().iter().find(|i| i["id"] == habit).unwrap().clone();
+        assert_eq!(h["today_done"], false);
+        assert_eq!(h["streak"], 0);
+
+        // 数值记录：缺 value → 400；有 value → last_value
+        let (code, _) = call(&state, "POST", "/api/daily/entry", Some(json!({"item_id": metric}))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, body) = call(&state, "POST", "/api/daily/entry", Some(json!({"item_id": metric, "value": 65.5}))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["value"], 65.5);
+        let (_, body) = call(&state, "GET", "/api/daily", None).await;
+        let m = body["items"].as_array().unwrap().iter().find(|i| i["id"] == metric).unwrap().clone();
+        assert_eq!(m["last_value"], 65.5);
+        assert_eq!(m["unit"], "kg");
+
+        // 历史包含以上条目
+        let (code, body) = call(&state, "GET", "/api/daily/history?days=7", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body["entries"].as_array().unwrap().len() >= 2);
+
+        // 归档习惯 → 总览不再出现
+        let (code, _) = call(&state, "PUT", &format!("/api/daily/items/{habit}"), Some(json!({"archived": true}))).await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, body) = call(&state, "GET", "/api/daily", None).await;
+        assert!(!body["items"].as_array().unwrap().iter().any(|i| i["id"] == habit));
     }
 
     #[tokio::test]

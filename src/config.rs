@@ -26,6 +26,9 @@ pub struct Config {
     /// 「今日任务」database id（同步任务懒建并回填；None 表示尚未创建）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks_db_id: Option<String>,
+    /// 「✅ 每日打卡」database id（同步任务懒建并回填；None 表示尚未创建）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_db_id: Option<String>,
     /// 外部 API（/api/ext）Bearer token；配置完成时自动生成，空串表示未生成
     #[serde(default)]
     pub api_token: String,

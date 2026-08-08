@@ -189,6 +189,7 @@ import CalendarView from './views/CalendarView.vue'
 import ProjectsView from './views/ProjectsView.vue'
 import NotesView from './views/NotesView.vue'
 import IdeasView from './views/IdeasView.vue'
+import DailyView from './views/DailyView.vue'
 import FloatingButton from './components/FloatingButton.vue'
 import TodayTaskList from './components/TodayTaskList.vue'
 import MoneyExpenseList from './components/MoneyExpenseList.vue'
@@ -219,6 +220,7 @@ const viewMap = {
   projects: ProjectsView,
   notes: NotesView,
   ideas: IdeasView,
+  daily: DailyView,
 }
 const subAction = ref(null)
 provide('subAction', subAction)
@@ -265,6 +267,8 @@ const floatButtons = computed(() => [
   { key: 'notes', icon: '📚', label: '知识库', color: '#13c2c2', x: 130, y: 530,
     subs: [] },
   { key: 'ideas', icon: '💡', label: '好想法', color: '#faad14', x: 130, y: 625,
+    subs: [] },
+  { key: 'daily', icon: '✅', label: '打卡', color: '#fa8c16', x: 130, y: 720,
     subs: [] },
 ])
 const activePanelConfig = ref(null)

@@ -299,3 +299,65 @@ pub struct Project {
     pub dirty: bool,
     pub deleted: bool,
 }
+
+/// 打卡项类型：习惯打卡 / 数值记录（体重等）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DailyKind {
+    Habit,
+    Metric,
+}
+
+impl DailyKind {
+    pub const ALL: [DailyKind; 2] = [DailyKind::Habit, DailyKind::Metric];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DailyKind::Habit => "打卡",
+            DailyKind::Metric => "记录",
+        }
+    }
+
+    pub fn from_label(s: &str) -> Option<DailyKind> {
+        Self::ALL.into_iter().find(|k| k.label() == s)
+    }
+}
+
+/// 打卡项（习惯或数值指标的定义；纯本地，不单独同步——远端只存每日条目）
+#[derive(Clone, Debug, PartialEq)]
+pub struct DailyItem {
+    pub id: String,
+    pub kind: DailyKind,
+    pub name: String,
+    /// 数值指标的单位（如 kg）；习惯为空
+    pub unit: String,
+    pub archived: bool,
+    pub created_ts: i64,
+}
+
+/// 每日条目：某天某打卡项的一次打卡/记录（item_id + date 唯一）
+#[derive(Clone, Debug, PartialEq)]
+pub struct DailyEntry {
+    pub id: String,
+    pub item_id: String,
+    /// YYYY-MM-DD（本地时区）
+    pub date: String,
+    pub done: bool,
+    /// 数值记录的值；习惯打卡为空
+    pub value: Option<f64>,
+    pub notion_page_id: Option<String>,
+    pub dirty: bool,
+    pub deleted: bool,
+    pub created_ts: i64,
+}
+
+/// 从 Notion 解析出的每日条目（item 按名称在本地解析/补建）
+#[derive(Clone, Debug, PartialEq)]
+pub struct PulledDailyEntry {
+    pub notion_page_id: String,
+    pub item_name: String,
+    pub kind: DailyKind,
+    pub date: String,
+    pub done: bool,
+    pub value: Option<f64>,
+    pub created_ts: i64,
+}

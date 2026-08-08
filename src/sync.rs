@@ -13,13 +13,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::Local;
 use tokio::sync::Notify;
 
 use crate::config::{self, Config};
 use crate::db::{Db, UpsertKind};
-use crate::models::{Event, Expense, ExtRecord, Idea, Note, NoteKind, Project, Task};
+use crate::models::{DailyEntry, DailyItem, Event, Expense, ExtRecord, Idea, Note, NoteKind, Project, Task};
 use crate::notion::{self, NotionClient};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
@@ -288,9 +288,11 @@ pub async fn sync_once(
             g.ext_namespaces(),
             g.dirty_ideas(),
             g.dirty_tasks(),
+            g.dirty_daily_entries(),
+            g.daily_items(true),
         ) {
-            (Ok(e), Ok(x), Ok(p), Ok(n), Ok(a), Ok(r), Ok(m), Ok(i), Ok(t)) => {
-                (e, x, p, n, a, r, m, i, t)
+            (Ok(e), Ok(x), Ok(p), Ok(n), Ok(a), Ok(r), Ok(m), Ok(i), Ok(t), Ok(d), Ok(di)) => {
+                (e, x, p, n, a, r, m, i, t, d, di)
             }
             _ => {
                 outcome.error = Some("读取 dirty 行失败".to_string());
@@ -298,8 +300,19 @@ pub async fn sync_once(
             }
         }
     };
-    let (events, expenses, projects, notes, all_notes, ext_records, ext_namespaces, ideas, tasks) =
-        snapshot;
+    let (
+        events,
+        expenses,
+        projects,
+        notes,
+        all_notes,
+        ext_records,
+        ext_namespaces,
+        ideas,
+        tasks,
+        daily_entries,
+        daily_items,
+    ) = snapshot;
 
     let record = |outcome: &mut SyncOutcome, r: Result<PushResult>, what: &str| match r {
         Ok(res) => {
@@ -391,13 +404,99 @@ pub async fn sync_once(
         sync_tasks(db, client, cfg, &cfg_snap, tasks, &mut outcome, &record).await;
     }
 
+    // 每日打卡：同 ideas，没有 dirty 条目时不触碰远端（避免无谓补建 database）
+    if !daily_entries.is_empty() {
+        sync_daily(
+            db,
+            client,
+            cfg,
+            &cfg_snap,
+            daily_entries,
+            daily_items,
+            &mut outcome,
+            &record,
+        )
+        .await;
+    }
+
     // 增量拉取：远端的新增/修改自动下来（本地 dirty 行推送优先，跳过不覆盖）
     pull_incremental(db, client, &cfg_snap, &mut outcome).await;
     outcome
 }
 
-// ---------------- 增量拉取 ----------------
+/// 每日条目：镜像为「✅ 每日打卡」database 中的行（item 名称/类型内嵌在 properties 里）
+async fn push_daily_entry(
+    client: &NotionClient,
+    entry: &DailyEntry,
+    item: Option<&DailyItem>,
+    daily_db_id: &str,
+) -> Result<PushResult> {
+    if entry.deleted {
+        if let Some(pid) = &entry.notion_page_id {
+            archive_tolerant(client, pid).await?;
+        }
+        return Ok(PushResult::Archived);
+    }
+    let item = item.ok_or_else(|| anyhow!("打卡项 {} 不存在", entry.item_id))?;
+    let props = notion::daily_entry_properties(
+        &item.name,
+        item.kind,
+        &entry.date,
+        entry.done,
+        entry.value,
+    );
+    if let Some(pid) = &entry.notion_page_id {
+        client.update_page(pid, &props).await?;
+        Ok(PushResult::Updated)
+    } else {
+        let pid = client.create_page(daily_db_id, &props).await?;
+        Ok(PushResult::Created(pid))
+    }
+}
 
+/// 每日打卡同步：config 缺 daily_db_id 时先搜索复用远端同名库，缺失才补建并持久化；
+/// 建不出则全部记 failed，下轮重试
+#[allow(clippy::too_many_arguments)]
+async fn sync_daily(
+    db: &Arc<Mutex<Db>>,
+    client: &NotionClient,
+    cfg: &Arc<Mutex<Config>>,
+    cfg_snap: &Config,
+    entries: Vec<DailyEntry>,
+    items: Vec<DailyItem>,
+    outcome: &mut SyncOutcome,
+    record: &impl Fn(&mut SyncOutcome, Result<PushResult>, &str) -> Option<PushResult>,
+) {
+    let db_id = ensure_db_id(
+        client,
+        cfg,
+        cfg_snap.daily_db_id.as_deref(),
+        "✅ 每日打卡",
+        client.create_daily_db(&cfg_snap.parent_page_id),
+        |c, id| c.daily_db_id = Some(id),
+        outcome,
+    )
+    .await;
+    let Some(db_id) = db_id else {
+        outcome.failed += entries.len();
+        return;
+    };
+    let item_map: HashMap<String, DailyItem> = items.into_iter().map(|i| (i.id.clone(), i)).collect();
+    for entry in entries {
+        let r = push_daily_entry(client, &entry, item_map.get(&entry.item_id), &db_id).await;
+        if let Some(res) = record(outcome, r, "每日打卡")
+            && let Ok(g) = db.lock()
+        {
+            let _ = match res {
+                PushResult::Created(pid) => g.set_daily_entry_page_id(&entry.id, &pid),
+                PushResult::Updated => g.clear_daily_entry_dirty(&entry.id),
+                PushResult::Archived => g.purge_daily_entry(&entry.id),
+            };
+        }
+    }
+}
+
+// ---------------- 增量拉取 ----------------
 /// 增量拉取：把远端自上次水位以来的新增/修改同步到本地。
 ///
 /// - 水位按 database 存 sync_meta（key `incr:{kind}`），取本批最大 last_edited_time；
@@ -424,6 +523,7 @@ async fn pull_incremental(
         ("ideas", &cfg_snap.ideas_db_id),
         ("tasks", &cfg_snap.tasks_db_id),
         ("notes", &cfg_snap.notes_db_id),
+        ("daily", &cfg_snap.daily_db_id),
     ] {
         if let Some(id) = db_id {
             pull_one_database(db, client, kind, id, outcome).await;
@@ -525,6 +625,16 @@ async fn pull_one_database(
         }
         "notes" => {
             applied += pull_notes_incremental(db, client, &pages).await;
+        }
+        "daily" => {
+            for page in &pages {
+                if let Some(p) = notion::parse_daily_entry_page(page) {
+                    let now = Local::now().timestamp();
+                    if let Ok(g) = db.lock() {
+                        apply(&g.upsert_pulled_daily_entry(&p, now).unwrap_or(UpsertKind::NoPageId));
+                    }
+                }
+            }
         }
         _ => {}
     }

@@ -67,5 +67,11 @@ export const api = {
   getPomodoro: () => unwrap(http.get('/pomodoro')),
   cancelPomodoro: () => unwrap(http.post('/pomodoro/cancel')),
   quickEntry: (text) => unwrap(http.post('/ai/quick-entry', { text })),
+
+  getDaily: () => unwrap(http.get('/daily')),
+  createDailyItem: (data) => unwrap(http.post('/daily/items', data)),
+  updateDailyItem: (id, data) => unwrap(http.put(`/daily/items/${id}`, data)),
+  upsertDailyEntry: (data) => unwrap(http.post('/daily/entry', data)),
+  getDailyHistory: (days) => unwrap(http.get('/daily/history', { params: { days } })),
   getOngoingEvent: () => unwrap(http.get('/events/ongoing')),
 }
