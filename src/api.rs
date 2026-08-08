@@ -1133,13 +1133,19 @@ struct AiAssistBody {
     /// 上下文（当前任务/今日消费/参考日期等），由前端按面板拼好后传入
     #[serde(default)]
     context: String,
+    /// 模式：notes 面板识别 "outline"（先出大纲），其他忽略
+    #[serde(default)]
+    mode: Option<String>,
+    /// 字数引导：short / normal / long，未指定 = normal
+    #[serde(default)]
+    length: Option<String>,
 }
 
 const ALLOWED_PANELS: &[&str] = &[
     "today", "money", "calendar", "projects", "notes", "ideas", "daily",
 ];
 
-/// 把 [ai::AiAssistItem] 序列化为前端可用的 JSON
+
 fn assist_item_json(it: &ai::AiAssistItem) -> Value {
     match it {
         ai::AiAssistItem::Task { title, date, priority } => json!({
@@ -1158,6 +1164,9 @@ fn assist_item_json(it: &ai::AiAssistItem) -> Value {
         }),
         ai::AiAssistItem::Note { title, content_md, kind } => json!({
             "type": "note", "title": title, "content_md": content_md, "kind": kind,
+        }),
+        ai::AiAssistItem::NoteOutline { title, headings } => json!({
+            "type": "note_outline", "title": title, "headings": headings,
         }),
         ai::AiAssistItem::Project { name, description } => json!({
             "type": "project", "name": name, "description": description,
@@ -1188,7 +1197,28 @@ async fn ai_assist_handler(
         .lock()
         .map(|c| c.ai.clone())
         .unwrap_or_default();
-    let assist = ai::ai_assist(&ai_cfg, panel, text, &body.context)
+    // ideas 面板：客户端未传 context 时，自动用最近 5 条想法作为上下文（让 AI 知道已有方向避免重复）
+    let mut context = body.context;
+    if panel == "ideas" && context.trim().is_empty() {
+        context = match lock_db(&state) {
+            Ok(db) => db
+                .all_ideas(None)
+                .map(|ideas| {
+                    ideas
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .map(|i| format!("- [{}] {}", i.tag.label(), i.content))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+    }
+    let mode = body.mode.as_deref().unwrap_or("");
+    let length = body.length.as_deref().unwrap_or("");
+    let assist = ai::ai_assist(&ai_cfg, panel, text, &context, mode, length)
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.message()))?;
     Ok(Json(json!({

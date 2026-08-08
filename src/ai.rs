@@ -359,6 +359,8 @@ pub enum AiAssistItem {
     Expense { item: String, amount: f64, category: String, time: Option<String> },
     Idea { content: String, tag: String },
     Note { title: String, content_md: String, kind: String },
+    /// 「先出大纲」：仅给标题 + 标题数组，正文由下一步生成
+    NoteOutline { title: String, headings: Vec<String> },
     Project { name: String, description: String },
     DailyItem { name: String, kind: String, unit: String },
 }
@@ -397,7 +399,9 @@ const ASSIST_PANEL_PROMPTS: &[(&str, &str)] = &[
     (
         "notes",
         "用户想写一篇知识库文档。根据用户描述返回 1 篇 `note`：\
-         title 简明、content_md 用 markdown（标题、列表、要点；不要空文档）；kind 必须是「doc」",
+         title 简明、content_md 用 markdown（标题、列表、要点；不要空文档）；kind 必须是「doc」。\
+         若用户处于「先出大纲」模式：返回 1 个 `note_outline` 替代 `note`，字段为 `title` + `headings`(3-6 条)，\
+         不要写正文。",
     ),
     (
         "ideas",
@@ -423,10 +427,22 @@ fn assist_panel_hint(panel: &str) -> &'static str {
 }
 
 /// 组装系统 prompt：面板角色 + 严格 JSON 输出 schema
-pub fn build_assist_prompt(panel: &str, now: &str) -> String {
+/// - `mode`: 某些面板的特殊模式（仅 notes 面板识别 "outline"）
+/// - `length`: 简短/标准/详尽，仅影响字数引导
+pub fn build_assist_prompt(panel: &str, now: &str, mode: &str, length: &str) -> String {
     let hint = assist_panel_hint(panel);
+    let note_type = if panel == "notes" && mode == "outline" {
+        "note_outline"
+    } else {
+        "note"
+    };
+    let length_guide = match length {
+        "short" => "整体偏简短，重点 3-5 条；",
+        "long" => "尽量详尽，给出示例、对比和延伸阅读；",
+        _ => "", // normal / 未指定 → 不做引导
+    };
     format!(
-        "现在是 {now}。面板：{panel}。{hint}\n\
+        "现在是 {now}。面板：{panel}。{length_guide}{hint}\n\
          严格只返回一个 JSON 对象（不要解释、不要围栏）：\n\
          {{\"summary\":\"可选文字说明，可为空字符串\",\"items\":[...]}}\n\
          items 数组中每项按类型取以下字段（缺字段时整条丢弃）：\n\
@@ -434,14 +450,22 @@ pub fn build_assist_prompt(panel: &str, now: &str) -> String {
          - event: {{\"type\":\"event\",\"content\":\"...\",\"tag\":\"工作/运动/生活/学习/看书 可省，默认生活\",\"start\":\"YYYY-MM-DD HH:mm\",\"end\":\"YYYY-MM-DD HH:mm 可省\",\"remind\":bool 可省}}\n\
          - expense: {{\"type\":\"expense\",\"item\":\"...\",\"amount\":数字,\"category\":\"餐饮/交通/购物/娱乐/其他\",\"time\":\"YYYY-MM-DD HH:mm 可省\"}}\n\
          - idea: {{\"type\":\"idea\",\"content\":\"...\",\"tag\":\"灵感/待办/读书/问题/其他 可省，默认灵感\"}}\n\
-         - note: {{\"type\":\"note\",\"title\":\"...\",\"content_md\":\"markdown 内容\",\"kind\":\"doc 默认 doc\"}}\n\
+         - {note_type}: {{\"type\":\"{note_type}\",\"title\":\"...\",\"content_md\":\"markdown 内容（仅 {note_type} != note_outline 时需要）\",\"headings\":[\"小节标题\"...]（仅 {note_type} == note_outline 时需要，3-6 条）\",\"kind\":\"doc 默认 doc\"}}\n\
          - project: {{\"type\":\"project\",\"name\":\"...\",\"description\":\"目标与关键节点\"}}\n\
          - daily_item: {{\"type\":\"daily_item\",\"name\":\"...\",\"kind\":\"打卡/记录\",\"unit\":\"单位 打卡可省 记录必填\"}}\n\
          当用户没要求新增条目时 items 可以是 []。"
     )
 }
 
-pub fn build_assist_request_body(cfg: &AiConfig, panel: &str, text: &str, now: &str, context: &str) -> Value {
+pub fn build_assist_request_body(
+    cfg: &AiConfig,
+    panel: &str,
+    text: &str,
+    now: &str,
+    context: &str,
+    mode: &str,
+    length: &str,
+) -> Value {
     let mut user_msg = text.to_string();
     if !context.is_empty() {
         user_msg.push_str("\n\n【参考上下文】\n");
@@ -450,11 +474,12 @@ pub fn build_assist_request_body(cfg: &AiConfig, panel: &str, text: &str, now: &
     json!({
         "model": cfg.model,
         "messages": [
-            { "role": "system", "content": build_assist_prompt(panel, now) },
+            { "role": "system", "content": build_assist_prompt(panel, now, mode, length) },
             { "role": "user", "content": user_msg },
         ],
     })
 }
+
 
 /// 把 "高/中/低" / "工作/运动/生活/学习/看书" / 分类 / 想法 tag 等尽量映射成标准标签；
 /// 映射失败时回退到默认值（不丢弃整条）
@@ -565,6 +590,20 @@ fn parse_assist_item(v: &Value, today: &str) -> Option<AiAssistItem> {
             };
             Some(AiAssistItem::Note { title: title.into(), content_md, kind })
         }
+        "note_outline" => {
+            let title = v["title"].as_str()?.trim();
+            if title.is_empty() { return None; }
+            let headings: Vec<String> = v["headings"]
+                .as_array()
+                .map(|arr| arr.iter()
+                    .filter_map(|h| h.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .take(8)
+                    .collect())
+                .unwrap_or_default();
+            if headings.is_empty() { return None; }
+            Some(AiAssistItem::NoteOutline { title: title.into(), headings })
+        }
         "project" => {
             let name = v["name"].as_str()?.trim();
             if name.is_empty() { return None; }
@@ -607,12 +646,13 @@ pub fn parse_assist(text: &str, now: chrono::DateTime<Local>) -> Option<AiAssist
     Some(AiAssist { summary, items })
 }
 
-/// 调用 OpenAI 兼容代理，按面板返回结构化助手结果
 pub async fn ai_assist(
     cfg: &AiConfig,
     panel: &str,
     text: &str,
     context: &str,
+    mode: &str,
+    length: &str,
 ) -> Result<AiAssist, AiError> {
     let now = Local::now();
     let now_text = now.format("%Y-%m-%d %H:%M 周%u").to_string();
@@ -624,7 +664,7 @@ pub async fn ai_assist(
         "{}/v1/chat/completions",
         cfg.proxy_base.trim_end_matches('/')
     );
-    let body = build_assist_request_body(cfg, panel, text, &now_text, context);
+    let body = build_assist_request_body(cfg, panel, text, &now_text, context, mode, length);
     let mut req = http.post(&url).json(&body);
     if !cfg.api_key.is_empty() {
         req = req.bearer_auth(&cfg.api_key);
@@ -978,11 +1018,59 @@ mod tests {
 
     #[test]
     fn assist_prompt_mentions_panel_and_types() {
-        let p = build_assist_prompt("today", "2024-08-01 12:00 周4");
+        let p = build_assist_prompt("today", "2024-08-01 12:00 周4", "", "");
         assert!(p.contains("today"));
         assert!(p.contains("2024-08-01 12:00 周4"));
         for t in ["task", "event", "expense", "idea", "note", "project", "daily_item"] {
             assert!(p.contains(t), "prompt 应说明 {t} 类型");
         }
+        // normal 长度下不出现 short/long 字样
+        assert!(!p.contains("偏简短"));
+        assert!(!p.contains("尽量详尽"));
+    }
+
+    #[test]
+    fn assist_prompt_notes_outline_uses_note_outline_type() {
+        let p = build_assist_prompt("notes", "2024-08-01 12:00", "outline", "");
+        // 标题里出现 note_outline 而不是 note
+        assert!(p.contains("note_outline"));
+        // 长度引导未指定 → 不出现 short/long 字样
+        assert!(!p.contains("偏简短"));
+    }
+
+    #[test]
+    fn assist_prompt_length_short_and_long_inject_guide() {
+        let p_short = build_assist_prompt("today", "2024-08-01 12:00", "", "short");
+        assert!(p_short.contains("偏简短"));
+        let p_long = build_assist_prompt("today", "2024-08-01 12:00", "", "long");
+        assert!(p_long.contains("尽量详尽"));
+    }
+
+    #[test]
+    fn assist_parse_note_outline_basic() {
+        let text = r#"{"summary":"","items":[{"type":"note_outline","title":"Rust 学习路径","headings":["入门","所有权","生命周期","async"]}]}"#;
+        let out = parse_assist(text, fixed_now()).unwrap();
+        assert_eq!(out.items.len(), 1);
+        match &out.items[0] {
+            AiAssistItem::NoteOutline { title, headings } => {
+                assert_eq!(title, "Rust 学习路径");
+                assert_eq!(headings.len(), 4);
+                assert_eq!(headings[1], "所有权");
+            }
+            other => panic!("应为 NoteOutline，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assist_parse_note_outline_drops_empty_or_oversized() {
+        // 空标题 → 丢弃；headings 全空 → 丢弃
+        let text = r#"{"summary":"","items":[{"type":"note_outline","title":"","headings":["x"]},{"type":"note_outline","title":"X","headings":[]}]}"#;
+        // 两条都被丢弃，且 summary 也空 → parse_assist 返回 None
+        assert!(parse_assist(text, fixed_now()).is_none());
+        // 只要有非空 summary，即便 items 全空也保留
+        let text2 = r#"{"summary":"先想个大纲","items":[{"type":"note_outline","title":"X","headings":[]}]}"#;
+        let out = parse_assist(text2, fixed_now()).unwrap();
+        assert!(out.items.is_empty());
+        assert_eq!(out.summary, "先想个大纲");
     }
 }

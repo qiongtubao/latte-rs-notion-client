@@ -156,8 +156,10 @@
       :title="aiPanel ? (AI_PANEL_META[aiPanel]?.title || '🤖 AI 助手') : '🤖 AI 助手'"
       :placeholder="aiPanel ? (AI_PANEL_META[aiPanel]?.placeholder || '') : ''"
       :context="aiContext"
+      :prefill="aiPrefill"
       @close="aiPanel = null"
       @adopted="onAiAdopted"
+      @idea-to-task="onIdeaToTask"
     />
 
     <!-- 弹出面板（浮于内容之上） -->
@@ -270,9 +272,17 @@ function openAiAssist(key) {
   aiPanel.value = key
 }
 const aiContext = computed(() => '')
+// 想法 → 任务：把想法正文作为初始文本注入到「今日任务」AI 对话框
+const aiPrefill = ref('')
 function onAiAdopted() {
   // 任何面板的 AI 采纳后都触发全量刷新，与现有「拉取/重置」行为一致
   panelRefreshKey.value++
+}
+function onIdeaToTask(ideaContent) {
+  // 关闭当前 ideas 对话框（aiPanel 已经在子按钮触发 idea 落库时清空对应卡片，但保持打开），
+  // 切到 today，预填想法内容
+  aiPrefill.value = `基于这个想法拆成可执行任务：${ideaContent}`
+  aiPanel.value = 'today'
 }
 const floatButtons = computed(() => [
   { key: 'today', icon: '☑', label: '今日任务', color: '#409eff', x: 130, y: 150,
