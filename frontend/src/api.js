@@ -67,6 +67,7 @@ export const api = {
   getPomodoro: () => unwrap(http.get('/pomodoro')),
   cancelPomodoro: () => unwrap(http.post('/pomodoro/cancel')),
   quickEntry: (text) => unwrap(http.post('/ai/quick-entry', { text })),
+  aiAssist: (panel, text, context) => unwrap(http.post('/ai/assist', { panel, text, context: context || '' })),
 
   getDaily: () => unwrap(http.get('/daily')),
   createDailyItem: (data) => unwrap(http.post('/daily/items', data)),

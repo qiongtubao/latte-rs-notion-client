@@ -345,6 +345,308 @@ pub async fn quick_entry(cfg: &AiConfig, text: &str) -> Result<QuickEntry, AiErr
     parse_quick_entry(content, now).ok_or(AiError::BadFormat)
 }
 
+// ---------------- AI 助手（按面板给出建议 + 可采纳的结构化条目） ----------------
+
+/// 助手返回的「可采纳条目」：与 [QuickEntry] 类似但更通用：
+/// - note: 知识库条目（title + markdown）
+/// - project: 项目（name + 描述/目标）
+/// - daily_item: 打卡项（name + kind 打卡/记录 + unit）
+/// 其余（expense/event/idea/task）与 [QuickEntry] 同语义，由前端直接调对应创建接口。
+#[derive(Clone, Debug, PartialEq)]
+pub enum AiAssistItem {
+    Task { title: String, date: String, priority: String },
+    Event { content: String, tag: String, start: String, end: String, remind: bool },
+    Expense { item: String, amount: f64, category: String, time: Option<String> },
+    Idea { content: String, tag: String },
+    Note { title: String, content_md: String, kind: String },
+    Project { name: String, description: String },
+    DailyItem { name: String, kind: String, unit: String },
+}
+
+/// 助手结果：`summary` 是模型给的文字说明（思路 / 总结 / 计划解释），
+/// `items` 是结构化条目供前端一张张采纳。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiAssist {
+    pub summary: String,
+    pub items: Vec<AiAssistItem>,
+}
+
+/// 各面板的「该问什么 / 该返回什么」白名单：避免用户/模型超出范围
+const ASSIST_PANEL_PROMPTS: &[(&str, &str)] = &[
+    (
+        "today",
+        "用户想规划今日/本周任务。结合用户的【当前任务清单】避免重复，\
+         返回 3-7 条 `task` 条目；按可执行、具体、有截止的标题；priority 用「高/中/低」。",
+    ),
+    (
+        "money",
+        "用户想整理记账思路或请 AI 给消费建议。优先返回一段 `summary`（思路/建议），\
+         如需新增记账条目，返回 1-5 条 `expense`（item 简明、amount 数字、category 必须是「餐饮/交通/购物/娱乐/其他」之一、time 可省）。",
+    ),
+    (
+        "calendar",
+        "用户想安排日程。结合【参考日期】和相对时间（如「明天下午3点」）换算，\
+         返回 1-5 条 `event` 条目；content 简明、tag 必须是「工作/运动/生活/学习/看书」之一、\
+         start/end 格式「YYYY-MM-DD HH:mm」、仅给开始时间时 end 留空字符串。",
+    ),
+    (
+        "projects",
+        "用户想规划项目或给项目出大纲。先返回 1 个 `project`（name 简明、description 写目标与关键节点），\
+         再返回 3-10 条 `task` 作为下一步行动；task date 留空时回退今天。",
+    ),
+    (
+        "notes",
+        "用户想写一篇知识库文档。根据用户描述返回 1 篇 `note`：\
+         title 简明、content_md 用 markdown（标题、列表、要点；不要空文档）；kind 必须是「doc」",
+    ),
+    (
+        "ideas",
+        "用户想记录灵感 / 待办 / 读书心得 / 问题。返回 1-5 条 `idea`：content 简明、\
+         tag 必须是「灵感/待办/读书/问题/其他」之一；同时若有可执行的下一步，附带 1-3 条 `task`。",
+    ),
+    (
+        "daily",
+        "用户想规划打卡项 / 寻求坚持建议。优先返回一段 `summary`（坚持思路 / 习惯建议），\
+         如需新增打卡项，返回 1-5 条 `daily_item`：name 简明、kind 必须是「打卡/记录」之一、\
+         `打卡` 项 unit 留空、`记录` 项 unit 填单位（如 kg / 分钟 / 次）。",
+    ),
+];
+
+/// 取面板对应的系统提示；未知面板退回「today」的提示
+fn assist_panel_hint(panel: &str) -> &'static str {
+    for (k, v) in ASSIST_PANEL_PROMPTS {
+        if *k == panel {
+            return v;
+        }
+    }
+    ASSIST_PANEL_PROMPTS[0].1
+}
+
+/// 组装系统 prompt：面板角色 + 严格 JSON 输出 schema
+pub fn build_assist_prompt(panel: &str, now: &str) -> String {
+    let hint = assist_panel_hint(panel);
+    format!(
+        "现在是 {now}。面板：{panel}。{hint}\n\
+         严格只返回一个 JSON 对象（不要解释、不要围栏）：\n\
+         {{\"summary\":\"可选文字说明，可为空字符串\",\"items\":[...]}}\n\
+         items 数组中每项按类型取以下字段（缺字段时整条丢弃）：\n\
+         - task: {{\"type\":\"task\",\"title\":\"...\",\"date\":\"YYYY-MM-DD 可省\",\"priority\":\"高/中/低 可省，默认中\"}}\n\
+         - event: {{\"type\":\"event\",\"content\":\"...\",\"tag\":\"工作/运动/生活/学习/看书 可省，默认生活\",\"start\":\"YYYY-MM-DD HH:mm\",\"end\":\"YYYY-MM-DD HH:mm 可省\",\"remind\":bool 可省}}\n\
+         - expense: {{\"type\":\"expense\",\"item\":\"...\",\"amount\":数字,\"category\":\"餐饮/交通/购物/娱乐/其他\",\"time\":\"YYYY-MM-DD HH:mm 可省\"}}\n\
+         - idea: {{\"type\":\"idea\",\"content\":\"...\",\"tag\":\"灵感/待办/读书/问题/其他 可省，默认灵感\"}}\n\
+         - note: {{\"type\":\"note\",\"title\":\"...\",\"content_md\":\"markdown 内容\",\"kind\":\"doc 默认 doc\"}}\n\
+         - project: {{\"type\":\"project\",\"name\":\"...\",\"description\":\"目标与关键节点\"}}\n\
+         - daily_item: {{\"type\":\"daily_item\",\"name\":\"...\",\"kind\":\"打卡/记录\",\"unit\":\"单位 打卡可省 记录必填\"}}\n\
+         当用户没要求新增条目时 items 可以是 []。"
+    )
+}
+
+pub fn build_assist_request_body(cfg: &AiConfig, panel: &str, text: &str, now: &str, context: &str) -> Value {
+    let mut user_msg = text.to_string();
+    if !context.is_empty() {
+        user_msg.push_str("\n\n【参考上下文】\n");
+        user_msg.push_str(context);
+    }
+    json!({
+        "model": cfg.model,
+        "messages": [
+            { "role": "system", "content": build_assist_prompt(panel, now) },
+            { "role": "user", "content": user_msg },
+        ],
+    })
+}
+
+/// 把 "高/中/低" / "工作/运动/生活/学习/看书" / 分类 / 想法 tag 等尽量映射成标准标签；
+/// 映射失败时回退到默认值（不丢弃整条）
+fn norm_priority(s: Option<&str>) -> String {
+    match s.unwrap_or("").trim() {
+        "高" | "紧急" | "high" | "High" | "HIGH" => "高".into(),
+        "低" | "low" | "Low" | "LOW" => "低".into(),
+        "中" | "普通" | "mid" | "Med" => "中".into(),
+        _ => "中".into(),
+    }
+}
+fn norm_event_tag(s: Option<&str>) -> String {
+    match s.unwrap_or("").trim() {
+        "工作" | "Work" => "工作".into(),
+        "运动" | "Sport" => "运动".into(),
+        "学习" | "Study" => "学习".into(),
+        "看书" | "Reading" => "看书".into(),
+        _ => "生活".into(),
+    }
+}
+fn norm_expense_cat(s: Option<&str>) -> String {
+    match s.unwrap_or("").trim() {
+        "餐饮" | "吃饭" | "Food" => "餐饮".into(),
+        "交通" | "Transport" => "交通".into(),
+        "购物" | "Shop" => "购物".into(),
+        "娱乐" | "Fun" => "娱乐".into(),
+        _ => "其他".into(),
+    }
+}
+fn norm_idea_tag(s: Option<&str>) -> String {
+    match s.unwrap_or("").trim() {
+        "灵感" | "Inspiration" => "灵感".into(),
+        "待办" | "Todo" => "待办".into(),
+        "读书" | "Reading" => "读书".into(),
+        "问题" | "Question" => "问题".into(),
+        _ => "其他".into(),
+    }
+}
+fn norm_daily_kind(s: Option<&str>) -> String {
+    match s.unwrap_or("").trim() {
+        "打卡" | "习惯" | "habit" => "打卡".into(),
+        _ => "记录".into(),
+    }
+}
+
+/// 解析单个 item：字段缺失/不合法时返回 None
+fn parse_assist_item(v: &Value, today: &str) -> Option<AiAssistItem> {
+    let t = v["type"].as_str()?;
+    match t {
+        "task" => {
+            let title = v["title"].as_str()?.trim();
+            if title.is_empty() { return None; }
+            let date = v["date"].as_str()
+                .filter(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+                .unwrap_or(today)
+                .to_string();
+            Some(AiAssistItem::Task {
+                title: title.into(),
+                date,
+                priority: norm_priority(v["priority"].as_str()),
+            })
+        }
+        "event" => {
+            let content = v["content"].as_str()?.trim();
+            if content.is_empty() { return None; }
+            let start = v["start"].as_str()?.trim();
+            let end = v["end"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+            // 校验开始时间合法
+            let _ = NaiveDateTime::parse_from_str(start, "%Y-%m-%d %H:%M").ok()?;
+            let end_str = end.map(|s| {
+                if NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").is_ok() { s.to_string() } else { String::new() }
+            }).unwrap_or_default();
+            Some(AiAssistItem::Event {
+                content: content.into(),
+                tag: norm_event_tag(v["tag"].as_str()),
+                start: start.into(),
+                end: end_str,
+                remind: v["remind"].as_bool().unwrap_or(false),
+            })
+        }
+        "expense" => {
+            let item = v["item"].as_str()?.trim();
+            let amount = v["amount"].as_f64()?;
+            if item.is_empty() || amount <= 0.0 { return None; }
+            Some(AiAssistItem::Expense {
+                item: item.into(),
+                amount,
+                category: norm_expense_cat(v["category"].as_str()),
+                time: v["time"].as_str().map(|s| s.to_string()),
+            })
+        }
+        "idea" => {
+            let content = v["content"].as_str()?.trim();
+            if content.is_empty() { return None; }
+            Some(AiAssistItem::Idea {
+                content: content.into(),
+                tag: norm_idea_tag(v["tag"].as_str()),
+            })
+        }
+        "note" => {
+            let title = v["title"].as_str()?.trim();
+            if title.is_empty() { return None; }
+            let content_md = v["content_md"].as_str().unwrap_or("").to_string();
+            if content_md.trim().is_empty() { return None; }
+            let kind = match v["kind"].as_str() {
+                Some("dir") => "dir".into(),
+                _ => "doc".into(),
+            };
+            Some(AiAssistItem::Note { title: title.into(), content_md, kind })
+        }
+        "project" => {
+            let name = v["name"].as_str()?.trim();
+            if name.is_empty() { return None; }
+            Some(AiAssistItem::Project {
+                name: name.into(),
+                description: v["description"].as_str().unwrap_or("").to_string(),
+            })
+        }
+        "daily_item" => {
+            let name = v["name"].as_str()?.trim();
+            if name.is_empty() { return None; }
+            let kind = norm_daily_kind(v["kind"].as_str());
+            let unit = v["unit"].as_str().unwrap_or("").trim().to_string();
+            // 「记录」必须有 unit，否则归类为「打卡」
+            let (kind, unit) = if kind == "记录" && unit.is_empty() {
+                ("打卡".to_string(), String::new())
+            } else {
+                (kind, unit)
+            };
+            Some(AiAssistItem::DailyItem { name: name.into(), kind, unit })
+        }
+        _ => None,
+    }
+}
+
+/// 解析模型回复为 [AiAssist]；JSON 整体无法解析时返回 None
+pub fn parse_assist(text: &str, now: chrono::DateTime<Local>) -> Option<AiAssist> {
+    let value: Value = serde_json::from_str(strip_fence(text)).ok()?;
+    let obj = value.as_object()?;
+    let summary = obj["summary"].as_str().unwrap_or("").trim().to_string();
+    let items_arr = obj["items"].as_array();
+    let today = now.date_naive().to_string();
+    let items: Vec<AiAssistItem> = items_arr
+        .map(|arr| arr.iter().filter_map(|v| parse_assist_item(v, &today)).collect())
+        .unwrap_or_default();
+    // summary 和 items 都为空 → 视为无内容，返回 None
+    if summary.is_empty() && items.is_empty() {
+        return None;
+    }
+    Some(AiAssist { summary, items })
+}
+
+/// 调用 OpenAI 兼容代理，按面板返回结构化助手结果
+pub async fn ai_assist(
+    cfg: &AiConfig,
+    panel: &str,
+    text: &str,
+    context: &str,
+) -> Result<AiAssist, AiError> {
+    let now = Local::now();
+    let now_text = now.format("%Y-%m-%d %H:%M 周%u").to_string();
+    let http = reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .map_err(|e| AiError::Unavailable(e.to_string()))?;
+    let url = format!(
+        "{}/v1/chat/completions",
+        cfg.proxy_base.trim_end_matches('/')
+    );
+    let body = build_assist_request_body(cfg, panel, text, &now_text, context);
+    let mut req = http.post(&url).json(&body);
+    if !cfg.api_key.is_empty() {
+        req = req.bearer_auth(&cfg.api_key);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AiError::Unavailable(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(AiError::Unavailable(format!("HTTP {status}")));
+    }
+    let value: Value = resp
+        .json()
+        .await
+        .map_err(|e| AiError::Unavailable(e.to_string()))?;
+    let content = value["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or(AiError::BadFormat)?;
+    parse_assist(content, now).ok_or(AiError::BadFormat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +836,153 @@ mod tests {
             )
             .is_none()
         );
+    }
+    // ---- parse_assist ----
+
+    #[test]
+    fn assist_parse_mixed_items_and_summary() {
+        let text = "{\n            \"summary\": \"本周围绕三件事：... \",\n            \"items\": [\n                {\"type\":\"task\",\"title\":\"写周报\",\"priority\":\"高\",\"date\":\"2024-08-02\"},\n                {\"type\":\"event\",\"content\":\"复盘\",\"tag\":\"工作\",\"start\":\"2024-08-02 16:00\",\"end\":\"2024-08-02 17:00\",\"remind\":true},\n                {\"type\":\"expense\",\"item\":\"咖啡\",\"amount\":18.5,\"category\":\"餐饮\",\"time\":\"2024-08-01 09:00\"},\n                {\"type\":\"idea\",\"content\":\"读《系统之美》\",\"tag\":\"读书\"},\n                {\"type\":\"note\",\"title\":\"Rust 学习路径\",\"content_md\":\"## 入门\\n要点：所有权/借用\",\"kind\":\"doc\"},\n                {\"type\":\"project\",\"name\":\"体重管理\",\"description\":\"三个月减重 5kg\"},\n                {\"type\":\"daily_item\",\"name\":\"早起\",\"kind\":\"打卡\",\"unit\":\"\"},\n                {\"type\":\"daily_item\",\"name\":\"体重\",\"kind\":\"记录\",\"unit\":\"kg\"}\n            ]\n        }";
+        let out = parse_assist(text, fixed_now()).unwrap();
+        assert_eq!(out.summary, "本周围绕三件事：...");
+        assert_eq!(out.items.len(), 8);
+        match &out.items[0] {
+            AiAssistItem::Task { title, date, priority } => {
+                assert_eq!(title, "写周报");
+                assert_eq!(date, "2024-08-02");
+                assert_eq!(priority, "高");
+            }
+            other => panic!("应为 Task，实际 {other:?}"),
+        }
+        match &out.items[1] {
+            AiAssistItem::Event { content, tag, start, end, remind } => {
+                assert_eq!(content, "复盘");
+                assert_eq!(tag, "工作");
+                assert_eq!(start, "2024-08-02 16:00");
+                assert_eq!(end, "2024-08-02 17:00");
+                assert!(remind);
+            }
+            other => panic!("应为 Event，实际 {other:?}"),
+        }
+        match &out.items[2] {
+            AiAssistItem::Expense { item, amount, category, time } => {
+                assert_eq!(item, "咖啡");
+                assert!((amount - 18.5).abs() < 1e-9);
+                assert_eq!(category, "餐饮");
+                assert_eq!(time.as_deref(), Some("2024-08-01 09:00"));
+            }
+            other => panic!("应为 Expense，实际 {other:?}"),
+        }
+        match &out.items[3] {
+            AiAssistItem::Idea { content, tag } => {
+                assert_eq!(content, "读《系统之美》");
+                assert_eq!(tag, "读书");
+            }
+            other => panic!("应为 Idea，实际 {other:?}"),
+        }
+        match &out.items[4] {
+            AiAssistItem::Note { title, content_md, kind } => {
+                assert_eq!(title, "Rust 学习路径");
+                assert!(content_md.contains("所有权"));
+                assert_eq!(kind, "doc");
+            }
+            other => panic!("应为 Note，实际 {other:?}"),
+        }
+        match &out.items[5] {
+            AiAssistItem::Project { name, description } => {
+                assert_eq!(name, "体重管理");
+                assert!(description.contains("5kg"));
+            }
+            other => panic!("应为 Project，实际 {other:?}"),
+        }
+        // 打卡项 kind 默认值 + unit 校验
+        match &out.items[6] {
+            AiAssistItem::DailyItem { name, kind, unit } => {
+                assert_eq!(name, "早起");
+                assert_eq!(kind, "打卡");
+                assert_eq!(unit, "");
+            }
+            other => panic!("应为 DailyItem，实际 {other:?}"),
+        }
+        match &out.items[7] {
+            AiAssistItem::DailyItem { name, kind, unit } => {
+                assert_eq!(name, "体重");
+                assert_eq!(kind, "记录");
+                assert_eq!(unit, "kg");
+            }
+            other => panic!("应为 DailyItem，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assist_parse_drops_invalid_items_but_keeps_summary() {
+        // 任务空标题 → 丢弃；事件结束时间非法 → 降级为无 end
+        let text = r#"{
+            "summary": "先这样",
+            "items": [
+                {"type":"task","title":""},
+                {"type":"event","content":"复盘","tag":"工作","start":"2024-08-02 16:00","end":"坏时间","remind":false},
+                {"type":"expense","item":"","amount":1},
+                {"type":"expense","item":"x","amount":-1}
+            ]
+        }"#;
+        let out = parse_assist(text, fixed_now()).unwrap();
+        assert_eq!(out.summary, "先这样");
+        // 任务空标题丢弃；事件 end 非法被解析函数降级成空字符串（仍保留）；expense 非法被丢弃
+        assert_eq!(out.items.len(), 1);
+        match &out.items[0] {
+            AiAssistItem::Event { end, .. } => assert_eq!(end, ""),
+            other => panic!("应为 Event，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assist_parse_daily_record_without_unit_falls_back_to_habit() {
+        // 「记录」无 unit 应降级为「打卡」
+        let text = r#"{"summary":"","items":[{"type":"daily_item","name":"冥想","kind":"记录","unit":""}]}"#;
+        let out = parse_assist(text, fixed_now()).unwrap();
+        assert_eq!(out.items.len(), 1);
+        match &out.items[0] {
+            AiAssistItem::DailyItem { kind, unit, .. } => {
+                assert_eq!(kind, "打卡");
+                assert_eq!(unit, "");
+            }
+            other => panic!("应为 DailyItem，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assist_parse_invalid_task_date_falls_back_to_today() {
+        let text = r#"{"summary":"","items":[{"type":"task","title":"X","date":"坏","priority":"高"}]}"#;
+        let out = parse_assist(text, fixed_now()).unwrap();
+        match &out.items[0] {
+            AiAssistItem::Task { date, .. } => assert_eq!(date, "2024-08-01"),
+            other => panic!("应为 Task，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assist_parse_empty_returns_none() {
+        assert!(parse_assist(r#"{"summary":"","items":[]}"#, fixed_now()).is_none());
+        assert!(parse_assist("garbage", fixed_now()).is_none());
+    }
+
+    #[test]
+    fn assist_panel_hint_covers_all_known_panels() {
+        for p in ["today", "money", "calendar", "projects", "notes", "ideas", "daily"] {
+            let h = assist_panel_hint(p);
+            assert!(!h.is_empty(), "{p} 应有提示");
+        }
+        // 未知面板退回「today」
+        assert!(!assist_panel_hint("unknown").is_empty());
+    }
+
+    #[test]
+    fn assist_prompt_mentions_panel_and_types() {
+        let p = build_assist_prompt("today", "2024-08-01 12:00 周4");
+        assert!(p.contains("today"));
+        assert!(p.contains("2024-08-01 12:00 周4"));
+        for t in ["task", "event", "expense", "idea", "note", "project", "daily_item"] {
+            assert!(p.contains(t), "prompt 应说明 {t} 类型");
+        }
     }
 }

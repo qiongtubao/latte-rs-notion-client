@@ -149,6 +149,17 @@
       </template>
     </el-dialog>
 
+    <!-- 浮动按钮的 AI 子按钮：按面板给出建议 + 可采纳条目 -->
+    <AiAssistDialog
+      :open="aiPanel !== null"
+      :panel="aiPanel || 'today'"
+      :title="aiPanel ? (AI_PANEL_META[aiPanel]?.title || '🤖 AI 助手') : '🤖 AI 助手'"
+      :placeholder="aiPanel ? (AI_PANEL_META[aiPanel]?.placeholder || '') : ''"
+      :context="aiContext"
+      @close="aiPanel = null"
+      @adopted="onAiAdopted"
+    />
+
     <!-- 弹出面板（浮于内容之上） -->
     <Transition name="panel-fade">
       <div v-if="activePanel" class="panel-overlay" @click="closePanel()" />
@@ -197,6 +208,7 @@ import CalendarDayList from './components/CalendarDayList.vue'
 import ProjectList from './components/ProjectList.vue'
 import NoteList from './components/NoteList.vue'
 import IdeaList from './components/IdeaList.vue'
+import AiAssistDialog from './components/AiAssistDialog.vue'
 
 const loading = ref(true)
 const configured = ref(false)
@@ -241,6 +253,27 @@ function subActionHandler(key, action) {
   setTimeout(() => { subAction.value = { key, action } }, 50)
 }
 
+const AI_PANEL_META = {
+  today: { title: '🤖 安排任务', placeholder: '比如：明天的重点是写周报、跑步 30 分钟、整理收件箱' },
+  money: { title: '🤖 记账思路', placeholder: '比如：帮我分析本月餐饮开销、给点省钱思路、或直接说"今天午饭25、咖啡12"' },
+  calendar: { title: '🤖 安排日程', placeholder: '比如：明天下午3点开会提醒我；周三晚上7点健身一小时' },
+  projects: { title: '🤖 规划项目', placeholder: '比如：我想做一个"读 30 本书"项目，帮我列目标和下一步' },
+  notes: { title: '🤖 写文档', placeholder: '比如：帮我写一篇 Rust 入门笔记，要点：所有权、生命周期、async' },
+  ideas: { title: '🤖 捕捉灵感', placeholder: '比如：读《系统之美》时关于反馈环的思考；想做个小工具…' },
+  daily: { title: '🤖 打卡建议', placeholder: '比如：想养成早起 + 每天阅读的习惯，给点坚持思路 / 推荐一些打卡项' },
+}
+const aiPanel = ref(null) // null = 关闭；否则为 panel key
+function openAiAssist(key) {
+  // 面板打开时收起悬浮子按钮，避免视觉重叠
+  const fb = floatButtons.value.find(b => b.key === key)
+  if (fb && dockOpen[key]) dockOpen[key] = false
+  aiPanel.value = key
+}
+const aiContext = computed(() => '')
+function onAiAdopted() {
+  // 任何面板的 AI 采纳后都触发全量刷新，与现有「拉取/重置」行为一致
+  panelRefreshKey.value++
+}
 const floatButtons = computed(() => [
   { key: 'today', icon: '☑', label: '今日任务', color: '#409eff', x: 130, y: 150,
     subs: [
@@ -251,25 +284,36 @@ const floatButtons = computed(() => [
       timing.value
         ? { icon: '⏹', label: '结束计时', handler: () => subActionHandler('today', 'stop-timing') }
         : { icon: '▶', label: '开始计时', handler: () => subActionHandler('today', 'timing') },
+      { icon: '🤖', label: 'AI 安排', handler: () => openAiAssist('today') },
     ] },
   { key: 'money', icon: '💰', label: '金钱', color: '#67c23a', x: 130, y: 245,
     subs: [
       { icon: '＋', label: '记一笔', handler: () => subActionHandler('money', 'add') },
       { icon: '☷', label: '统计', handler: () => subActionHandler('money', 'summary') },
+      { icon: '🤖', label: 'AI 思路', handler: () => openAiAssist('money') },
     ] },
   { key: 'calendar', icon: '📅', label: '日历', color: '#909399', x: 130, y: 340,
-    subs: [] },
+    subs: [
+      { icon: '🤖', label: 'AI 安排', handler: () => openAiAssist('calendar') },
+    ] },
   { key: 'projects', icon: '📊', label: '项目', color: '#e6a23c', x: 130, y: 435,
     subs: [
       { icon: '◫', label: '看板', handler: () => subActionHandler('projects', 'board') },
       { icon: '▤', label: '甘特', handler: () => subActionHandler('projects', 'gantt') },
+      { icon: '🤖', label: 'AI 规划', handler: () => openAiAssist('projects') },
     ] },
   { key: 'notes', icon: '📚', label: '知识库', color: '#13c2c2', x: 130, y: 530,
-    subs: [] },
+    subs: [
+      { icon: '🤖', label: 'AI 写文档', handler: () => openAiAssist('notes') },
+    ] },
   { key: 'ideas', icon: '💡', label: '好想法', color: '#faad14', x: 130, y: 625,
-    subs: [] },
+    subs: [
+      { icon: '🤖', label: 'AI 捕捉', handler: () => openAiAssist('ideas') },
+    ] },
   { key: 'daily', icon: '✅', label: '打卡', color: '#fa8c16', x: 130, y: 720,
-    subs: [] },
+    subs: [
+      { icon: '🤖', label: 'AI 建议', handler: () => openAiAssist('daily') },
+    ] },
 ])
 const activePanelConfig = ref(null)
 const activeView = ref(null)

@@ -199,6 +199,7 @@ pub fn router(state: AppState) -> Router {
             post(recognize_events).layer(DefaultBodyLimit::max(15 * 1024 * 1024)),
         )
         .route("/api/ai/quick-entry", post(ai_quick_entry))
+        .route("/api/ai/assist", post(ai_assist_handler))
         .route("/api/reports/time", get(time_report))
         .route("/api/expenses", get(list_expenses).post(add_expense))
         .route("/api/expenses/summary", get(expenses_summary))
@@ -1123,6 +1124,79 @@ async fn ai_quick_entry(
         }),
     }))
 }
+// ---------------- AI 助手（按面板给出建议 + 可采纳条目） ----------------
+
+#[derive(Deserialize)]
+struct AiAssistBody {
+    panel: String,
+    text: String,
+    /// 上下文（当前任务/今日消费/参考日期等），由前端按面板拼好后传入
+    #[serde(default)]
+    context: String,
+}
+
+const ALLOWED_PANELS: &[&str] = &[
+    "today", "money", "calendar", "projects", "notes", "ideas", "daily",
+];
+
+/// 把 [ai::AiAssistItem] 序列化为前端可用的 JSON
+fn assist_item_json(it: &ai::AiAssistItem) -> Value {
+    match it {
+        ai::AiAssistItem::Task { title, date, priority } => json!({
+            "type": "task", "title": title, "date": date, "priority": priority,
+        }),
+        ai::AiAssistItem::Event { content, tag, start, end, remind } => json!({
+            "type": "event", "content": content, "tag": tag,
+            "start": start, "end": end, "remind": remind,
+        }),
+        ai::AiAssistItem::Expense { item, amount, category, time } => json!({
+            "type": "expense", "item": item, "amount": amount, "category": category,
+            "time": time,
+        }),
+        ai::AiAssistItem::Idea { content, tag } => json!({
+            "type": "idea", "content": content, "tag": tag,
+        }),
+        ai::AiAssistItem::Note { title, content_md, kind } => json!({
+            "type": "note", "title": title, "content_md": content_md, "kind": kind,
+        }),
+        ai::AiAssistItem::Project { name, description } => json!({
+            "type": "project", "name": name, "description": description,
+        }),
+        ai::AiAssistItem::DailyItem { name, kind, unit } => json!({
+            "type": "daily_item", "name": name, "kind": kind, "unit": unit,
+        }),
+    }
+}
+
+async fn ai_assist_handler(
+    State(state): State<AppState>,
+    Json(body): Json<AiAssistBody>,
+) -> ApiResult<Json<Value>> {
+    let panel = body.panel.trim();
+    if !ALLOWED_PANELS.contains(&panel) {
+        return Err(ApiError::bad_request(format!(
+            "panel 应为：{}",
+            ALLOWED_PANELS.join("|")
+        )));
+    }
+    let text = body.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("text 不能为空"));
+    }
+    let ai_cfg = state
+        .config
+        .lock()
+        .map(|c| c.ai.clone())
+        .unwrap_or_default();
+    let assist = ai::ai_assist(&ai_cfg, panel, text, &body.context)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.message()))?;
+    Ok(Json(json!({
+        "summary": assist.summary,
+        "items": assist.items.iter().map(assist_item_json).collect::<Vec<_>>(),
+    })))
+}
+
 
 // ---------------- 报表 ----------------
 
@@ -2994,6 +3068,65 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::BAD_GATEWAY);
         assert!(body["error"].as_str().unwrap().starts_with("AI 服务不可用"));
+    }
+
+    #[tokio::test]
+    async fn ai_assist_route_validation_and_panel() {
+        let state = test_state(true);
+        // 代理指向不可达地址
+        state.config.lock().unwrap().ai.proxy_base = "http://127.0.0.1:1".into();
+
+        // 空 text / 未知 panel → 400
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "today", "text": ""})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "nope", "text": "x"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("panel 应为"));
+
+        // 未配置 → 409
+        let unconfigured = test_state(false);
+        let (code, body) = call(
+            &unconfigured,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "today", "text": "x"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not configured");
+
+        // 代理不可达 → 502
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "today", "text": "排一下明天的事"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert!(body["error"].as_str().unwrap().starts_with("AI 服务不可用"));
+
+        // context 字段可选
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "notes", "text": "整理 Rust 学习路径", "context": "已有笔记：…"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY); // 仍因代理不可达，但 400 不会被触发
     }
 
     #[tokio::test]
