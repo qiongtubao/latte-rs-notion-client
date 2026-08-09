@@ -5,7 +5,13 @@
 
   <SetupView v-else-if="!configured" @done="onSetupDone" />
 
-  <div v-else class="app-root">
+  <div v-else :class="['app-root', { 'is-offline': !online }]">
+    <!-- 离线状态条：顶栏之上，置顶 + 醒目 -->
+    <div v-if="!online" class="offline-bar" role="status">
+      <el-icon><Warning /></el-icon>
+      <span>当前处于离线状态 — 同步/拉取/AI 功能暂不可用，本地数据正常读写。</span>
+    </div>
+
     <!-- 极简顶栏 -->
     <header class="topbar">
       <span class="brand">☕ Latte</span>
@@ -40,7 +46,10 @@
           </el-option-group>
         </el-select>
         <span class="sync-info">
-          <template v-if="status.last_error">
+          <template v-if="!online">
+            <span class="sync-offline">⚠ 离线</span>
+          </template>
+          <template v-else-if="status.last_error">
             <span class="sync-error">{{ status.last_error }}</span>
           </template>
           <template v-else>
@@ -48,7 +57,10 @@
           </template>
           <el-badge v-if="status.pending > 0" :value="status.pending" type="warning" class="pending-badge" />
         </span>
-        <el-button size="small" circle :type="remindOn ? 'primary' : 'default'" @click="toggleRemind">
+        <el-button size="small" circle :type="darkMode ? 'primary' : 'default'" :title="darkMode ? '切换到亮色' : '切换到暗色'" @click="toggleDark">
+          <el-icon><Moon v-if="!darkMode" /><Sunny v-else /></el-icon>
+        </el-button>
+         <el-button size="small" circle :type="remindOn ? 'primary' : 'default'" @click="toggleRemind">
           <el-icon><BellFilled v-if="remindOn" /><Bell v-else /></el-icon>
         </el-button>
         <el-button size="small" :loading="syncing" @click="doSync">同步</el-button>
@@ -172,7 +184,6 @@
       @adopted="onAiAdopted"
       @idea-to-task="onIdeaToTask"
     />
-
     <!-- 弹出面板（浮于内容之上） -->
     <Transition name="panel-fade">
       <div v-if="activePanel" class="panel-overlay" @click="closePanel()" />
@@ -196,10 +207,11 @@
       </aside>
     </Transition>
   </div>
+
 </template>
 
 <script setup>
-import { computed, markRaw, nextTick, onMounted, onUnmounted, provide, reactive, ref } from 'vue'
+import { Bell, BellFilled, Close, Loading, Moon, Refresh, Sunny, Warning } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import TodayView from './views/TodayView.vue'
 import MoneyView from './views/MoneyView.vue'
@@ -211,7 +223,6 @@ import DailyView from './views/DailyView.vue'
 import ReportView from './views/ReportView.vue'
 import FloatingButton from './components/FloatingButton.vue'
 import TodayTaskList from './components/TodayTaskList.vue'
-import MoneyExpenseList from './components/MoneyExpenseList.vue'
 import CalendarDayList from './components/CalendarDayList.vue'
 import ProjectList from './components/ProjectList.vue'
 import NoteList from './components/NoteList.vue'
@@ -227,9 +238,12 @@ const resetting = ref(false)
 const activePanel = ref(null)
 const panelRefreshKey = ref(0)
 const timing = ref(false)
+// 网络在线状态：监听 online/offline 事件；离线时禁用同步/拉取
+const online = ref(typeof navigator !== 'undefined' ? navigator.onLine : true)
+function onOnline() { online.value = true }
+function onOffline() { online.value = false }
 let pollTimer = null
 let timingTimer = null
-
 // 番茄钟：会话进行中时 { task_id, task_title, end_ts, minutes }，否则 null
 const pomodoro = ref(null)
 const pomodoroRemaining = ref('') // 人类可读 mm:ss
@@ -418,6 +432,23 @@ function closePanel() {
   activeView.value = null
 }
 
+// ---------- 暗色主题：localStorage 持久化 + html.dark 类切换 ----------
+const THEME_KEY = 'latte-theme'
+function readInitialTheme() {
+  try { return localStorage.getItem(THEME_KEY) === 'dark' } catch { return false }
+}
+const darkMode = ref(readInitialTheme())
+function applyTheme(v) {
+  if (typeof document === 'undefined') return
+  document.documentElement.classList.toggle('dark', v)
+  try { localStorage.setItem(THEME_KEY, v ? 'dark' : 'light') } catch { /* 忽略 */ }
+}
+function toggleDark() {
+  darkMode.value = !darkMode.value
+  applyTheme(darkMode.value)
+}
+onMounted(() => applyTheme(darkMode.value))
+
 // ---------- 到点提醒（后端系统通知，页面关了也有效） ----------
 // 开关状态以服务端 config 为准（status.remind_enabled），不再用浏览器 Notification
 const remindOn = computed(() => !!status.value.remind_enabled)
@@ -431,7 +462,6 @@ async function toggleRemind() {
 }
 
 // ---------- 全局搜索 ----------
-const searchPick = ref(null)
 const searching = ref(false)
 const searchHits = ref([])
 // 搜索跳转目标（目前只有知识库文档深链）；NotesView 挂载时消费并清空
@@ -711,19 +741,45 @@ onMounted(() => {
   refreshPomodoro()
   pomodoroPoll = setInterval(refreshPomodoro, 5000)
   window.addEventListener('keydown', onGlobalKey)
+  window.addEventListener('online', onOnline)
+  window.addEventListener('offline', onOffline)
   setupTauriQuickEntry()
 })
 onUnmounted(() => {
   clearInterval(pollTimer); clearInterval(timingTimer)
   clearInterval(pomodoroPoll); stopPomodoroTick()
   window.removeEventListener('keydown', onGlobalKey)
+  window.removeEventListener('online', onOnline)
+  window.removeEventListener('offline', onOffline)
   if (tauriUnlisten) tauriUnlisten()
 })
 </script>
 
 <style scoped>
-.boot { display: flex; justify-content: center; align-items: center; height: 100vh; }
-.app-root { min-height: 100vh; }
+/* 离线状态条：置顶于顶栏之上 */
+.offline-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 200;
+  height: 32px;
+  background: #e6a23c;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+.offline-bar .el-icon { font-size: 16px; }
+/* 离线时顶栏下移避免被灰条挡住 */
+.app-root.is-offline .topbar { top: 32px; }
+.app-root.is-offline .pomobar { top: 80px; }
+
+ .kbd-hint { font-size: 10px; color: #b0b6bf; margin-left: 4px; }
 
 .topbar {
   position: fixed; top: 0; left: 0; right: 0; z-index: 100;
@@ -778,6 +834,7 @@ onUnmounted(() => {
   font-weight: 600;
 }
 .sync-error { color: #f56c6c; }
+.sync-offline { color: #e6a23c; font-weight: 600; }
 .pending-badge { margin-left: 4px; }
 
 .main-area {
@@ -800,13 +857,9 @@ onUnmounted(() => {
   box-shadow: 0 4px 16px rgba(0,0,0,0.08);
   padding: 12px 16px;
 }
-/* 知识库编辑器式 dock 更宽 */
-.today-dock.dock-wide {
-  width: 560px;
-}
-/* 知识库 dock 更宽更高，便于文档阅读 */
-.today-dock.dock-notes {
+.empty-bg {
   width: min(860px, 92vw);
+  padding: 60px 0;
 }
 .empty-icon { font-size: 64px; margin-bottom: 12px; opacity: 0.5; }
 .empty-hint { font-size: 14px; }
@@ -840,7 +893,6 @@ onUnmounted(() => {
 .panel-slide-enter-from, .panel-slide-leave-to { transform: translateX(100%); }
 </style>
 
-<!-- 搜索下拉内容 teleport 到 body，scoped 样式命中不到，单独非 scoped 块 -->
 <style>
 .srch-opt { display: flex; flex-direction: column; line-height: 1.4; padding: 2px 0; }
 .srch-title { font-size: 13px; color: #303133; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
@@ -850,4 +902,27 @@ onUnmounted(() => {
 .qe-type { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
 .qe-field { display: flex; gap: 12px; font-size: 13px; padding: 3px 0; }
 .qe-k { flex: 0 0 40px; color: #909399; }
+</style>
+
+<style>
+/* 暗色主题：覆盖项目内建的硬编码颜色（Element Plus 自带深色） */
+html.dark .topbar { background: rgba(33,33,33,0.92); border-bottom-color: #3a3a3a; }
+html.dark .topbar .brand { color: #66b1ff; }
+html.dark .topbar .top-date { color: #c0c4cc; }
+html.dark .topbar .top-right .sync-info,
+html.dark .topbar .top-right .kbd-hint { color: #909399; }
+html.dark .topbar .top-right .sync-error { color: #f56c6c; }
+html.dark .topbar .top-right .sync-offline { color: #e6a23c; }
+html.dark .main-area { background: #1f1f1f; }
+html.dark .main-area .empty-bg { color: #666; }
+html.dark .today-dock { background: #2a2a2a; border-color: #3a3a3a; }
+html.dark .pomobar { background: #2a1f1f; border-bottom-color: #5a2a2a; color: #f89898; }
+html.dark .pomobar .pomobar-time { color: #ffb3b3; }
+html.dark .offline-bar { background: #b88230; }
+html.dark .side-panel { background: #2a2a2a; border-left-color: #3a3a3a; }
+html.dark .panel-header { border-bottom-color: #3a3a3a; }
+html.dark .panel-title { color: #e0e0e0; }
+html.dark .qe-preview { background: #1f1f1f; border-color: #3a3a3a; }
+html.dark .qe-k { color: #888; }
+html.dark .empty-icon { color: #555; }
 </style>
