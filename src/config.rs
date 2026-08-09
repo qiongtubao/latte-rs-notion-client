@@ -35,8 +35,15 @@ pub struct Config {
     /// 到点提醒总开关（后端系统通知，D-Bus）；旧配置缺省视为开启
     #[serde(default = "default_remind_enabled")]
     pub remind_enabled: bool,
+    /// 全局快捷键（Tauri 桌面壳），按此键在任何应用都能唤起快速录入
+    #[serde(default = "default_global_shortcut")]
+    pub global_shortcut: String,
     #[serde(default)]
     pub ai: AiConfig,
+}
+
+fn default_global_shortcut() -> String {
+    "Alt+Q".to_string()
 }
 
 fn default_remind_enabled() -> bool {

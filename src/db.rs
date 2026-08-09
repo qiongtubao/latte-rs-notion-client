@@ -12,7 +12,7 @@ use anyhow::Result;
 use rusqlite::types::ToSql;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, TimeZone};
 
 use crate::notion::PulledData;
 use crate::models::{
@@ -223,6 +223,8 @@ impl Db {
                 name TEXT NOT NULL,
                 unit TEXT NOT NULL DEFAULT '',
                 archived INTEGER NOT NULL DEFAULT 0,
+                remind_at TEXT,
+                remind_days TEXT,
                 created_ts INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS daily_entries (
@@ -236,7 +238,10 @@ impl Db {
                 deleted INTEGER NOT NULL DEFAULT 0,
                 created_ts INTEGER NOT NULL,
                 UNIQUE(item_id, date)
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_daily_items_remind
+                ON daily_items(remind_at) WHERE remind_at IS NOT NULL;
+        ",
         )?;
         self.migrate()?;
         Ok(())
@@ -254,7 +259,8 @@ impl Db {
         Self::add_column_if_missing(self, "tasks", "task_type", "TEXT NOT NULL DEFAULT ''")?;
         Self::add_column_if_missing(self, "tasks", "project_id", "TEXT")?;
         Self::add_column_if_missing(self, "tasks", "start_ts", "INTEGER")?;
-        // 知识库结构升级（页面树 -> database 行）：清空旧 notion_page_id 并置 dirty，
+        Self::add_column_if_missing(self, "daily_items", "remind_at", "TEXT")?;
+        Self::add_column_if_missing(self, "daily_items", "remind_days", "TEXT")?;
         // 促使下次同步把笔记重新建到新的「📚 知识库」database。用 user_version 防重复执行
         let uv: i64 = self
             .conn
@@ -1588,7 +1594,9 @@ impl Db {
             name: row.get(2)?,
             unit: row.get(3)?,
             archived: row.get::<_, i64>(4)? != 0,
-            created_ts: row.get(5)?,
+            remind_at: row.get(5)?,
+            remind_days: row.get(6)?,
+            created_ts: row.get(7)?,
         })
     }
 
@@ -1609,9 +1617,9 @@ impl Db {
     /// 全部打卡项（默认不含已归档）
     pub fn daily_items(&self, include_archived: bool) -> Result<Vec<DailyItem>> {
         let sql = if include_archived {
-            "SELECT id, kind, name, unit, archived, created_ts FROM daily_items ORDER BY created_ts"
+            "SELECT id, kind, name, unit, archived, remind_at, remind_days, created_ts FROM daily_items ORDER BY created_ts"
         } else {
-            "SELECT id, kind, name, unit, archived, created_ts FROM daily_items WHERE archived = 0 ORDER BY created_ts"
+            "SELECT id, kind, name, unit, archived, remind_at, remind_days, created_ts FROM daily_items WHERE archived = 0 ORDER BY created_ts"
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], Self::row_to_daily_item)?;
@@ -1622,18 +1630,26 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, kind, name, unit, archived, created_ts FROM daily_items WHERE id = ?1",
+                "SELECT id, kind, name, unit, archived, remind_at, remind_days, created_ts FROM daily_items WHERE id = ?1",
                 params![id],
                 Self::row_to_daily_item,
             )
             .optional()?)
     }
 
-    pub fn create_daily_item(&self, kind: DailyKind, name: &str, unit: &str, now: i64) -> Result<DailyItem> {
+    pub fn create_daily_item(
+        &self,
+        kind: DailyKind,
+        name: &str,
+        unit: &str,
+        remind_at: Option<&str>,
+        remind_days: Option<&str>,
+        now: i64,
+    ) -> Result<DailyItem> {
         let id = Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO daily_items (id, kind, name, unit, created_ts) VALUES (?1,?2,?3,?4,?5)",
-            params![id, kind.label(), name, unit, now],
+            "INSERT INTO daily_items (id, kind, name, unit, remind_at, remind_days, created_ts) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![id, kind.label(), name, unit, remind_at, remind_days, now],
         )?;
         Ok(DailyItem {
             id,
@@ -1641,6 +1657,8 @@ impl Db {
             name: name.to_string(),
             unit: unit.to_string(),
             archived: false,
+            remind_at: remind_at.map(|s| s.to_string()),
+            remind_days: remind_days.map(|s| s.to_string()),
             created_ts: now,
         })
     }
@@ -1651,6 +1669,10 @@ impl Db {
         name: Option<&str>,
         unit: Option<&str>,
         archived: Option<bool>,
+        // None=不动；Some("")=清空；Some(v)=设为 v
+        remind_at: Option<&str>,
+        // None=不动；Some("")=清空；Some(v)=设为 v
+        remind_days: Option<&str>,
     ) -> Result<bool> {
         let mut sets: Vec<&str> = Vec::new();
         let mut values: Vec<Box<dyn ToSql>> = Vec::new();
@@ -1666,6 +1688,15 @@ impl Db {
             sets.push("archived = ?");
             values.push(Box::new(a));
         }
+        if let Some(r) = remind_at {
+            // 空字符串当 NULL 写入
+            values.push(Box::new(if r.is_empty() { None } else { Some(r.to_string()) }));
+            sets.push("remind_at = ?");
+        }
+        if let Some(d) = remind_days {
+            values.push(Box::new(if d.is_empty() { None } else { Some(d.to_string()) }));
+            sets.push("remind_days = ?");
+        }
         if sets.is_empty() {
             return Ok(self.get_daily_item(id)?.is_some());
         }
@@ -1675,24 +1706,47 @@ impl Db {
         Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
     }
 
-    /// 按 名称+类型 找打卡项 id（拉取解析用）
-    pub fn daily_item_id_by_name(&self, kind: DailyKind, name: &str) -> Result<Option<String>> {
-        Ok(self
+    /// 找出所有「当前 hhmm 应该提醒」的打卡项（remind_at = hhmm 且 remind_days 包含今天/为空）
+    pub fn daily_items_due_at(&self, hhmm: &str) -> Result<Vec<DailyItem>> {
+        // 星期 1-7 (周一..周日)
+        let weekday = Local::now().weekday().num_days_from_monday() as i64 + 1;
+        // 用 SQL 计算 remind_days 是否包含 weekday；不直接传 weekday 进去以避免 SQL 注入
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, unit, archived, remind_at, remind_days, created_ts \
+             FROM daily_items \
+             WHERE archived = 0 AND remind_at = ?1",
+        )?;
+        let rows = stmt.query_map(params![hhmm], Self::row_to_daily_item)?;
+        let all: Vec<DailyItem> = rows.collect::<rusqlite::Result<_>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|it| match &it.remind_days {
+                None => true,
+                Some(s) if s.trim().is_empty() => true,
+                Some(s) => s
+                    .split(',')
+                    .any(|d| d.trim().parse::<i64>().ok() == Some(weekday)),
+            })
+            .collect())
+    }
+    /// 按名称找打卡项，没有就补建（拉取远端条目时自动接上本地定义）
+    pub fn ensure_daily_item(&self, kind: DailyKind, name: &str, now: i64) -> Result<String> {
+        // 优先按 (kind, name) 找
+        if let Some(id) = self
             .conn
             .query_row(
                 "SELECT id FROM daily_items WHERE kind = ?1 AND name = ?2 LIMIT 1",
                 params![kind.label(), name],
                 |r| r.get(0),
             )
-            .optional()?)
-    }
-
-    /// 按名称找打卡项，没有就补建（拉取远端条目时自动接上本地定义）
-    pub fn ensure_daily_item(&self, kind: DailyKind, name: &str, now: i64) -> Result<String> {
-        match self.daily_item_id_by_name(kind, name)? {
-            Some(id) => Ok(id),
-            None => Ok(self.create_daily_item(kind, name, "", now)?.id),
+            .optional()?
+        {
+            return Ok(id);
         }
+        // 没有则补建（不设置提醒）
+        Ok(self
+            .create_daily_item(kind, name, "", None, None, now)?
+            .id)
     }
 
     pub fn daily_entry_for(&self, item_id: &str, date: &str) -> Result<Option<DailyEntry>> {

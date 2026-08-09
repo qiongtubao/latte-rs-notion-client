@@ -135,7 +135,48 @@ fn toggle_popup(app: tauri::AppHandle, key: String) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- 窗口创建 ----------
+/// 获取当前配置的全局快捷键
+#[tauri::command]
+fn get_global_shortcut() -> String {
+    latte::config::load()
+        .ok()
+        .flatten()
+        .map(|c| c.global_shortcut)
+        .unwrap_or_else(|| "Alt+Q".to_string())
+}
+/// 修改全局快捷键：写 config.toml + 重新注册（先 unregister_all 再 on_shortcut）
+#[tauri::command]
+fn set_global_shortcut(app: tauri::AppHandle, new_key: String) -> Result<String, String> {
+    let key = new_key.trim().to_string();
+    if key.is_empty() {
+        return Err("快捷键不能为空".into());
+    }
+    // 写配置文件
+    let mut cfg = latte::config::load().ok().flatten().unwrap_or_default();
+    cfg.global_shortcut = key.clone();
+    latte::config::save(&cfg).map_err(|e| e.to_string())?;
+    // 重新注册：先全部注销，再注册新的
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let _ = app.global_shortcut().unregister_all();
+    use tauri_plugin_global_shortcut::{ShortcutEvent, ShortcutState};
+    use tauri::Emitter;
+    let _ = app.global_shortcut().on_shortcut(
+        key.as_str(),
+        move |app, _shortcut, event: ShortcutEvent| {
+            if event.state == ShortcutState::Pressed {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+                let _ = app.emit("latte-global-quick-entry", ());
+            }
+        },
+    );
+    Ok(key)
+}
+
+ // ---------- 窗口创建 ----------
 
 /// 创建 5 个悬浮球窗口和 1 个共享弹窗（需主线程调用，服务就绪后进行）
 fn create_floating_windows(app: &tauri::AppHandle) {
@@ -217,11 +258,14 @@ pub fn run() {
             // 全局快捷键：Alt+Q 呼出主窗口并唤起快速录入（即使窗口未聚焦/已隐藏）
             use tauri_plugin_global_shortcut::{ShortcutEvent, ShortcutState};
             use tauri::Emitter;
+            // 全局快捷键：从 config.toml 读取，缺省 Alt+Q
+            let initial_key = latte::config::load()
+                .ok()
+                .flatten()
+                .map(|c| c.global_shortcut)
+                .unwrap_or_else(|| "Alt+Q".to_string());
             let _ = app.handle().global_shortcut().on_shortcut(
-                "Alt+Q",
-                |app, _shortcut, event: ShortcutEvent| {
-                    // event 即 GlobalHotKeyEvent（插件别名），仅按下时触发一次
-                    if event.state == ShortcutState::Pressed {
+                move |app, _shortcut, event: ShortcutEvent| {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.show();
                             let _ = w.unminimize();
@@ -231,9 +275,6 @@ pub fn run() {
                     }
                 },
             );
-
-
-            // 主窗口关闭时仅隐藏（退出走托盘菜单），保证后台同步与到点提醒存活
             if let Some(main) = app.get_webview_window("main") {
                 let w = main.clone();
                 main.on_window_event(move |event| {
@@ -292,7 +333,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![show_main, hide_popup, toggle_popup])
+        .invoke_handler(tauri::generate_handler![show_main, hide_popup, toggle_popup, get_global_shortcut, set_global_shortcut])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

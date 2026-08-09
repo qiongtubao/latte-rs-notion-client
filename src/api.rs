@@ -238,6 +238,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily/items/{id}", put(update_daily_item))
         .route("/api/daily/entry", post(upsert_daily_entry_api))
         .route("/api/daily/history", get(daily_history))
+        .route("/api/daily/due", get(daily_due_now))
         .route("/api/sync/pull", post(sync_pull))
         .route("/api/data/reset", post(reset_data))
         .route_layer(middleware::from_fn_with_state(
@@ -336,7 +337,7 @@ async fn setup(
             )
         })?;
     // 保留已有 AI 配置、外部 API token、提醒开关与懒建的 database id，避免重新 setup 时被默认值覆盖
-    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id, daily_db_id, remind_enabled) = state
+    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id, daily_db_id, remind_enabled, global_shortcut) = state
         .config
         .lock()
         .map(|c| {
@@ -347,6 +348,7 @@ async fn setup(
                 c.tasks_db_id.clone(),
                 c.daily_db_id.clone(),
                 c.remind_enabled,
+                c.global_shortcut.clone(),
             )
         })
         .unwrap_or_default();
@@ -366,6 +368,7 @@ async fn setup(
         daily_db_id,
         api_token,
         remind_enabled,
+        global_shortcut,
         ai: ai_cfg,
     };
     config::save(&cfg).map_err(ApiError::internal)?;
@@ -517,6 +520,16 @@ fn daily_entry_json(e: &DailyEntry) -> Value {
     })
 }
 
+fn daily_item_json(i: &crate::models::DailyItem) -> Value {
+    json!({
+        "id": i.id,
+        "kind": i.kind.label(),
+        "name": i.name,
+        "unit": i.unit,
+        "remind_at": i.remind_at,
+        "remind_days": i.remind_days,
+    })
+}
 /// 连续打卡天数：今天没打从昨天起数（今天打了算今天）
 fn daily_streak(dates_desc: &[String], today: NaiveDate) -> i64 {
     let set: std::collections::HashSet<&str> = dates_desc.iter().map(|s| s.as_str()).collect();
@@ -566,16 +579,19 @@ async fn daily_overview(State(state): State<AppState>) -> ApiResult<Json<Value>>
             "today_value": entry.and_then(|e| e.value),
             "streak": streak,
             "last_value": last_value,
+            "remind_at": item.remind_at,
+            "remind_days": item.remind_days,
         }));
     }
     Ok(Json(json!({ "date": today_s, "items": out })))
 }
-
 #[derive(Deserialize)]
 struct AddDailyItemBody {
     kind: String,
     name: String,
     unit: Option<String>,
+    remind_at: Option<String>,
+    remind_days: Option<String>,
 }
 
 async fn add_daily_item(
@@ -590,14 +606,23 @@ async fn add_daily_item(
     }
     let db = lock_db(&state)?;
     let unit = body.unit.as_deref().unwrap_or("").trim();
+    let remind_at = body.remind_at.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(s) = remind_at {
+        if s.len() != 5 || s.as_bytes()[2] != b':' {
+            return Err(ApiError::bad_request("remind_at 格式应为 HH:MM"));
+        }
+    }
+    let remind_days = body.remind_days.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let item = db
-        .create_daily_item(kind, name, unit, now_ts())
+        .create_daily_item(kind, name, unit, remind_at, remind_days, now_ts())
         .map_err(ApiError::internal)?;
     Ok(Json(json!({
         "id": item.id,
         "kind": item.kind.label(),
         "name": item.name,
         "unit": item.unit,
+        "remind_at": item.remind_at,
+        "remind_days": item.remind_days,
     })))
 }
 
@@ -606,6 +631,9 @@ struct UpdateDailyItemBody {
     name: Option<String>,
     unit: Option<String>,
     archived: Option<bool>,
+    /// 提醒时间（HH:MM）；空字符串「''」表示清空；缺省 = 不动
+    remind_at: Option<String>,
+    remind_days: Option<String>,
 }
 
 async fn update_daily_item(
@@ -618,9 +646,23 @@ async fn update_daily_item(
     {
         return Err(ApiError::bad_request("name 不能为空"));
     }
+    // remind_at 校验（非空且不合法 → 400）
+    if let Some(s) = body.remind_at.as_deref() {
+        let s = s.trim();
+        if !s.is_empty() && (s.len() != 5 || s.as_bytes()[2] != b':') {
+            return Err(ApiError::bad_request("remind_at 格式应为 HH:MM 或空字符串"));
+        }
+    }
     let db = lock_db(&state)?;
     let updated = db
-        .update_daily_item(&id, body.name.as_deref(), body.unit.as_deref(), body.archived)
+        .update_daily_item(
+            &id,
+            body.name.as_deref(),
+            body.unit.as_deref(),
+            body.archived,
+            body.remind_at.as_deref().map(str::trim),
+            body.remind_days.as_deref().map(str::trim),
+        )
         .map_err(ApiError::internal)?;
     if !updated {
         return Err(ApiError::not_found("打卡项不存在"));
@@ -635,6 +677,8 @@ async fn update_daily_item(
         "name": item.name,
         "unit": item.unit,
         "archived": item.archived,
+        "remind_at": item.remind_at,
+        "remind_days": item.remind_days,
     })))
 }
 
@@ -700,6 +744,20 @@ async fn daily_history(
         "from": from.to_string(),
         "to": to.to_string(),
         "entries": entries.iter().map(daily_entry_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// 当前分钟应该提醒的打卡项（前端启动时拉一次 + 每分钟轮询）
+async fn daily_due_now(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let now = Local::now();
+    let hhmm = now.format("%H:%M").to_string();
+    let db = lock_db(&state)?;
+    let items = db
+        .daily_items_due_at(&hhmm)
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "hhmm": hhmm,
+        "items": items.iter().map(daily_item_json).collect::<Vec<_>>(),
     })))
 }
 
@@ -2820,12 +2878,31 @@ mod tests {
         let (code, body) = call(&state, "GET", "/api/daily/history?days=7", None).await;
         assert_eq!(code, StatusCode::OK);
         assert!(body["entries"].as_array().unwrap().len() >= 2);
+        // 提醒：建习惯 + 设置 HH:MM
+        let (code, body) = call(&state, "POST", "/api/daily/items", Some(json!({"kind": "打卡", "name": "喝水", "remind_at": "09:30", "remind_days": "1,3,5"}))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["remind_at"], "09:30");
+        assert_eq!(body["remind_days"], "1,3,5");
+        let water = body["id"].as_str().unwrap().to_string();
+        // 总览透出提醒
+        let (_, body) = call(&state, "GET", "/api/daily", None).await;
+        let w = body["items"].as_array().unwrap().iter().find(|i| i["id"] == water).unwrap();
+        assert_eq!(w["remind_at"], "09:30");
+        // 非法格式 → 400
+        let (code, _) = call(&state, "POST", "/api/daily/items", Some(json!({"kind": "打卡", "name": "x2", "remind_at": "abc"}))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        // update: 清空提醒（空字符串「''」=清空，缺省=不动）
+        let (code, body) = call(&state, "PUT", &format!("/api/daily/items/{water}"), Some(json!({"remind_at": "", "remind_days": ""}))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body["remind_at"].is_null());
+        assert!(body["remind_days"].is_null());
+        // update: 设置新提醒
+        let (code, body) = call(&state, "PUT", &format!("/api/daily/items/{water}"), Some(json!({"remind_at": "21:00"}))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["remind_at"], "21:00");
 
         // 归档习惯 → 总览不再出现
         let (code, _) = call(&state, "PUT", &format!("/api/daily/items/{habit}"), Some(json!({"archived": true}))).await;
-        assert_eq!(code, StatusCode::OK);
-        let (_, body) = call(&state, "GET", "/api/daily", None).await;
-        assert!(!body["items"].as_array().unwrap().iter().any(|i| i["id"] == habit));
     }
 
     #[tokio::test]

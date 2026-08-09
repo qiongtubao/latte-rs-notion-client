@@ -221,6 +221,23 @@ async fn reminder_loop(state: AppState, shutdown: Arc<Notify>) {
                     ev.tag.label()
                 ));
             }
+            // 每日打卡项提醒（按 HH:MM + remind_days 过滤，每分钟最多 1 次）
+            let due_items = state
+                .db
+                .lock()
+                .ok()
+                .and_then(|db| {
+                    let now_h = chrono::Local::now();
+                    let hhmm = now_h.format("%H:%M").to_string();
+                    db.daily_items_due_at(&hhmm).ok()
+                })
+                .unwrap_or_default();
+            for it in due_items {
+                notify(
+                    "Latte 打卡",
+                    &format!("🍅 该打卡了：{}{}", it.name, if it.unit.is_empty() { String::new() } else { format!("（{}）", it.unit) }),
+                );
+            }
             // 番茄钟到点：通知后清除会话（关联事件继续计时，由用户手动结束）
             let pomo_done = state
                 .pomodoro

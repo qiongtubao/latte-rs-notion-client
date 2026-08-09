@@ -331,6 +331,10 @@ pub struct DailyItem {
     /// 数值指标的单位（如 kg）；习惯为空
     pub unit: String,
     pub archived: bool,
+    /// 到点提醒时间（HH:MM 本地时区），空 = 不提醒
+    pub remind_at: Option<String>,
+    /// 提醒生效的星期（CSV，如 "1,3,5" 表示周一三五），空 = 每天
+    pub remind_days: Option<String>,
     pub created_ts: i64,
 }
 
