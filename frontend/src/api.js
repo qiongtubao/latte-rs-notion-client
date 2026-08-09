@@ -81,6 +81,7 @@ export const api = {
     text: period,
     date: opts.date || '',
     focus: opts.focus || '',
+    compare: !!opts.compare,
   })),
 
   getDaily: () => unwrap(http.get('/daily')),

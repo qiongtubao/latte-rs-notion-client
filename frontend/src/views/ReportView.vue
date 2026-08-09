@@ -15,8 +15,8 @@
         class="report-focus"
         @keyup.enter="generate"
       />
+      <el-checkbox v-model="compare" size="small" title="把上一同期数据也喂给 AI，让它做趋势对比">对比上一期</el-checkbox>
       <el-button type="primary" size="small" :loading="loading" :disabled="!configured" @click="generate">
-        🤖 生成
       </el-button>
       <el-button
         v-if="report"
@@ -36,7 +36,10 @@
     <div v-if="report" class="report-body">
       <div class="report-title">{{ report.title }}</div>
       <div class="markdown-body" v-html="rendered" />
-      <el-collapse class="report-raw-collapse">
+      <el-collapse v-if="prevContext || report.context" class="report-raw-collapse">
+        <el-collapse-item v-if="prevContext" title="上一同期数据汇总（对比模式）">
+          <pre class="report-raw">{{ prevContext }}</pre>
+        </el-collapse-item>
         <el-collapse-item title="查看 AI 依据的原始数据汇总">
           <pre class="report-raw">{{ report.context }}</pre>
         </el-collapse-item>
@@ -59,9 +62,11 @@ import { api } from '../api'
 const configured = ref(true)
 const period = ref('day')
 const focus = ref('')
+const compare = ref(false)
 const loading = ref(false)
 const saving = ref(false)
 const report = ref(null)
+const prevContext = ref('')
 const errorMsg = ref('')
 const savedTitle = ref('')
 
@@ -80,9 +85,13 @@ async function generate() {
   report.value = null
   savedTitle.value = ''
   try {
-    const r = await api.aiReport(period.value, { focus: focus.value.trim() })
-    report.value = r
-    savedTitle.value = r.title || ''
+  const r = await api.aiReport(period.value, {
+    focus: focus.value.trim(),
+    compare: compare.value,
+  });
+  report.value = r;
+  prevContext.value = r.prev_context || '';
+  savedTitle.value = r.title || ''
   } catch (e) {
     errorMsg.value = e.status === 502
       ? `${e.message}（请检查 latte-model-proxy 是否启动）`

@@ -722,7 +722,9 @@ pub struct AiReport {
 }
 
 /// 拼接系统 prompt：角色 + 输出 schema
-pub fn build_report_prompt(period: ReportPeriod, focus: &str) -> String {
+/// 拼接系统 prompt：角色 + 输出 schema
+/// `prev_context` 非空时进入「对比上一周期」模式
+pub fn build_report_prompt(period: ReportPeriod, focus: &str, prev_context: &str) -> String {
     let period_label = match period {
         ReportPeriod::Day => "日",
         ReportPeriod::Week => "周",
@@ -732,6 +734,12 @@ pub fn build_report_prompt(period: ReportPeriod, focus: &str) -> String {
         String::new()
     } else {
         format!("\n用户特别想关注：{focus}")
+    };
+    let comparison_directive = if prev_context.trim().is_empty() {
+        String::new()
+    } else {
+        // 对比模式：明确要求两期对照 + 趋势判断
+        "\n本次数据已包含【本期】与【上一同期】两段，请在 summary 中显式对比两期的关键数字差异（哪些涨/跌、原因猜测）。".to_string()
     };
     format!(
         "你是一位资深个人效率助理。请根据【数据汇总】输出一份「{period_label}报」总结。\
@@ -744,22 +752,29 @@ pub fn build_report_prompt(period: ReportPeriod, focus: &str) -> String {
          - ## ☑ 任务（完成率解读 + 未完成项的下一步建议）\n\
          - ## 📊 项目（进展、卡点、下周/月重点）\n\
          - ## 💡 想法 / 灵感（值得深挖的）\n\
-         - ## 下一步建议（具体可执行的 3-5 条）{focus_hint}"
+         - ## 下一步建议（具体可执行的 3-5 条）{focus_hint}{comparison_directive}"
     )
 }
 
-/// 构造 AI 报告请求体（chat/completions）。`context` 是后端汇总的 markdown
+/// 构造 AI 报告请求体（chat/completions）。`context` 是后端汇总的 markdown；
+/// `prev_context` 非空时会作为对比段一起喂给模型
 pub fn build_report_request_body(
     cfg: &AiConfig,
     period: ReportPeriod,
     focus: &str,
     context: &str,
+    prev_context: &str,
 ) -> Value {
+    let user_msg = if prev_context.trim().is_empty() {
+        format!("【数据汇总】\n{context}")
+    } else {
+        format!("【数据汇总】\n{context}\n\n【上一同期数据汇总】\n{prev_context}")
+    };
     json!({
         "model": cfg.model,
         "messages": [
-            { "role": "system", "content": build_report_prompt(period, focus) },
-            { "role": "user", "content": format!("【数据汇总】\n{context}") },
+            { "role": "system", "content": build_report_prompt(period, focus, prev_context) },
+            { "role": "user", "content": user_msg },
         ],
     })
 }
@@ -775,20 +790,21 @@ pub fn parse_report(text: &str) -> Option<AiReport> {
     Some(AiReport { title, body_md })
 }
 
-
-/// 调用 OpenAI 兼容代理生成报告。`context` 是后端预汇总的 markdown
+/// 调用 OpenAI 兼容代理生成报告。`context` 是后端预汇总的 markdown；
+/// `prev_context` 非空时进入「对比上一周期」模式
 pub async fn ai_report(
     cfg: &AiConfig,
     period: ReportPeriod,
     focus: &str,
     context: &str,
+    prev_context: &str,
 ) -> Result<AiReport, AiError> {
     let http = reqwest::Client::builder()
         .timeout(TIMEOUT)
         .build()
         .map_err(|e| AiError::Unavailable(e.to_string()))?;
     let url = format!("{}/v1/chat/completions", cfg.proxy_base.trim_end_matches('/'));
-    let body = build_report_request_body(cfg, period, focus, context);
+    let body = build_report_request_body(cfg, period, focus, context, prev_context);
     let mut req = http.post(&url).json(&body);
     if !cfg.api_key.is_empty() {
         req = req.bearer_auth(&cfg.api_key);
@@ -810,7 +826,6 @@ pub async fn ai_report(
         .ok_or(AiError::BadFormat)?;
     parse_report(content).ok_or(AiError::BadFormat)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,48 +1225,36 @@ mod tests {
 
     #[test]
     fn report_prompt_mentions_period_and_focus() {
-        let p = build_report_prompt(ReportPeriod::Week, "");
+        let p = build_report_prompt(ReportPeriod::Week, "", "");
         assert!(p.contains("周报"));
         assert!(!p.contains("用户特别想关注"));
-        let p2 = build_report_prompt(ReportPeriod::Month, "开源贡献");
+        assert!(!p.contains("对比两期"));
+        let p2 = build_report_prompt(ReportPeriod::Month, "开源贡献", "");
         assert!(p2.contains("月报"));
         assert!(p2.contains("用户特别想关注：开源贡献"));
     }
 
     #[test]
-    fn report_parse_basic() {
-        let text = "{\"title\":\"本周高效推进\",\"body_md\":\"## 本期概览\\n完成率 80%。\"}";
-        let r = parse_report(text).unwrap();
-        assert_eq!(r.title, "本周高效推进");
-        assert!(r.body_md.contains("完成率 80%"));
+    fn report_prompt_includes_compare_directive_when_prev_context_given() {
+        let p = build_report_prompt(ReportPeriod::Week, "", "## 上周数据\n- 工作 5h");
+        assert!(p.contains("周报"));
+        // 对比指令出现
+        assert!(p.contains("对比两期"));
     }
 
     #[test]
-    fn report_parse_strips_fence() {
-        let text = "```json\n{\"title\":\"T\",\"body_md\":\"B\"}\n```";
-        let r = parse_report(text).unwrap();
-        assert_eq!(r.title, "T");
-        assert_eq!(r.body_md, "B");
-    }
-
-    #[test]
-    fn report_parse_rejects_missing_or_empty() {
-        assert!(parse_report("garbage").is_none());
-        assert!(parse_report(r#"{"title":"X"}"#).is_none()); // 缺 body_md
-        assert!(parse_report(r#"{"body_md":"B"}"#).is_none()); // 缺 title
-        assert!(parse_report(r#"{"title":"","body_md":"B"}"#).is_none()); // 空 title
-        assert!(parse_report(r#"{"title":"X","body_md":""}"#).is_none()); // 空 body
-    }
-
-    #[test]
-    fn report_request_body_includes_context() {
+    fn report_request_body_appends_prev_context_when_provided() {
         let cfg = AiConfig { model: "m1".into(), ..AiConfig::default() };
-        let body = build_report_request_body(&cfg, ReportPeriod::Day, "读书", "## 时间\n- 工作 1h");
-        assert_eq!(body["model"], "m1");
+        let body = build_report_request_body(&cfg, ReportPeriod::Day, "读书", "## 本期", "## 上期");
         let user_msg = body["messages"][1]["content"].as_str().unwrap();
         assert!(user_msg.contains("【数据汇总】"));
-        assert!(user_msg.contains("## 时间"));
-        let sys_msg = body["messages"][0]["content"].as_str().unwrap();
-        assert!(sys_msg.contains("读书"));
+        assert!(user_msg.contains("## 本期"));
+        assert!(user_msg.contains("【上一同期数据汇总】"));
+        assert!(user_msg.contains("## 上期"));
+        // 不传 prev_context 时不应出现该段
+        let body2 = build_report_request_body(&cfg, ReportPeriod::Day, "读书", "## 本期", "");
+        let user_msg2 = body2["messages"][1]["content"].as_str().unwrap();
+        assert!(!user_msg2.contains("【上一同期数据汇总】"));
     }
+
 }

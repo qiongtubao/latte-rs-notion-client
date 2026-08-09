@@ -66,6 +66,16 @@
         </el-dropdown>
       </div>
     </header>
+    <!-- 番茄钟进行中：贴在顶栏下方的红色进度条 + 倒计时 -->
+    <div v-if="pomodoro" class="pomobar">
+      <div class="pomobar-bg" :style="{ width: pomodoroProgress + '%' }" />
+      <div class="pomobar-text">
+        🍅 <strong>{{ pomodoro.task_title }}</strong>
+        <span class="pomobar-time">还剩 {{ pomodoroRemaining }}</span>
+        <el-button size="small" text type="danger" @click="cancelPomodoro()">⏹ 停止</el-button>
+      </div>
+    </div>
+
 
     <!-- 主区域：干净背景（其他功能从浮动按钮进入） -->
     <main class="main-area">
@@ -220,9 +230,31 @@ const timing = ref(false)
 let pollTimer = null
 let timingTimer = null
 
-const todayStr = computed(() => dayjs().format('M月D日 dddd'))
-
-// 视图映射：浮动按钮 key → 对应视图组件（面板内渲染）
+// 番茄钟：会话进行中时 { task_id, task_title, end_ts, minutes }，否则 null
+const pomodoro = ref(null)
+const pomodoroRemaining = ref('') // 人类可读 mm:ss
+let pomodoroTick = null
+let pomodoroPoll = null
+// 让任务卡（TodayTaskList）唤起番茄钟
+provide('pomodoroStart', async (taskId, minutes) => {
+  try {
+    const r = await api.pomodoroTask(taskId, minutes)
+    // 启动成功后立刻拉一次（接口已返回字段，但保险起见也再拉）
+    await refreshPomodoro()
+    ElMessage.success(`🍅 ${r.minutes} 分钟番茄钟已启动`)
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+})
+provide('pomodoroCancel', async () => {
+  try {
+    await api.cancelPomodoro()
+    pomodoro.value = null
+    ElMessage.info('番茄钟已停止')
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+})
 const viewMap = {
   today: TodayView,
   money: MoneyView,
@@ -570,6 +602,40 @@ async function checkTiming() {
     timing.value = !!(await api.getOngoingEvent())
   } catch { /* 查询失败保持原状态 */ }
 }
+
+// 番茄钟：5s 拉一次会话状态，1s 更新一次倒计时显示
+async function refreshPomodoro() {
+  if (!configured.value) return
+  try {
+    const s = await api.getPomodoro()
+    pomodoro.value = s && s.task_id ? s : null
+    updatePomodoroRemaining()
+  } catch { /* 忽略：pomodoro 失败不该影响其他 */ }
+}
+function updatePomodoroRemaining() {
+  if (!pomodoro.value) { pomodoroRemaining.value = ''; return }
+  const left = pomodoro.value.end_ts - Math.floor(Date.now() / 1000)
+  if (left <= 0) { pomodoroRemaining.value = '00:00'; return }
+  const m = Math.floor(left / 60), s = left % 60
+  pomodoroRemaining.value = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+function startPomodoroTick() {
+  stopPomodoroTick()
+  pomodoroTick = setInterval(updatePomodoroRemaining, 1000)
+}
+function stopPomodoroTick() {
+  if (pomodoroTick) { clearInterval(pomodoroTick); pomodoroTick = null }
+}
+watch(pomodoro, (v) => {
+  if (v) startPomodoroTick()
+  else stopPomodoroTick()
+})
+const pomodoroProgress = computed(() => {
+  if (!pomodoro.value) return 0
+  const total = (pomodoro.value.minutes || 25) * 60
+  const left = Math.max(0, pomodoro.value.end_ts - Math.floor(Date.now() / 1000))
+  return Math.min(100, Math.round((1 - left / total) * 100))
+})
 async function doSync() {
   syncing.value = true
   try {
@@ -642,11 +708,14 @@ onMounted(() => {
   pollTimer = setInterval(() => { if (configured.value) fetchStatus() }, 30000)
   checkTiming()
   timingTimer = setInterval(checkTiming, 5000)
+  refreshPomodoro()
+  pomodoroPoll = setInterval(refreshPomodoro, 5000)
   window.addEventListener('keydown', onGlobalKey)
   setupTauriQuickEntry()
 })
 onUnmounted(() => {
   clearInterval(pollTimer); clearInterval(timingTimer)
+  clearInterval(pomodoroPoll); stopPomodoroTick()
   window.removeEventListener('keydown', onGlobalKey)
   if (tauriUnlisten) tauriUnlisten()
 })
@@ -669,7 +738,45 @@ onUnmounted(() => {
 .top-right { display: flex; align-items: center; gap: 10px; }
 .top-search { width: 200px; }
 .kbd-hint { font-size: 10px; color: #b0b6bf; margin-left: 4px; }
-.sync-info { font-size: 12px; color: #909399; }
+
+/* 番茄钟进行中顶栏：贴顶栏下方的进度条 */
+.pomobar {
+  position: fixed;
+  top: 48px;
+  left: 0;
+  right: 0;
+  z-index: 99;
+  height: 32px;
+  background: #fff5f5;
+  border-bottom: 1px solid #fbc4c4;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+}
+.pomobar-bg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, #ffe7e7, #ffb3b3);
+  transition: width 1s linear;
+  z-index: 0;
+}
+.pomobar-text {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  font-size: 13px;
+  color: #c45656;
+  width: 100%;
+}
+.pomobar-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
 .sync-error { color: #f56c6c; }
 .pending-badge { margin-left: 4px; }
 

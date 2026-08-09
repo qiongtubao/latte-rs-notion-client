@@ -1145,6 +1145,9 @@ struct AiAssistBody {
     /// 用户特别想关注的方向（仅 panel=report），可空
     #[serde(default)]
     focus: Option<String>,
+    /// 是否对比上一周期（仅 panel=report）
+    #[serde(default)]
+    compare: Option<bool>,
 }
 
 const ALLOWED_PANELS: &[&str] = &[
@@ -1236,10 +1239,10 @@ async fn ai_assist_handler(
             ai::ReportPeriod::Week => Period::Week,
             ai::ReportPeriod::Month => Period::Month,
         };
-        let (from, to) = report::period_range(api_period, date);
         let now = now_ts();
-        // 把数据汇总和 AI 调用都包在 lock 之前，让 MutexGuard 在 await 前 drop
-        let (context, focus) = {
+        // 同步构建指定周期的「数据汇总」markdown（同时把 MutexGuard 收进块里）
+        let build_ctx = |p: Period, d: NaiveDate| -> Result<String, ApiError> {
+            let (from, to) = report::period_range(p, d);
             let db = lock_db(&state)?;
             let events = db.events_between(from, to, now).map_err(ApiError::internal)?;
             let expenses = db.expenses_between(from, to).map_err(ApiError::internal)?;
@@ -1248,8 +1251,8 @@ async fn ai_assist_handler(
                 .into_iter()
                 .filter(|t| {
                     NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")
-                        .map(|d| {
-                            let ts = report::local_midnight(d);
+                        .map(|dt| {
+                            let ts = report::local_midnight(dt);
                             ts >= from && ts < to
                         })
                         .unwrap_or(false)
@@ -1258,11 +1261,34 @@ async fn ai_assist_handler(
             let projects = db.all_projects().map_err(ApiError::internal)?;
             let ideas = db.all_ideas(None).map_err(ApiError::internal)?;
             let ctx = report::build_report_context(
-                api_period, date, &events, &expenses, &tasks, &projects, &ideas, now,
+                p, d, &events, &expenses, &tasks, &projects, &ideas, now,
             );
-            (ctx, body.focus.clone().unwrap_or_default())
-        }; // MutexGuard 在此处 drop
-        let report = ai::ai_report(&ai_cfg, report_period, &focus, &context)
+            Ok(ctx)
+        };
+        let context = build_ctx(api_period, date)?;
+        let focus = body.focus.clone().unwrap_or_default();
+        let compare = body.compare.unwrap_or(false);
+        let prev_context = if compare {
+            // 上一同期：日=昨天 / 周=上周同一天 / 月=上月 / 年=去年
+            let prev_date = match api_period {
+                Period::Day => date - chrono::Duration::days(1),
+                Period::Week => date - chrono::Duration::days(7),
+                Period::Month => {
+                    let (y, m) = if date.month() == 1 {
+                        (date.year() - 1, 12)
+                    } else {
+                        (date.year(), date.month() - 1)
+                    };
+                    NaiveDate::from_ymd_opt(y, m, 1).unwrap_or(date)
+                }
+                Period::Year => NaiveDate::from_ymd_opt(date.year() - 1, date.month(), date.day())
+                    .unwrap_or(date),
+            };
+            build_ctx(api_period, prev_date)?
+        } else {
+            String::new()
+        };
+        let report = ai::ai_report(&ai_cfg, report_period, &focus, &context, &prev_context)
             .await
             .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.message()))?;
         return Ok(Json(json!({
@@ -1271,6 +1297,8 @@ async fn ai_assist_handler(
             "period": report_period.as_str(),
             "date": date.format("%Y-%m-%d").to_string(),
             "context": context,
+            "prev_context": prev_context,
+            "compare": compare,
         })));
     }
     let mode = body.mode.as_deref().unwrap_or("");
@@ -3276,7 +3304,17 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::BAD_GATEWAY);
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/ai/assist",
+            Some(json!({"panel": "report", "text": "day", "date": "2026-08-09", "compare": true})),
+        )
+        .await;
+        // compare=true 走 同一路径（额外拉上周期数据），代理不可达仍 502
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
     }
+
 
 
     #[tokio::test]

@@ -62,6 +62,18 @@
           :title="isTiming(t) ? '结束计时' : '开始计时'"
           @click="isTiming(t) ? stopTiming() : startTiming(t)"
         >{{ isTiming(t) ? '⏹' : '▶' }}</button>
+        <el-dropdown trigger="click" @command="(m) => startPomo(t, m)">
+          <button class="ttl-pomobtn" :title="`启动番茄钟（已累计 ${t.pomodoro_count || 0} 个）`">🍅</button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item :command="15">15 分钟</el-dropdown-item>
+              <el-dropdown-item :command="25">25 分钟（标准）</el-dropdown-item>
+              <el-dropdown-item :command="45">45 分钟</el-dropdown-item>
+              <el-dropdown-item :command="60">60 分钟</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <span v-if="t.pomodoro_count > 0" class="ttl-pomocount">×{{ t.pomodoro_count }}</span>
       </div>
       <!-- 元信息行：类型 / 项目 / 计划开始 / 累计执行 -->
       <div v-if="hasMeta(t)" class="ttl-line2">
@@ -275,6 +287,16 @@ async function toggleDone(t, done) {
   }
 }
 
+async function startPomo(t, minutes) {
+  if (!pomodoroStart) {
+    ElMessage.warning('番茄钟组件未初始化')
+    return
+  }
+  await pomodoroStart(t.id, minutes)
+}
+
+
+
 // 子按钮动作：＋添加 / ▲排序 / ✓完成 / ▶⏹计时（由悬浮按钮经 provide 下发）
 const subAction = inject('subAction')
 watch(subAction, (act) => {
@@ -403,6 +425,31 @@ onUnmounted(() => {
 }
 .ttl-timebtn.stop:hover {
   background: #e1f3d8;
+}
+.ttl-pomobtn {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: #fff5f5;
+  color: #f56c6c;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin-left: 4px;
+}
+.ttl-pomobtn:hover {
+  background: #ffe7e7;
+}
+.ttl-pomocount {
+  font-size: 10px;
+  color: #f56c6c;
+  margin-left: 2px;
+  font-variant-numeric: tabular-nums;
 }
 .ttl-line2 {
   display: flex;
