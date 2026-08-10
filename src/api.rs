@@ -233,6 +233,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/reminders/toggle", post(toggle_reminders))
         .route("/api/export", get(export_json))
         .route("/api/export/csv", get(export_csv))
+        .route("/api/import", post(import_json))
         .route("/api/daily", get(daily_overview))
         .route("/api/daily/items", post(add_daily_item))
         .route("/api/daily/items/{id}", put(update_daily_item))
@@ -784,6 +785,130 @@ async fn export_json(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     })))
 }
 
+/// 全量导入（JSON）：把「全量导出」的备份写回本地。
+/// 采用 INSERT OR REPLACE（按 id），重复导入幂等，可安全往返备份/恢复。
+async fn import_json(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    // 阈值：单次导入最多 5000 条，防止误传超大 body 打爆内存
+    const MAX_PER_ENTITY: usize = 5000;
+    let db = lock_db(&state)?;
+    let now = now_ts();
+    let mut counts = serde_json::Map::new();
+
+    // 事件
+    if let Some(arr) = body.get("events").and_then(|v| v.as_array()) {
+        if arr.len() > MAX_PER_ENTITY {
+            return Err(ApiError::bad_request("events 数量超限"));
+        }
+        let mut n = 0usize;
+        for it in arr {
+            let Some(id) = it["id"].as_str() else { continue };
+            let start_ts = it["start_ts"].as_i64().unwrap_or(now);
+            let end_ts = it["end_ts"].as_i64();
+            let content = it["content"].as_str().unwrap_or("");
+            let tag = it["tag"].as_str().unwrap_or("生活");
+            let remind = it["remind"].as_bool().unwrap_or(false);
+            let task_id = it["task_id"].as_str();
+            let insert = db.insert_event_import(
+                id, start_ts, end_ts, content, tag,
+                remind, task_id, None, now,
+            );
+            match insert {
+                Ok(_) => n += 1,
+                Err(_) => { /* 跳过单条损坏数据 */ }
+            }
+        }
+        counts.insert("events".into(), json!(n));
+    }
+
+    // 消费
+    if let Some(arr) = body.get("expenses").and_then(|v| v.as_array()) {
+        if arr.len() > MAX_PER_ENTITY {
+            return Err(ApiError::bad_request("expenses 数量超限"));
+        }
+        let mut n = 0usize;
+        for it in arr {
+            let Some(id) = it["id"].as_str() else { continue };
+            let item = it["item"].as_str().unwrap_or("");
+            let amount_cents = it["amount_cents"].as_i64().unwrap_or(0);
+            let ts = it["ts"].as_i64().unwrap_or(now);
+            let category = it["category"].as_str().unwrap_or("其他");
+            if db.insert_expense_import(id, item, amount_cents, ts, category, None, now).is_ok() {
+                n += 1;
+            }
+        }
+        counts.insert("expenses".into(), json!(n));
+    }
+
+    // 项目
+    if let Some(arr) = body.get("projects").and_then(|v| v.as_array()) {
+        if arr.len() > MAX_PER_ENTITY {
+            return Err(ApiError::bad_request("projects 数量超限"));
+        }
+        let mut n = 0usize;
+        for it in arr {
+            let Some(id) = it["id"].as_str() else { continue };
+            let name = it["name"].as_str().unwrap_or("");
+            let status = it["status"].as_str().unwrap_or("进行中");
+            let note = it["note"].as_str().unwrap_or("");
+            if db.insert_project_import(id, name, status, it["start"].as_i64(), it["deadline_ts"].as_i64(), note, now).is_ok() {
+                n += 1;
+            }
+        }
+        counts.insert("projects".into(), json!(n));
+    }
+
+    // 想法
+    if let Some(arr) = body.get("ideas").and_then(|v| v.as_array()) {
+        if arr.len() > MAX_PER_ENTITY {
+            return Err(ApiError::bad_request("ideas 数量超限"));
+        }
+        let mut n = 0usize;
+        for it in arr {
+            let Some(id) = it["id"].as_str() else { continue };
+            let content = it["content"].as_str().unwrap_or("");
+            if content.is_empty() { continue; }
+            let tag = it["tag"].as_str().unwrap_or("灵感");
+            let pinned = it["pinned"].as_bool().unwrap_or(false);
+            let created = it["created_ts"].as_i64().unwrap_or(now);
+            if db.insert_idea_import(id, content, tag, pinned, created, now).is_ok() {
+                n += 1;
+            }
+        }
+        counts.insert("ideas".into(), json!(n));
+    }
+
+    // 任务
+    if let Some(arr) = body.get("tasks").and_then(|v| v.as_array()) {
+        if arr.len() > MAX_PER_ENTITY {
+            return Err(ApiError::bad_request("tasks 数量超限"));
+        }
+        let mut n = 0usize;
+        for it in arr {
+            let Some(id) = it["id"].as_str() else { continue };
+            let title = it["title"].as_str().unwrap_or("");
+            if title.is_empty() { continue; }
+            let date = it["date"].as_str().unwrap_or("");
+            let priority = it["priority"].as_str().unwrap_or("中");
+            let important = it["important"].as_bool().unwrap_or(false);
+            let urgent = it["urgent"].as_bool().unwrap_or(false);
+            let notes = it["notes"].as_str().unwrap_or("");
+            let done = it["done"].as_bool().unwrap_or(false);
+            let created = it["created_ts"].as_i64().unwrap_or(now);
+            if db.insert_task_import(id, date, title, priority, important, urgent, notes, done, created, now).is_ok() {
+                n += 1;
+            }
+        }
+        counts.insert("tasks".into(), json!(n));
+    }
+
+    Ok(Json(json!({
+        "imported": counts,
+        "ok": true,
+    })))
+}
 #[derive(Deserialize)]
 struct ExportCsvQuery {
     entity: Option<String>,
@@ -2828,6 +2953,42 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         let (code, _) = call(&state, "GET", "/api/export/csv?entity=x", None).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn import_endpoints_roundtrip() {
+        let state = test_state(true);
+        let now = now_ts();
+        // 手工构造一个导出形状的 JSON，POST 回去应能写入
+        let payload = json!({
+            "events": [ { "id": "ev1", "start_ts": now, "end_ts": now + 3600, "content": "晨会", "tag": "工作", "remind": false } ],
+            "expenses": [ { "id": "ex1", "item": "咖啡", "amount_cents": 1850, "ts": now, "category": "餐饮" } ],
+            "projects": [ { "id": "pr1", "name": "体重管理", "status": "进行中", "start": now, "deadline_ts": now + 86400, "note": "目标" } ],
+            "ideas": [ { "id": "id1", "content": "读《系统之美》", "tag": "读书", "pinned": true, "created_ts": now } ],
+            "tasks": [ { "id": "t1", "date": "2026-08-10", "title": "写周报", "priority": "高", "important": true, "urgent": false, "notes": "", "done": false, "created_ts": now } ],
+        });
+        let (code, body) = call(&state, "POST", "/api/import", Some(payload)).await;
+        assert_eq!(code, StatusCode::OK);
+        let imp = body["imported"].as_object().unwrap();
+        assert_eq!(imp["events"], json!(1));
+        assert_eq!(imp["expenses"], json!(1));
+        assert_eq!(imp["projects"], json!(1));
+        assert_eq!(imp["ideas"], json!(1));
+        assert_eq!(imp["tasks"], json!(1));
+
+        // 幂等：再导一遍不会重复（INSERT OR REPLACE）
+        let payload2 = json!({
+            "events": [ { "id": "ev1", "start_ts": now, "end_ts": now + 3600, "content": "晨会", "tag": "工作", "remind": false } ],
+        });
+        let (code, body) = call(&state, "POST", "/api/import", Some(payload2)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["imported"]["events"], json!(1));
+
+        // 查询确认真正落了库
+        let (code, body) = call(&state, "GET", "/api/expenses", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body.as_array().unwrap()[0]["item"], "咖啡");
     }
 
     #[tokio::test]

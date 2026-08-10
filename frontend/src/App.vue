@@ -76,6 +76,7 @@
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <el-button size="small" @click="pickImportFile">导入</el-button>
       </div>
     </header>
     <!-- 番茄钟进行中：贴在顶栏下方的红色进度条 + 倒计时 -->
@@ -558,7 +559,7 @@ function onGlobalKey(e) {
   }
 }
 
-// ---------- 数据导出 ----------
+// ---------- 数据导出 / 导入 ----------
 async function downloadExport(kind) {
   const url = kind === 'json' ? '/api/export' : `/api/export/csv?entity=${kind}`
   try {
@@ -577,6 +578,29 @@ async function downloadExport(kind) {
   }
 }
 
+// 导入：选择了 JSON 备份后 POST 回 /api/import（INSERT OR REPLACE，幂等）
+function pickImportFile() {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.json,application/json'
+  input.onchange = async () => {
+    const file = input.files && input.files[0]
+    if (!file) return
+    try {
+      const text = await file.text()
+      const payload = JSON.parse(text)
+      const result = await api.importData(payload)
+      const c = result.imported || {}
+      const parts = Object.entries(c).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`)
+      ElMessage.success(parts.length ? `导入成功：${parts.join(' · ')}` : '导入完成（无新数据）')
+      panelRefreshKey.value++
+      await fetchStatus()
+    } catch (e) {
+      ElMessage.error(`导入失败：${e.message}`)
+    }
+  }
+  input.click()
+}
 async function qeParse() {
   const text = qeText.value.trim()
   if (!text) return

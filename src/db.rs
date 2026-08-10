@@ -2239,7 +2239,76 @@ impl Db {
             .optional()?)
     }
 
-    // ---------- 全局搜索 ----------
+    // ---------- 全量导入（INSERT OR REPLACE，按 id 幂等） ----------
+
+    pub fn insert_event_import(
+        &self,
+        id: &str, start_ts: i64, end_ts: Option<i64>, content: &str, tag: &str,
+        remind: bool, task_id: Option<&str>, notion_page_id: Option<&str>, now: i64,
+    ) -> Result<()> {
+        let _ = now; // 事件没有 created_ts 列
+        self.conn.execute(
+            "INSERT OR REPLACE INTO events (id, start_ts, end_ts, content, tag, remind, task_id, notion_page_id, dirty, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,0)",
+            params![id, start_ts, end_ts, content, tag, remind as i64, task_id, notion_page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_expense_import(
+        &self,
+        id: &str, item: &str, amount_cents: i64, ts: i64, category: &str,
+        notion_page_id: Option<&str>, now: i64,
+    ) -> Result<()> {
+        let _ = now;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO expenses (id, item, amount_cents, ts, category, notion_page_id, dirty, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,0,0)",
+            params![id, item, amount_cents, ts, category, notion_page_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_project_import(
+        &self,
+        id: &str, name: &str, status: &str, start_ts: Option<i64>, deadline_ts: Option<i64>,
+        note: &str, now: i64,
+    ) -> Result<()> {
+        let _ = now;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO projects (id, name, status, start_ts, deadline_ts, note, notion_page_id, dirty, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,0,0)",
+            params![id, name, status, start_ts, deadline_ts, note],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_idea_import(
+        &self,
+        id: &str, content: &str, tag: &str, pinned: bool, created_ts: i64, now: i64,
+    ) -> Result<()> {
+        let _ = now;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ideas (id, content, tag, pinned, created_ts, updated_ts, notion_page_id, dirty, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,0,0)",
+            params![id, content, tag, pinned as i64, created_ts, created_ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_task_import(
+        &self,
+        id: &str, date: &str, title: &str, priority: &str, important: bool, urgent: bool,
+        notes: &str, done: bool, created_ts: i64, now: i64,
+    ) -> Result<()> {
+        let _ = now;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tasks (id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted)
+             VALUES (?1,?2,?3,?4,?5,?6,0,NULL,?7,?8,?9,?9,NULL,0,0)",
+            params![id, date, title, priority, important as i64, urgent as i64, notes, done as i64, created_ts],
+        )?;
+        Ok(())
+    }
 
     /// 全局搜索：在 6 类实体的标题/正文里做不区分大小写的子串匹配，按类分组返回。
     ///

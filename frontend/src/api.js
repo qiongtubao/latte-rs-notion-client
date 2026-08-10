@@ -19,6 +19,7 @@ export const api = {
   resetLocalData: () => unwrap(http.post('/data/reset')),
   toggleReminders: (enabled) => unwrap(http.post('/reminders/toggle', { enabled })),
   search: (q) => unwrap(http.get('/search', { params: { q } })),
+  importData: (payload) => unwrap(http.post('/import', payload)),
 
   getEvents: (date) => unwrap(http.get('/events', { params: { date } })),
   createEvent: (data) => unwrap(http.post('/events', data)),
