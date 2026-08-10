@@ -201,6 +201,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ai/quick-entry", post(ai_quick_entry))
         .route("/api/ai/assist", post(ai_assist_handler))
         .route("/api/reports/time", get(time_report))
+        .route("/api/reports/stats", get(reports_stats))
         .route("/api/expenses", get(list_expenses).post(add_expense))
         .route("/api/expenses/summary", get(expenses_summary))
         .route(
@@ -1531,6 +1532,67 @@ async fn time_report(
         "range_end": to,
         "total_seconds": total,
         "by_tag": by_tag,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ReportsStatsQuery {
+    period: Option<String>,
+    date: Option<String>,
+}
+
+/// 当前周期 vs 上一周期的结构化对比指标（时间/消费/任务完成），供前端画对比图
+async fn reports_stats(
+    State(state): State<AppState>,
+    Query(q): Query<ReportsStatsQuery>,
+) -> ApiResult<Json<Value>> {
+    let period = q
+        .period
+        .as_deref()
+        .and_then(parse_period)
+        .unwrap_or(Period::Week);
+    let date = date_param(q.date)?;
+    let now = now_ts();
+    // 计算当前周期 [from, to) 与上一周期 [prev_from, prev_to)
+    let (from, to) = report::period_range(period, date);
+    let prev_date = match period {
+        Period::Day => date - chrono::Duration::days(1),
+        Period::Week => date - chrono::Duration::days(7),
+        Period::Month => {
+            let (y, m) = if date.month() == 1 { (date.year() - 1, 12) } else { (date.year(), date.month() - 1) };
+            NaiveDate::from_ymd_opt(y, m, 1).unwrap_or(date)
+        }
+        Period::Year => NaiveDate::from_ymd_opt(date.year() - 1, date.month(), date.day()).unwrap_or(date),
+    };
+    let (prev_from, prev_to) = report::period_range(period, prev_date);
+    let stats_of = |db: &Db, from: i64, to: i64, n: i64| -> anyhow::Result<Value> {
+        let events = db.events_between(from, to, n)?;
+        let (_, total_secs) = report::summarize_events(&events, from, to, n);
+        let expense_cents: i64 = db.expenses_between(from, to)?.iter().map(|e| e.amount_cents).sum();
+        let all_tasks = db.all_tasks()?;
+        let tasks: Vec<_> = all_tasks.into_iter().filter(|t| {
+            NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")
+                .map(|d| { let ts = report::local_midnight(d); ts >= from && ts < to })
+                .unwrap_or(false)
+        }).collect();
+        let done = tasks.iter().filter(|t| t.done).count();
+        Ok(json!({
+            "time_secs": total_secs,
+            "expense_cents": expense_cents,
+            "tasks_total": tasks.len(),
+            "tasks_done": done,
+        }))
+    };
+
+    let db = lock_db(&state)?;
+    let current = stats_of(&db, from, to, now).map_err(ApiError::internal)?;
+    let prev = stats_of(&db, prev_from, prev_to, now).map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "period": period.label(),
+        "date": date.to_string(),
+        "prev_date": prev_date.to_string(),
+        "current": current,
+        "prev": prev,
     })))
 }
 
@@ -3279,6 +3341,31 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn reports_stats_compare_flow() {
+        let state = test_state(true);
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        // 今天加一笔消费 + 一个已完成任务
+        let now = now_ts();
+        call(&state, "POST", "/api/expenses", Some(json!({"item": "午饭", "amount": 25, "category": "餐饮", "ts": now}))).await;
+        call(&state, "POST", "/api/tasks", Some(json!({"title": "写周报", "date": today, "priority": "中"}))).await;
+
+        let (code, body) = call(
+            &state,
+            "GET",
+            &format!("/api/reports/stats?period=day&date={today}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["period"], "日");
+        // 今天有 1 笔消费、1 个任务
+        assert!(body["current"]["expense_cents"].as_i64().unwrap() >= 2500);
+        assert!(body["current"]["tasks_total"].as_i64().unwrap() >= 1);
+        // 对比结构完整
+        assert!(body["prev"].is_object());
+        assert!(body["prev_date"].is_string());
+    }
     #[tokio::test]
     async fn manual_create_event_flow() {
         let state = test_state(true);

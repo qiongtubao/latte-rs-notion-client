@@ -36,6 +36,24 @@
     <div v-if="report" class="report-body">
       <div class="report-title">{{ report.title }}</div>
       <div class="markdown-body" v-html="rendered" />
+      <!-- 对比图表：本周期 vs 上一周期 -->
+      <div v-if="stats" class="compare-chart">
+        <div class="compare-title">📊 本期 vs 上一期</div>
+        <div class="cmp-row" v-for="row in chartRows" :key="row.label">
+          <span class="cmp-label">{{ row.label }}</span>
+          <div class="cmp-bars">
+            <div class="cmp-bargroup">
+              <div class="cmp-bar" :class="row.down ? 'down' : ''" :style="{ width: row.curPct + '%' }" :title="`本期 ${row.curText}`" />
+              <span class="cmp-val">{{ row.curText }}</span>
+            </div>
+            <div class="cmp-bargroup">
+              <div class="cmp-bar prev" :style="{ width: row.prevPct + '%' }" :title="`上期 ${row.prevText}`" />
+              <span class="cmp-val">{{ row.prevText }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="cmp-legend"><span class="leg cur">本期</span><span class="leg prev">上一期</span></div>
+      </div>
       <el-collapse v-if="prevContext || report.context" class="report-raw-collapse">
         <el-collapse-item v-if="prevContext" title="上一同期数据汇总（对比模式）">
           <pre class="report-raw">{{ prevContext }}</pre>
@@ -53,22 +71,38 @@
 </template>
 
 <script setup>
-import { computed, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
-import { api } from '../api'
 
-const configured = ref(true)
-const period = ref('day')
-const focus = ref('')
+function fmtSecs(s) {
+  if (s == null) return '-'
+  const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60)
+  return h > 0 ? `${h}h${m}m` : `${m}m`
+}
+function fmtYuan2(cents) {
+  return cents == null ? '-' : `¥${(cents / 100).toFixed(1)}`
+}
+// 图表行：两期对比，横向条按较大值归一化
+const chartRows = computed(() => {
+  const st = stats.value
+  if (!st || !st.current || !st.prev) return []
+  const c = st.current, p = st.prev
+  const rows = [
+    { label: '时间投入', cur: c.time_secs || 0, prev: p.time_secs || 0, curText: fmtSecs(c.time_secs), prevText: fmtSecs(p.time_secs) },
+    { label: '消费', cur: c.expense_cents || 0, prev: p.expense_cents || 0, curText: fmtYuan2(c.expense_cents), prevText: fmtYuan2(p.expense_cents), down: true },
+  ]
+  const curDone = c.tasks_done || 0, prevDone = p.tasks_done || 0
+  rows.push({ label: '完成任务', cur: curDone, prev: prevDone, curText: String(curDone), prevText: String(prevDone) })
+  return rows.map(r => {
+    const max = Math.max(r.cur, r.prev, 1)
+    return { ...r, curPct: Math.round(r.cur / max * 100), prevPct: Math.round(r.prev / max * 100) }
+  })
+})
 const compare = ref(false)
 const loading = ref(false)
 const saving = ref(false)
 const report = ref(null)
 const prevContext = ref('')
-const errorMsg = ref('')
 const savedTitle = ref('')
+const stats = ref(null)
 
 const PERIOD_LABEL = { day: '日报', week: '周报', month: '月报' }
 
@@ -83,15 +117,21 @@ async function generate() {
   loading.value = true
   errorMsg.value = ''
   report.value = null
+  prevContext.value = ''
   savedTitle.value = ''
+  stats.value = null
   try {
-  const r = await api.aiReport(period.value, {
-    focus: focus.value.trim(),
-    compare: compare.value,
-  });
-  report.value = r;
-  prevContext.value = r.prev_context || '';
-  savedTitle.value = r.title || ''
+    const r = await api.aiReport(period.value, {
+      focus: focus.value.trim(),
+      compare: compare.value,
+    });
+    report.value = r;
+    prevContext.value = r.prev_context || '';
+    savedTitle.value = r.title || ''
+    // 对比模式额外拉结构化指标给图表
+    if (compare.value) {
+      stats.value = await api.getReportStats(period.value)
+    }
   } catch (e) {
     errorMsg.value = e.status === 502
       ? `${e.message}（请检查 latte-model-proxy 是否启动）`
@@ -130,11 +170,39 @@ async function saveAsNote() {
   margin-bottom: 12px;
   flex-wrap: wrap;
 }
-.report-focus {
-  width: 220px;
-  flex: 1;
-  max-width: 260px;
+
+/* 对比图表 */
+.compare-chart {
+  margin: 12px 0 4px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  padding: 10px 14px;
 }
+.compare-title { font-weight: 600; margin-bottom: 8px; font-size: 14px; }
+.cmp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.cmp-label { flex: 0 0 72px; font-size: 13px; color: var(--el-text-color-regular); }
+.cmp-bars { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.cmp-bargroup { display: flex; align-items: center; gap: 6px; }
+.cmp-bar {
+  height: 12px;
+  min-width: 2px;
+  border-radius: 3px;
+  background: #409eff;
+  transition: width 0.3s ease;
+}
+.cmp-bar.down { background: #f56c6c; }
+.cmp-bar.prev { background: #c0c4cc; }
+.cmp-val { font-size: 12px; color: var(--el-text-color-secondary); font-variant-numeric: tabular-nums; }
+.cmp-legend { display: flex; gap: 14px; font-size: 12px; margin-top: 6px; color: var(--el-text-color-regular); }
+.cmp-legend .leg { display: inline-flex; align-items: center; gap: 4px; }
+.cmp-legend .leg::before { content: ''; width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.cmp-legend .leg.cur::before { background: #409eff; }
+.cmp-legend .leg.prev::before { background: #c0c4cc; }
 .report-hint {
   color: var(--el-color-warning);
   font-size: 13px;

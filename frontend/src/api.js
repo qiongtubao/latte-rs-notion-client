@@ -29,6 +29,7 @@ export const api = {
   deleteEvent: (id) => unwrap(http.delete(`/events/${id}`)),
 
   getTimeReport: (period, date) => unwrap(http.get('/reports/time', { params: { period, date } })),
+  getReportStats: (period, date) => unwrap(http.get('/reports/stats', { params: { period, date } })),
 
   getExpenses: (from, to) => unwrap(http.get('/expenses', { params: { from, to } })),
   createExpense: (data) => unwrap(http.post('/expenses', data)),
