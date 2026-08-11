@@ -16,6 +16,7 @@ export const api = {
   setup: (token, page_url) => unwrap(http.post('/setup', { token, page_url })),
   verifySetup: (token, page_url) => unwrap(http.post('/setup/verify', { token, page_url })),
   pullFromNotion: () => unwrap(http.post('/sync/pull')),
+  sync: () => unwrap(http.post('/sync')),
   resetLocalData: () => unwrap(http.post('/data/reset')),
   toggleReminders: (enabled) => unwrap(http.post('/reminders/toggle', { enabled })),
   search: (q) => unwrap(http.get('/search', { params: { q } })),

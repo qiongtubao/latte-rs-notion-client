@@ -242,6 +242,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily/entry", post(upsert_daily_entry_api))
         .route("/api/daily/history", get(daily_history))
         .route("/api/daily/due", get(daily_due_now))
+        .route("/api/sync", post(sync_now))
         .route("/api/sync/pull", post(sync_pull))
         .route("/api/data/reset", post(reset_data))
         .route_layer(middleware::from_fn_with_state(
