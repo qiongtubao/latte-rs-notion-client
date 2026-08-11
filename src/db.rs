@@ -33,7 +33,7 @@ const NOTE_COLS: &str = "id, parent_id, kind, title, content_md, created_ts, upd
 const IDEA_COLS: &str =
     "id, content, tag, pinned, created_ts, updated_ts, notion_page_id, dirty, deleted";
 const TASK_COLS: &str =
-    "id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted, task_type, project_id, start_ts";
+    "id, date, title, priority, important, urgent, pomodoro_count, estimated_minutes, notes, done, created_ts, updated_ts, notion_page_id, dirty, deleted, task_type, project_id, start_ts, repeat_rule";
 const EXT_RECORD_COLS: &str =
     "ns, id, title, props_json, content_md, created_ts, updated_ts, notion_page_id, dirty, deleted";
 const DAILY_ENTRY_COLS: &str =
@@ -211,7 +211,11 @@ impl Db {
                 updated_ts INTEGER,
                 notion_page_id TEXT,
                 dirty INTEGER DEFAULT 1,
-                deleted INTEGER DEFAULT 0
+                deleted INTEGER DEFAULT 0,
+                task_type TEXT NOT NULL DEFAULT '',
+                project_id TEXT,
+                start_ts INTEGER,
+                repeat_rule TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS sync_meta (
                 k TEXT PRIMARY KEY,
@@ -257,8 +261,8 @@ impl Db {
         Self::add_column_if_missing(self, "tasks", "estimated_minutes", "INTEGER")?;
         Self::add_column_if_missing(self, "tasks", "notes", "TEXT NOT NULL DEFAULT ''")?;
         Self::add_column_if_missing(self, "tasks", "task_type", "TEXT NOT NULL DEFAULT ''")?;
-        Self::add_column_if_missing(self, "tasks", "project_id", "TEXT")?;
         Self::add_column_if_missing(self, "tasks", "start_ts", "INTEGER")?;
+        Self::add_column_if_missing(self, "tasks", "repeat_rule", "TEXT NOT NULL DEFAULT ''")?;
         Self::add_column_if_missing(self, "daily_items", "remind_at", "TEXT")?;
         Self::add_column_if_missing(self, "daily_items", "remind_days", "TEXT")?;
         // 促使下次同步把笔记重新建到新的「📚 知识库」database。用 user_version 防重复执行
@@ -1124,6 +1128,7 @@ impl Db {
             task_type: row.get(15)?,
             project_id: row.get(16)?,
             start_ts: row.get(17)?,
+            repeat_rule: row.get(18)?,
         })
     }
 
@@ -1161,6 +1166,7 @@ impl Db {
             task_type: task_type.to_string(),
             project_id: project_id.map(str::to_string),
             start_ts,
+            repeat_rule: String::new(),
             done: false,
             created_ts: now,
             updated_ts: now,
@@ -1244,6 +1250,7 @@ impl Db {
                     task_type: String::new(),
                     project_id: Some(pid.clone()),
                     start_ts: None,
+                    repeat_rule: String::new(),
                     done: false,
                     created_ts: 0,
                     updated_ts: 0,
@@ -1350,6 +1357,14 @@ impl Db {
         Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
     }
 
+    /// 设置/清除任务的重复规则
+    pub fn set_task_repeat_rule(&self, id: &str, rule: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET repeat_rule = ?2, dirty = 1 WHERE id = ?1 AND deleted = 0",
+            params![id, rule],
+        )?;
+        Ok(())
+    }
     /// 递增番茄钟计数（原子操作）
     pub fn increment_pomodoro(&self, id: &str, now: i64) -> Result<bool> {
         let updated = self.conn.execute(
@@ -2710,6 +2725,7 @@ mod tests {
             task_type: String::new(),
             project_id: None,
             start_ts: None,
+            repeat_rule: String::new(),
             done: false,
             created_ts: 100,
             updated_ts: 100,

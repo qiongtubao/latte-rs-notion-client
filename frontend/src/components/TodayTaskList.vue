@@ -24,10 +24,14 @@
         title="紧急"
         @click="newUrgent = !newUrgent"
       >急</el-button>
+      <el-select v-model="newRepeat" size="small" class="ttl-repeat" title="重复规则">
+        <el-option value="" label="不重复" />
+        <el-option value="daily" label="每日" />
+        <el-option value="weekly" label="每周" />
+        <el-option value="monthly" label="每月" />
+      </el-select>
       <el-button size="small" type="primary" :loading="adding" @click="quickAdd">添加</el-button>
     </div>
-
-    <!-- 空态：没任务也有个框 -->
     <div v-if="!loading && sortedTasks.length === 0" class="ttl-empty">
       没有未完成的任务
     </div>
@@ -54,7 +58,7 @@
           </template>
         </el-dropdown>
         <span class="ttl-title" :title="t.title">{{ t.title }}</span>
-        <span v-if="isTiming(t)" class="ttl-timing">⏱ {{ elapsed }}</span>
+        <span v-if="t.repeat_rule" class="ttl-repeat-badge" :title="repeatLabel(t.repeat_rule)">🔁{{ repeatLabel(t.repeat_rule) }}</span>
         <span v-else-if="t.estimated_minutes" class="ttl-est">预估{{ t.estimated_minutes }}m</span>
         <button
           class="ttl-timebtn"
@@ -103,9 +107,6 @@
 </template>
 
 <script setup>
-import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import dayjs from 'dayjs'
-import { ElMessage } from 'element-plus'
 import { api } from '../api'
 
 // 四象限优先级：颜色标识
@@ -121,7 +122,8 @@ function quadOf(t) {
   if (t.urgent) return QUADS.q3
   return QUADS.q4
 }
-
+const REPEAT_LABEL = { daily: '每日', weekly: '每周', monthly: '每月' }
+function repeatLabel(r) { return REPEAT_LABEL[r] || r }
 // 排序方式：子按钮「排序」循环切换
 const SORTS = ['priority', 'start', 'created']
 const sortMode = ref('priority')
@@ -137,8 +139,8 @@ const showAdd = ref(false)
 const newTitle = ref('')
 const newImportant = ref(false)
 const newUrgent = ref(false)
+const newRepeat = ref('') // daily / weekly / monthly / '' 不重复
 const adding = ref(false)
-const addInputRef = ref(null)
 
 // 已完成展示
 const showDone = ref(false)
@@ -253,10 +255,12 @@ async function quickAdd() {
       title,
       important: newImportant.value,
       urgent: newUrgent.value,
+      repeat_rule: newRepeat.value || undefined,
     })
     newTitle.value = ''
     newImportant.value = false
     newUrgent.value = false
+    newRepeat.value = ''
     await load()
   } catch (e) {
     ElMessage.error(e.message)
@@ -338,6 +342,15 @@ onUnmounted(() => {
   display: flex;
   gap: 6px;
   margin-bottom: 8px;
+}
+.ttl-repeat { width: 84px; }
+.ttl-repeat-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: #67c23a;
+  background: #f0f9eb;
+  border-radius: 4px;
+  padding: 2px 5px;
 }
 .ttl-empty {
   border: 1px dashed #dcdfe6;

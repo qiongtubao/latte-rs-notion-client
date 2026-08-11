@@ -604,8 +604,8 @@ mod tests {
         ];
         // 任务：1 完成 + 1 待办
         let tasks = vec![
-            Task { id: "t1".into(), date: "2026-08-09".into(), title: "写周报".into(), priority: TaskPriority::High, important: false, urgent: false, pomodoro_count: 2, estimated_minutes: None, notes: "".into(), task_type: "".into(), project_id: None, start_ts: None, done: true, created_ts: 0, updated_ts: 0, notion_page_id: None, dirty: false, deleted: false },
-            Task { id: "t2".into(), date: "2026-08-09".into(), title: "回邮件".into(), priority: TaskPriority::Mid, important: false, urgent: false, pomodoro_count: 0, estimated_minutes: None, notes: "".into(), task_type: "".into(), project_id: Some("p1".into()), start_ts: None, done: false, created_ts: 0, updated_ts: 0, notion_page_id: None, dirty: false, deleted: false },
+            Task { id: "t1".into(), date: "2026-08-09".into(), title: "写周报".into(), priority: TaskPriority::High, important: false, urgent: false, pomodoro_count: 2, estimated_minutes: None, notes: "".into(), task_type: "".into(), project_id: None, start_ts: None, repeat_rule: String::new(), done: true, created_ts: 0, updated_ts: 0, notion_page_id: None, dirty: false, deleted: false },
+            Task { id: "t2".into(), date: "2026-08-09".into(), title: "回邮件".into(), priority: TaskPriority::Mid, important: false, urgent: false, pomodoro_count: 0, estimated_minutes: None, notes: "".into(), task_type: "".into(), project_id: Some("p1".into()), start_ts: None, repeat_rule: String::new(), done: false, created_ts: 0, updated_ts: 0, notion_page_id: None, dirty: false, deleted: false },
         ];
         let projects = vec![
             Project { id: "p1".into(), name: "体重管理".into(), status: ProjectStatus::Doing, start_ts: Some(from), deadline_ts: Some(from + 30 * 86400), note: "".into(), notion_page_id: None, dirty: false, deleted: false },
@@ -671,7 +671,7 @@ mod tests {
                 title: format!("待办 {i}"), priority: TaskPriority::Mid,
                 important: false, urgent: false, pomodoro_count: 0,
                 estimated_minutes: None, notes: "".into(), task_type: "".into(),
-                project_id: None, start_ts: None, done: false,
+                project_id: None, start_ts: None, repeat_rule: String::new(), done: false,
                 created_ts: 0, updated_ts: 0, notion_page_id: None,
                 dirty: false, deleted: false,
             })

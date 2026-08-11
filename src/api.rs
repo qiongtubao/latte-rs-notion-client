@@ -2231,6 +2231,7 @@ fn task_json(t: &Task, executed_secs: i64) -> Value {
         "task_type": t.task_type,
         "project_id": t.project_id,
         "start_ts": t.start_ts,
+        "repeat_rule": t.repeat_rule,
         "done": t.done,
         "executed_secs": executed_secs,
         "created_ts": t.created_ts,
@@ -2293,6 +2294,9 @@ struct AddTaskBody {
     task_type: Option<String>,
     project_id: Option<String>,
     start_ts: Option<i64>,
+    /// 重复规则：daily / weekly / monthly；空 = 不重复
+    #[serde(default)]
+    repeat_rule: Option<String>,
 }
 
 async fn add_task(
@@ -2316,7 +2320,7 @@ async fn add_task(
     {
         return Err(ApiError::bad_request("关联项目不存在"));
     }
-    let task = db
+    let mut task = db
         .add_task(
             &date,
             title,
@@ -2331,7 +2335,38 @@ async fn add_task(
             now_ts(),
         )
         .map_err(ApiError::internal)?;
+    // 设置重复规则（同时刷新内存对象，让响应带上 repeat_rule）
+    if let Some(r) = body.repeat_rule.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let valid = matches!(r, "daily" | "weekly" | "monthly");
+        if !valid {
+            return Err(ApiError::bad_request("repeat_rule 应为 daily|weekly|monthly"));
+        }
+        let _ = db.set_task_repeat_rule(&task.id, r);
+        task.repeat_rule = r.to_string();
+    }
     Ok(Json(task_json(&task, 0)))
+}
+
+// 计算下一次重复日期：daily=明天, weekly=+7 天, monthly=+1 月同日（末日在 29-31 时钳到月尾）
+fn next_repeat_date(date: &str, rule: &str) -> Option<String> {
+    let d = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let next = match rule.trim() {
+        "daily" => d + chrono::Duration::days(1),
+        "weekly" => d + chrono::Duration::days(7),
+        "monthly" => {
+            let (y, m) = if d.month() == 12 { (d.year() + 1, 1) } else { (d.year(), d.month() + 1) };
+            let first = NaiveDate::from_ymd_opt(y, m, 1)?;
+            let raw = first + chrono::Duration::days(d.day() as i64 - 1);
+            if raw.month() == first.month() {
+                raw
+            } else {
+                let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+                NaiveDate::from_ymd_opt(ny, nm, 1).unwrap_or(raw) - chrono::Duration::days(1)
+            }
+        }
+        _ => return None,
+    };
+    Some(next.to_string())
 }
 
 #[derive(Deserialize)]
@@ -2350,6 +2385,7 @@ struct UpdateTaskBody {
     project_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "de_nullable")]
     start_ts: Option<Option<i64>>,
+    repeat_rule: Option<String>,
 }
 
 async fn update_task(
@@ -2403,10 +2439,38 @@ async fn update_task(
     if !updated {
         return Err(ApiError::not_found("任务不存在"));
     }
+    // 更新重复规则（若 body 带了 repeat_rule）
+    if let Some(r) = body.repeat_rule.as_deref().map(str::trim) {
+        if !r.is_empty() && !matches!(r, "daily" | "weekly" | "monthly") {
+            return Err(ApiError::bad_request("repeat_rule 应为 daily|weekly|monthly"));
+        }
+        let _ = db.set_task_repeat_rule(&id, r);
+    }
     let task = db
         .get_task(&id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("任务不存在"))?;
+    // 重复规则：标记完成时自动生成下一次出现（daily/weekly/monthly）
+    if body.done == Some(true) && !task.repeat_rule.is_empty() {
+        if let Some(next_date) = next_repeat_date(&task.date, &task.repeat_rule) {
+            let new_id = db
+                .add_task(
+                    &next_date,
+                    &task.title,
+                    task.priority,
+                    task.important,
+                    task.urgent,
+                    task.estimated_minutes,
+                    &task.notes,
+                    &task.task_type,
+                    task.project_id.as_deref(),
+                    task.start_ts,
+                    now_ts(),
+                )
+                .map_err(ApiError::internal)?;
+            let _ = db.set_task_repeat_rule(&new_id.id, &task.repeat_rule);
+        }
+    }
     let secs = db
         .task_executed_secs(&id, now_ts())
         .map_err(ApiError::internal)?;
@@ -4267,6 +4331,51 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn next_repeat_date_handles_monthly_clamping() {
+        // daily / weekly / monthly
+        assert_eq!(next_repeat_date("2026-08-10", "daily").unwrap(), "2026-08-11");
+        assert_eq!(next_repeat_date("2026-08-10", "weekly").unwrap(), "2026-08-17");
+        assert_eq!(next_repeat_date("2026-01-31", "weekly").unwrap(), "2026-02-07");
+        // monthly：1/31 → 2/28（2 月无 29/30/31）
+        assert_eq!(next_repeat_date("2026-01-31", "monthly").unwrap(), "2026-02-28");
+        // monthly：3/15 → 4/15
+        assert_eq!(next_repeat_date("2026-03-15", "monthly").unwrap(), "2026-04-15");
+        // 非法规则 / 日期 → None
+        assert!(next_repeat_date("2026-08-10", "yearly").is_none());
+        assert!(next_repeat_date("bad", "daily").is_none());
+    }
+
+    #[tokio::test]
+    async fn recurring_task_spawns_next_on_done() {
+        let state = test_state(true);
+        let today = Local::now().date_naive().to_string();
+        // 建一个 daily 重复任务
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/tasks",
+            Some(json!({"title": "每日晨跑", "date": today, "priority": "中", "repeat_rule": "daily"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["repeat_rule"], "daily");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        // 标记完成 → 自动生成明天同标题
+        let (code, _) = call(
+            &state,
+            "PUT",
+            &format!("/api/tasks/{id}"),
+            Some(json!({"done": true})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let tomorrow = (Local::now().date_naive() + chrono::Duration::days(1)).to_string();
+        let (_, body) = call(&state, "GET", &format!("/api/tasks?date={tomorrow}"), None).await;
+        let arr = body.as_array().unwrap();
+        assert!(arr.iter().any(|t| t["title"] == "每日晨跑" && t["repeat_rule"] == "daily"));
+    }
     #[tokio::test]
     async fn event_start_prefill_and_stop_optional() {
         let state = test_state(true);

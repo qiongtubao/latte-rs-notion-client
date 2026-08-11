@@ -278,6 +278,8 @@ pub struct Task {
     pub project_id: Option<String>,
     /// 计划开始时间（unix 秒，可选）
     pub start_ts: Option<i64>,
+    /// 重复规则：daily / weekly / monthly；空 = 不重复
+    pub repeat_rule: String,
     pub done: bool,
     pub created_ts: i64,
     pub updated_ts: i64,
