@@ -64,9 +64,10 @@ export const api = {
   createTask: (data) => unwrap(http.post('/tasks', data)),
   updateTask: (id, data) => unwrap(http.put(`/tasks/${id}`, data)),
   deleteTask: (id) => unwrap(http.delete(`/tasks/${id}`)),
+  getPomodoro: () => unwrap(http.get('/pomodoro')),
+  getPomodoroStats: (days) => unwrap(http.get('/pomodoro/stats', { params: { days } })),
   rolloverTasks: (from, to) => unwrap(http.post('/tasks/rollover', { from, to })),
   pomodoroTask: (id, minutes) => unwrap(http.post(`/tasks/${id}/pomodoro`, minutes ? { minutes } : {})),
-  getPomodoro: () => unwrap(http.get('/pomodoro')),
   cancelPomodoro: () => unwrap(http.post('/pomodoro/cancel')),
   quickEntry: (text) => unwrap(http.post('/ai/quick-entry', { text })),
   aiAssist: (panel, text, opts = {}) => unwrap(http.post('/ai/assist', {

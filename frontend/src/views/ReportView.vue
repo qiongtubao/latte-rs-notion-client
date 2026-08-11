@@ -16,8 +16,7 @@
         @keyup.enter="generate"
       />
       <el-checkbox v-model="compare" size="small" title="把上一同期数据也喂给 AI，让它做趋势对比">对比上一期</el-checkbox>
-      <el-button type="primary" size="small" :loading="loading" :disabled="!configured" @click="generate">
-      </el-button>
+      <el-button type="primary" size="small" :loading="loading" :disabled="!configured" @click="generate">🤖 生成</el-button>
       <el-button
         v-if="report"
         size="small"
@@ -32,7 +31,24 @@
       请先在设置里配置 AI（latte-model-proxy）。
     </div>
 
-    <!-- 原始数据兜底提示（AI 不可用也可看数据汇总） -->
+
+    <!-- 番茄钟专注统计：近 14 天专注时长 + 番茄数（条形图） -->
+    <div class="pomo-card">
+      <div class="pomo-head">
+        <span class="pomo-title">🍅 专注统计（近 14 天）</span>
+        <span class="pomo-total">共 {{ pomoStats.total_pomodoros }} 个番茄 · {{ fmtSecs(pomoStats.total_secs) }}</span>
+      </div>
+      <div v-loading="pomoLoading" class="pomo-bars">
+        <div v-for="d in pomoDays" :key="d.date" class="pomo-bar-row" :title="`${d.date}：${d.pomodoros} 个 · ${fmtSecs(d.secs)}`">
+          <span class="pomo-day">{{ d.dateLabel }}</span>
+          <div class="pomo-bar-track">
+            <div class="pomo-bar" :style="{ width: d.pct + '%' }" />
+          </div>
+          <span class="pomo-val">{{ d.pomodoros }}</span>
+        </div>
+      </div>
+    </div>
+
     <div v-if="report" class="report-body">
       <div class="report-title">{{ report.title }}</div>
       <div class="markdown-body" v-html="rendered" />
@@ -65,22 +81,25 @@
     </div>
     <div v-else-if="loading" v-loading="true" class="report-loading" />
     <el-empty v-else description="选择周期后点击「生成」来产出日报 / 周报 / 月报" :image-size="80" />
-
     <div v-if="errorMsg" class="report-error">{{ errorMsg }}</div>
   </div>
 </template>
 
 <script setup>
+import { computed, onMounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+import { api } from '../api'
 
+function fmtYuan2(cents) {
+  return cents == null ? '-' : `¥${(cents / 100).toFixed(1)}`
+}
 function fmtSecs(s) {
   if (s == null) return '-'
   const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60)
   return h > 0 ? `${h}h${m}m` : `${m}m`
 }
-function fmtYuan2(cents) {
-  return cents == null ? '-' : `¥${(cents / 100).toFixed(1)}`
-}
-// 图表行：两期对比，横向条按较大值归一化
 const chartRows = computed(() => {
   const st = stats.value
   if (!st || !st.current || !st.prev) return []
@@ -105,6 +124,44 @@ const savedTitle = ref('')
 const stats = ref(null)
 
 const PERIOD_LABEL = { day: '日报', week: '周报', month: '月报' }
+const period = ref('day')
+const configured = ref(false)
+const errorMsg = ref('')
+const focus = ref('')
+
+const pomoStats = ref({ total_pomodoros: 0, total_secs: 0 })
+const pomoLoading = ref(false)
+const pomoDays = computed(() => {
+  const arr = pomoStats.value.days || []
+  const max = Math.max(...arr.map(d => d.secs || 0), 1)
+  return arr.map(d => {
+    const day = new Date(d.date + 'T00:00:00')
+    return {
+      ...d,
+      dateLabel: Number.isNaN(day.getTime()) ? d.date : `${day.getMonth() + 1}/${day.getDate()}`,
+      pct: Math.round((d.secs || 0) / max * 100),
+    }
+  })
+})
+async function loadPomo() {
+  pomoLoading.value = true
+  try {
+    pomoStats.value = await api.getPomodoroStats(14)
+  } catch (e) {
+    console.error('加载番茄钟统计失败', e)
+  } finally {
+    pomoLoading.value = false
+  }
+}
+onMounted(async () => {
+  loadPomo()
+  try {
+    const s = await api.getStatus()
+    configured.value = !!s.configured
+  } catch (e) {
+    configured.value = false
+  }
+})
 
 const rendered = computed(() => {
   if (!report.value) return ''
@@ -242,4 +299,24 @@ async function saveAsNote() {
   max-height: 260px;
   overflow: auto;
 }
+.pomo-card {
+  margin-bottom: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  padding: 10px 14px;
+}
+.pomo-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.pomo-title { font-weight: 600; font-size: 14px; }
+.pomo-total { font-size: 12px; color: var(--el-text-color-secondary); font-variant-numeric: tabular-nums; }
+.pomo-bars { display: flex; flex-direction: column; gap: 6px; min-height: 40px; }
+.pomo-bar-row { display: flex; align-items: center; gap: 8px; }
+.pomo-day { flex: 0 0 40px; font-size: 12px; color: var(--el-text-color-regular); }
+.pomo-bar-track { flex: 1; height: 12px; background: var(--el-fill-color-light); border-radius: 3px; overflow: hidden; }
+.pomo-bar { height: 100%; min-width: 2px; border-radius: 3px; background: #f56c6c; transition: width 0.3s ease; }
+.pomo-val { flex: 0 0 20px; font-size: 12px; text-align: right; color: var(--el-text-color-secondary); font-variant-numeric: tabular-nums; }
 </style>

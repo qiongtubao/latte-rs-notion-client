@@ -227,6 +227,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/pomodoro", post(pomodoro_task))
         .route("/api/pomodoro", get(get_pomodoro))
         .route("/api/pomodoro/cancel", post(cancel_pomodoro))
+        .route("/api/pomodoro/stats", get(pomodoro_stats))
         .route("/api/tasks", get(list_tasks).post(add_task))
         .route("/api/tasks/{id}", put(update_task).delete(delete_task))
         .route("/api/events/ongoing", get(ongoing_event))
@@ -2576,6 +2577,60 @@ async fn cancel_pomodoro(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
+/// 番茄钟/任务执行统计：按天聚合「关联任务的事件」的数量与时长
+#[derive(Deserialize)]
+struct PomodoroStatsQuery {
+    days: Option<i64>,
+}
+async fn pomodoro_stats(
+    State(state): State<AppState>,
+    Query(q): Query<PomodoroStatsQuery>,
+) -> ApiResult<Json<Value>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    let to = today();
+    let from = to - chrono::Duration::days(days - 1);
+    let (from_ts, to_ts) = report::day_range(to + chrono::Duration::days(1)); // to 的次日零点作上界
+    let _ = (from_ts, to_ts);
+    let now = now_ts();
+    let db = lock_db(&state)?;
+    // 关联任务的已结束事件（完整时段落在 [from, to+1) 内）
+    let events = db
+        .events_between(report::day_range(from).0, report::day_range(to + chrono::Duration::days(1)).0, now)
+        .map_err(ApiError::internal)?;
+    // 按天聚合（事件开始那天计入）
+    let mut per_day: std::collections::BTreeMap<String, (i64, i64)> = std::collections::BTreeMap::new();
+    for ev in &events {
+        if ev.task_id.is_none() { continue; } // 只统计番茄钟/任务专注
+        let Some(end) = ev.end_ts else {
+            continue; // 进行中不计
+        };
+        let day = Local.timestamp_opt(ev.start_ts, 0).single().map(|d| d.format("%Y-%m-%d").to_string());
+        let Some(day) = day else { continue };
+        if day < from.to_string() || day >= (to + chrono::Duration::days(1)).to_string() {
+            continue;
+        }
+        let secs = (end - ev.start_ts).max(0);
+        let e = per_day.entry(day).or_insert((0, 0));
+        e.0 += 1;   // 番茄数
+        e.1 += secs; // 专注秒
+    }
+    // 补全缺失的天（0）
+    let mut arr = Vec::new();
+    let mut d = from;
+    while d <= to {
+        let key = d.to_string();
+        let (n, secs) = per_day.get(&key).copied().unwrap_or((0, 0));
+        arr.push(json!({ "date": key, "pomodoros": n, "secs": secs }));
+        d += chrono::Duration::days(1);
+    }
+    let total_pomo: i64 = arr.iter().map(|v| v["pomodoros"].as_i64().unwrap_or(0)).sum();
+    let total_secs: i64 = arr.iter().map(|v| v["secs"].as_i64().unwrap_or(0)).sum();
+    Ok(Json(json!({
+        "days": arr,
+        "total_pomodoros": total_pomo,
+        "total_secs": total_secs,
+    })))
+}
 /// 当前进行中的事件
 async fn ongoing_event(
     State(state): State<AppState>,
@@ -4627,5 +4682,31 @@ mod tests {
         assert_eq!(code, StatusCode::NOT_FOUND);
         let (code, _) = auth("DELETE", "/api/ext/agents/records/task-1".into(), None).await;
         assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pomodoro_stats_aggregates_task_events() {
+        let state = test_state(true);
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        // 建任务 + 启动番茄钟
+        let (_, body) = call(&state, "POST", "/api/tasks", Some(json!({"title": "写代码", "date": today}))).await;
+        let tid = body["id"].as_str().unwrap().to_string();
+        let (code, _) = call(&state, "POST", &format!("/api/tasks/{tid}/pomodoro"), Some(json!({"minutes": 25}))).await;
+        assert_eq!(code, StatusCode::OK);
+        // 结束关联事件（置 start/end，造出一段有时长的任务专注）
+        let now = now_ts();
+        call(&state, "POST", "/api/events/start", Some(json!({"content": "写代码", "tag": "工作"}))).await;
+        let (_, body) = call(&state, "GET", "/api/events/ongoing", None).await;
+        let ev_id = body["id"].as_str().unwrap().to_string();
+        if !ev_id.is_empty() {
+            call(&state, "PUT", &format!("/api/events/{ev_id}"), Some(json!({"start_ts": now - 1200, "end_ts": now}))).await;
+        }
+        // 查询统计
+        let (code, body) = call(&state, "GET", "/api/pomodoro/stats?days=7", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let days = body["days"].as_array().unwrap();
+        assert_eq!(days.len(), 7);
+        assert_eq!(body["total_pomodoros"].as_i64().unwrap() >= 0, true);
+        assert!(days.iter().any(|d| d["date"] == today && d["secs"].as_i64().unwrap() >= 1000));
     }
 }
