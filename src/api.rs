@@ -245,6 +245,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync", post(sync_now))
         .route("/api/sync/pull", post(sync_pull))
         .route("/api/data/reset", post(reset_data))
+
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_configured,
@@ -436,11 +437,31 @@ async fn sync_now(State(state): State<AppState>) -> ApiResult<Json<Value>> {
 /// 远端为事实来源：本地存在但远端没有的行被删除；已同步行的本地专属字段
 ///（事件 remind/task_id、任务 pomodoro/estimated/notes）按 notion_page_id 保留。
 async fn sync_pull(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let cfg = state
+    // 拉取前先解析数据库映射：旧 ID 失效时在根页面下自动修复；存在多个同名库
+    // 则返回冲突，不静默选错数据库中覆盖本地。
+    let cfg_now = state
         .config
         .lock()
         .map(|c| c.clone())
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "配置锁不可用"))?;
+    let cfg = state
+        .client
+        .resolve_required_ids(&cfg_now)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                format!("数据库解析失败，未拉取任何数据: {e:#}"),
+            )
+        })?;
+    if cfg != cfg_now {
+        if let Err(e) = config::save(&cfg) {
+            return Err(ApiError::internal(e));
+        }
+        if let Ok(mut c) = state.config.lock() {
+            *c = cfg.clone();
+        }
+    }
     let data = state.client.pull_all(&cfg).await.map_err(|e| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,
@@ -464,7 +485,6 @@ async fn sync_pull(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         }
     })))
 }
-
 /// 清空本地全部业务数据（保留 Notion token/页面配置与 ext 命名空间凭证）。
 ///
 /// 仅删本地，不动远端；之后由前端调用 /api/sync/pull 重新拉取。

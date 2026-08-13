@@ -2,6 +2,7 @@
 //!
 //! 请求体构造函数（`*_body` / `*_properties`）为纯函数，附带单元测试。
 
+use std::collections::HashSet;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,85 @@ pub struct SetupVerifyResult {
 pub struct FoundDatabase {
     pub title: String,
     pub id: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseKind {
+    Events,
+    Expenses,
+    Projects,
+    Notes,
+    Ideas,
+    Tasks,
+    Daily,
+}
+
+impl DatabaseKind {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Events => "时间碎片",
+            Self::Expenses => "金钱记录",
+            Self::Projects => "项目管理",
+            Self::Notes => "📚 知识库",
+            Self::Ideas => "好想法",
+            Self::Tasks => "今日任务",
+            Self::Daily => "✅ 每日打卡",
+        }
+    }
+}
+
+fn database_title(db: &Value) -> String {
+    db["title"]
+        .as_array()
+        .map(|parts| {
+            parts.iter().filter_map(|p| {
+                p["plain_text"].as_str().or_else(|| p["text"]["content"].as_str())
+            }).collect()
+        })
+        .unwrap_or_default()
+}
+fn property_type<'a>(db: &'a Value, name: &str) -> Option<&'a str> {
+    db["properties"][name]
+        .as_object()
+        .and_then(|p| p.keys().find(|key| *key != "id" && *key != "name"))
+        .map(String::as_str)
+}
+
+fn database_schema_matches(db: &Value, kind: DatabaseKind) -> bool {
+    let required: &[(&str, &str)] = match kind {
+        DatabaseKind::Events => &[("名称", "title"), ("开始", "date"), ("结束", "date"), ("内容", "rich_text"), ("标签", "select")],
+        DatabaseKind::Expenses => &[("事项", "title"), ("金额", "number"), ("时间", "date"), ("分类", "select")],
+        DatabaseKind::Projects => &[("名称", "title"), ("状态", "select"), ("开始", "date"), ("截止", "date"), ("备注", "rich_text")],
+        DatabaseKind::Notes => &[("名称", "title"), ("类型", "select"), ("父级", "relation")],
+        DatabaseKind::Ideas => &[("名称", "title"), ("内容", "rich_text"), ("置顶", "checkbox"), ("标签", "select")],
+        DatabaseKind::Tasks => &[("名称", "title"), ("日期", "date"), ("完成", "checkbox"), ("优先级", "select")],
+        DatabaseKind::Daily => &[("名称", "title"), ("日期", "date"), ("完成", "checkbox"), ("类型", "select")],
+    };
+    required.iter().all(|(name, ty)| property_type(db, name) == Some(*ty))
+}
+
+fn database_matches(db: &Value, kind: DatabaseKind) -> bool {
+    db["object"].as_str() == Some("database")
+        && database_title(db) == kind.title()
+        && database_schema_matches(db, kind)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseCandidate {
+    pub kind: DatabaseKind,
+    pub id: String,
+    pub title: String,
+    pub parent_id: Option<String>,
+    pub schema_ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseBinding {
+    pub kind: DatabaseKind,
+    pub id: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub candidates: Vec<DatabaseCandidate>,
 }
 
 pub struct NotionClient {
@@ -323,6 +403,126 @@ impl NotionClient {
         Ok(json!({ "results": all }))
     }
 
+    async fn database_object(&self, id: &str) -> Result<Value> {
+        self.send(reqwest::Method::GET, &format!("/databases/{id}"), &Value::Null)
+            .await
+            .with_context(|| format!("读取 Notion database {id} 失败"))
+    }
+
+    async fn root_database_ids(&self, root_page_id: &str) -> Result<HashSet<String>> {
+        let mut seen_pages = HashSet::new();
+        let mut database_ids = HashSet::new();
+        let mut stack = vec![root_page_id.to_string()];
+        while let Some(page_id) = stack.pop() {
+            if !seen_pages.insert(page_id.clone()) {
+                continue;
+            }
+            let children = self.child_objects(&page_id).await?;
+            for block in children["results"].as_array().into_iter().flatten() {
+                match block["type"].as_str() {
+                    Some("child_database") => {
+                        if let Some(id) = block["id"].as_str() {
+                            database_ids.insert(id.to_string());
+                        }
+                    }
+                    Some("child_page") => {
+                        if let Some(id) = block["id"].as_str() {
+                            stack.push(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(database_ids)
+    }
+
+    async fn resolve_kind_from_ids(
+        &self,
+        ids: &HashSet<String>,
+        kind: DatabaseKind,
+        configured_id: Option<&str>,
+        allow_missing: bool,
+    ) -> Result<Option<String>> {
+        if let Some(id) = configured_id
+            .filter(|id| !id.is_empty())
+            .filter(|id| ids.contains(&id.to_string()))
+            && let Ok(db) = self.database_object(id).await
+            && database_matches(&db, kind)
+        {
+            return Ok(Some(id.to_string()));
+        }
+        let mut candidates = Vec::new();
+        for id in ids {
+            let db = self.database_object(id).await?;
+            if database_matches(&db, kind) {
+                candidates.push(id.clone());
+            }
+        }
+        match candidates.as_slice() {
+            [id] => Ok(Some(id.clone())),
+            [] if allow_missing => Ok(None),
+            [] => bail!("根页面下未找到「{}」数据库，请先完成初始化", kind.title()),
+            _ => bail!("根页面下存在多个「{}」数据库，请在设置中选择正确的数据库", kind.title()),
+        }
+    }
+
+
+
+    pub async fn resolve_required_ids(&self, cfg: &Config) -> Result<Config> {
+        let (root, _) = self.resolve_root(&cfg.parent_page_id).await?;
+        let ids = self.root_database_ids(&root).await?;
+        let mut resolved = cfg.clone();
+        resolved.parent_page_id = root;
+        resolved.events_db_id = self
+            .resolve_kind_from_ids(&ids, DatabaseKind::Events, Some(&cfg.events_db_id), false)
+            .await?
+            .unwrap();
+        resolved.expenses_db_id = self
+            .resolve_kind_from_ids(&ids, DatabaseKind::Expenses, Some(&cfg.expenses_db_id), false)
+            .await?
+            .unwrap();
+        resolved.projects_db_id = self
+            .resolve_kind_from_ids(&ids, DatabaseKind::Projects, Some(&cfg.projects_db_id), false)
+            .await?
+            .unwrap();
+        if let Some(id) = self
+            .resolve_kind_from_ids(&ids, DatabaseKind::Notes, cfg.notes_db_id.as_deref(), true)
+            .await?
+        {
+            resolved.notes_db_id = Some(id);
+        }
+        Ok(resolved)
+    }
+
+    pub async fn setup_databases(
+        &self,
+        parent_page_id: &str,
+    ) -> Result<(DatabaseIds, String)> {
+        let (root_page_id, _) = self.resolve_root(parent_page_id).await?;
+        let ids = self.root_database_ids(&root_page_id).await?;
+        let events_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Events, None, true).await? {
+            Some(id) => id,
+            None => self.create_db_return(events_db_body(&root_page_id)).await?,
+        };
+        let expenses_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Expenses, None, true).await? {
+            Some(id) => id,
+            None => self.create_db_return(expenses_db_body(&root_page_id)).await?,
+        };
+        let projects_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Projects, None, true).await? {
+            Some(id) => id,
+            None => self.create_db_return(projects_db_body(&root_page_id)).await?,
+        };
+        let notes_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Notes, None, true).await? {
+            Some(id) => id,
+            None => self.create_notes_db(&root_page_id).await?,
+        };
+        Ok((
+            DatabaseIds { events_db_id, expenses_db_id, projects_db_id, notes_db_id },
+            root_page_id,
+        ))
+    }
+
 
     /// 从 /search 返回的 database 对象中提取显示标题。
     ///
@@ -527,51 +727,7 @@ impl NotionClient {
         }
         self.append_children(page_id, blocks).await
     }
-    /// 为父页面准备 Latte 的 3 个 database + 知识库页面：先查询已存在的对象并复用，
-    /// 只为缺失的创建。返回最终生效的 id（既有 + 新建）。
-    ///
-    /// 标题匹配与 lazy 建库复用同一套规则，故只要用户在 Notion 里按规定的
-    /// 「时间碎片 / 金钱记录 / 项目管理 / 📚 知识库」建好即可直接接入，不会重复创建。
-    pub async fn setup_databases(
-        &self,
-        parent_page_id: &str,
-    ) -> Result<(DatabaseIds, String)> {
-        // 先解析输入：若用户粘了 database URL，向上爬升到真正的父页面
-        let (root_page_id, _is_database) = self.resolve_root(parent_page_id).await?;
-        // 全局搜索 integration 可访问的数据库（任意嵌套层级），按标题复用
-        let found_dbs = self.find_latte_databases().await?;
-        let mut by_title: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
-        for (id, title) in &found_dbs {
-            by_title.insert(title.as_str(), id.clone());
-        }
-        // 复用已存在的（无论它建在哪个页面下），缺失的才在根页面下创建
-        let events_db_id = match by_title.get("时间碎片") {
-            Some(v) => v.clone(),
-            None => self.create_db_return(events_db_body(&root_page_id)).await?,
-        };
-        let expenses_db_id = match by_title.get("金钱记录") {
-            Some(v) => v.clone(),
-            None => self.create_db_return(expenses_db_body(&root_page_id)).await?,
-        };
-        let projects_db_id = match by_title.get("项目管理") {
-            Some(v) => v.clone(),
-            None => self.create_db_return(projects_db_body(&root_page_id)).await?,
-        };
-        // 知识库 database：复用已存在的「📚 知识库」DB，否则新建并补自关联「父级」
-        let notes_db_id = match by_title.get("📚 知识库") {
-            Some(v) => v.clone(),
-            None => self.create_notes_db(&root_page_id).await?,
-        };
-        Ok((
-            DatabaseIds {
-                events_db_id,
-                expenses_db_id,
-                projects_db_id,
-                notes_db_id,
-            },
-            root_page_id,
-        ))
-    }
+
 
     /// 创建 database 并返回其 id（复用 create 请求的解析逻辑）
     async fn create_db_return(&self, body: Value) -> Result<String> {
@@ -1544,6 +1700,26 @@ mod tests {
             "2026-08-01T00:00:00.000Z"
         );
         assert_eq!(body["start_cursor"], "cur-1");
+    }
+    #[test]
+    fn database_matching_requires_exact_title_and_schema() {
+        let mut db = events_db_body("root");
+        db["object"] = json!("database");
+        db["id"] = json!("events-1");
+        assert!(database_matches(&db, DatabaseKind::Events));
+
+        db["title"][0]["text"]["content"] = json!("时间碎片（副本）");
+        assert!(!database_matches(&db, DatabaseKind::Events));
+        db["title"][0]["text"]["content"] = json!("时间碎片");
+        db["properties"]["标签"] = json!({"rich_text": {}});
+        assert!(!database_matches(&db, DatabaseKind::Events));
+    }
+
+    #[test]
+    fn database_kind_titles_cover_optional_databases() {
+        assert_eq!(DatabaseKind::Ideas.title(), "好想法");
+        assert_eq!(DatabaseKind::Tasks.title(), "今日任务");
+        assert_eq!(DatabaseKind::Daily.title(), "✅ 每日打卡");
     }
 
     #[test]

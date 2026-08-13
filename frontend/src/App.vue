@@ -734,6 +734,10 @@ async function doReset() {
   } catch { return } // 用户取消
   resetting.value = true
   try {
+    // 先解析并校验数据库映射（远端为事实来源）：映射不可用（旧 ID 失效 / 存在多个
+    // 同名库）时同步接口返回 409，这里在删除本地数据前就终止，避免本地被清空后
+    // 却无法从 Notion 恢复。
+    await api.pullFromNotion()
     await api.resetLocalData()
     const r = await api.pullFromNotion()
     const c = r.counts || {}

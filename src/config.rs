@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
     pub token: String,
@@ -51,7 +51,7 @@ fn default_remind_enabled() -> bool {
 }
 
 /// AI 图片识别配置（OpenAI 兼容代理，全部可选）
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AiConfig {
     #[serde(default = "default_proxy_base")]
     pub proxy_base: String,
