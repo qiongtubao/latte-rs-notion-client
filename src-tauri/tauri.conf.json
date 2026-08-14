@@ -16,6 +16,7 @@
         "height": 800,
         "resizable": true,
         "fullscreen": false,
+        "visible": false,
         "url": "http://127.0.0.1:3210"
       }
     ],

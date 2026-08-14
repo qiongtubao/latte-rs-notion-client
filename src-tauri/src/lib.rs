@@ -5,7 +5,7 @@
 //!
 //! 窗口结构：
 //! - `main`：主窗口（标签页界面），默认隐藏，托盘/弹窗可唤起，关闭时仅隐藏；
-//! - `ball-<key>`：5 个系统级悬浮球（透明、无边框、置顶、跳过任务栏），可拖拽，位置持久化；
+//! - `ball-<key>`：4 个系统级悬浮球（透明、无边框、置顶、跳过任务栏），可拖拽，位置持久化；
 //! - `popup`：共享的快捷操作弹窗，点击悬浮球时在球旁边弹出对应功能视图。
 
 use std::collections::HashMap;
@@ -20,8 +20,8 @@ use tauri::{
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 const SERVER_URL: &str = "http://127.0.0.1:3210";
-/// 悬浮球 key 列表（与前端视图一一对应）
-const BALL_KEYS: [&str; 5] = ["today", "time", "money", "calendar", "projects"];
+/// 悬浮球 key 列表（与前端 PopupApp 的 viewMap 一一对应）
+const BALL_KEYS: [&str; 4] = ["today", "money", "calendar", "projects"];
 /// 弹窗尺寸（逻辑像素）
 const POPUP_W: f64 = 440.0;
 const POPUP_H: f64 = 560.0;
@@ -51,6 +51,31 @@ fn save_position(key: &str, x: i32, y: i32) {
     }
     if let Ok(text) = serde_json::to_string(&map) {
         let _ = std::fs::write(&path, text);
+    }
+}
+
+// ---------- 悬浮球透明开关 ----------
+
+/// 悬浮球是否使用透明窗口。
+/// 配置项 `ball_transparent`（~/.config/latte/config.toml）可强制指定；
+/// 缺省自动：Wayland / 非 Linux 透明；Linux X11 保守取不透明圆角色块——
+/// X11 下无法可靠判断合成器是否真的混合 ARGB（xrdp/软渲染等场景透明窗口退化为白方块）。
+fn ball_transparent() -> bool {
+    if let Some(forced) = latte::config::load()
+        .ok()
+        .flatten()
+        .and_then(|c| c.ball_transparent)
+    {
+        return forced;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
     }
 }
 
@@ -188,6 +213,7 @@ fn create_floating_windows(app: &tauri::AppHandle) {
         .map(|m| (m.position().x, m.position().y, m.size().width as i32, m.scale_factor()))
         .unwrap_or((0, 0, 1920, 1.0));
 
+    let transparent = ball_transparent();
     for (i, key) in BALL_KEYS.iter().enumerate() {
         // 默认位置：屏幕右边缘竖排
         let default = (
@@ -195,10 +221,14 @@ fn create_floating_windows(app: &tauri::AppHandle) {
             mon_y + (160.0 * sf) as i32 + (i as f64 * 84.0 * sf) as i32,
         );
         let (x, y) = positions.get(*key).copied().unwrap_or(default);
-        let url = format!("{SERVER_URL}/?ball={key}");
+        let url = if transparent {
+            format!("{SERVER_URL}/?ball={key}")
+        } else {
+            format!("{SERVER_URL}/?ball={key}&opaque=1")
+        };
         let win = match WebviewWindowBuilder::new(app, format!("ball-{key}"), WebviewUrl::External(url.parse().unwrap()))
             .title("Latte")
-            .transparent(true)
+            .transparent(transparent)
             .decorations(false)
             .always_on_top(true)
             .skip_taskbar(true)
@@ -244,10 +274,10 @@ fn create_floating_windows(app: &tauri::AppHandle) {
 }
 
 /// 桌面悬浮球 UI 总开关。
-/// 目前暂停：Linux X11 无合成器时透明失效，球窗口退化成白色方块。
-/// 后期重启桌面开发时置为 true，并恢复 tauri.conf.json 里 main 窗口的 `"visible": false`。
-/// 注意：托盘与「关闭仅隐藏」不受此影响——它们一直启用，保证窗口关掉后提醒仍然存活。
-const FLOATING_UI_ENABLED: bool = false;
+/// 悬浮球窗口样式由 `ball_transparent()` 决定：Wayland/macOS 透明圆球，
+/// Linux X11 默认不透明圆角色块（可在 config.toml 设 `ball_transparent = true` 强制透明）。
+/// 托盘与「关闭仅隐藏」不受此影响——它们一直启用，保证窗口关掉后提醒仍然存活。
+const FLOATING_UI_ENABLED: bool = true;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -265,7 +295,9 @@ pub fn run() {
                 .map(|c| c.global_shortcut)
                 .unwrap_or_else(|| "Alt+Q".to_string());
             let _ = app.handle().global_shortcut().on_shortcut(
+                initial_key.as_str(),
                 move |app, _shortcut, event: ShortcutEvent| {
+                    if event.state == ShortcutState::Pressed {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.show();
                             let _ = w.unminimize();

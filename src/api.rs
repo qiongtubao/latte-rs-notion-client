@@ -342,7 +342,7 @@ async fn setup(
             )
         })?;
     // 保留已有 AI 配置、外部 API token、提醒开关与懒建的 database id，避免重新 setup 时被默认值覆盖
-    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id, daily_db_id, remind_enabled, global_shortcut) = state
+    let (ai_cfg, mut api_token, ideas_db_id, tasks_db_id, daily_db_id, remind_enabled, global_shortcut, ball_transparent) = state
         .config
         .lock()
         .map(|c| {
@@ -354,6 +354,7 @@ async fn setup(
                 c.daily_db_id.clone(),
                 c.remind_enabled,
                 c.global_shortcut.clone(),
+                c.ball_transparent,
             )
         })
         .unwrap_or_default();
@@ -374,6 +375,7 @@ async fn setup(
         api_token,
         remind_enabled,
         global_shortcut,
+        ball_transparent,
         ai: ai_cfg,
     };
     config::save(&cfg).map_err(ApiError::internal)?;

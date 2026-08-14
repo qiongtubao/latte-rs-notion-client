@@ -38,6 +38,11 @@ pub struct Config {
     /// 全局快捷键（Tauri 桌面壳），按此键在任何应用都能唤起快速录入
     #[serde(default = "default_global_shortcut")]
     pub global_shortcut: String,
+    /// 桌面悬浮球透明窗口开关（Tauri 桌面壳）：
+    /// None = 自动（Wayland/macOS 透明，X11 保守取不透明圆角色块）；
+    /// Some(true) 强制透明（X11 有正常混合 ARGB 的合成器时可开），Some(false) 强制不透明
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ball_transparent: Option<bool>,
     #[serde(default)]
     pub ai: AiConfig,
 }
