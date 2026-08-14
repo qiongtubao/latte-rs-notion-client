@@ -24,6 +24,7 @@ const META = {
   money: { icon: '💰', label: '金钱', color: '#67c23a' },
   calendar: { icon: '📅', label: '日历', color: '#909399' },
   projects: { icon: '📊', label: '项目', color: '#9b59b6' },
+  notes: { icon: '📚', label: '知识库', color: '#16a085' },
 }
 const meta = computed(() => META[props.ballKey] || { icon: '☕', label: props.ballKey, color: '#409eff' })
 

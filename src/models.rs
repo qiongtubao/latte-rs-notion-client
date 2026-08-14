@@ -215,6 +215,16 @@ pub struct Note {
     pub deleted: bool,
 }
 
+/// 知识库文档搜索命中
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoteSearchHit {
+    pub id: String,
+    pub title: String,
+    /// 命中片段（含 <b> 高亮标记，或 LIKE 路径的正文前 80 字符）
+    pub snippet: String,
+    pub updated_ts: i64,
+}
+
 /// 时间碎片事件（end_ts 为空表示进行中）
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {

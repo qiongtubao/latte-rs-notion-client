@@ -59,10 +59,11 @@ pub fn build_state(
     cfg: config::Config,
     db_path: &std::path::Path,
 ) -> Result<AppState> {
+    let db = Db::open(db_path).context("打开本地数据库失败")?;
+    // 重建知识库全文索引（兜底漏钩子的历史数据；表小，重建开销可忽略）
+    db.rebuild_notes_fts().context("重建知识库检索索引失败")?;
     let state = AppState {
-        db: Arc::new(Mutex::new(
-            Db::open(db_path).context("打开本地数据库失败")?,
-        )),
+        db: Arc::new(Mutex::new(db)),
         client: Arc::new(NotionClient::new(cfg.token.clone())),
         config: Arc::new(Mutex::new(cfg)),
         sync_status: Arc::new(Mutex::new(SyncStatus::default())),

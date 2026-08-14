@@ -50,6 +50,7 @@ export const api = {
   deleteProject: (id) => unwrap(http.delete(`/projects/${id}`)),
 
   getNotesTree: () => unwrap(http.get('/notes/tree')),
+  searchNotes: (q) => unwrap(http.get('/notes/search', { params: { q } })),
   getNote: (id) => unwrap(http.get(`/notes/${id}`)),
   createNote: (data) => unwrap(http.post('/notes', data)),
   updateNote: (id, data) => unwrap(http.put(`/notes/${id}`, data)),

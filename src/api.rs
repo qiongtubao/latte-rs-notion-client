@@ -216,6 +216,7 @@ pub fn router(state: AppState) -> Router {
             put(update_project).delete(delete_project),
         )
         .route("/api/notes/tree", get(notes_tree))
+        .route("/api/notes/search", get(search_notes))
         .route("/api/notes", post(add_note))
         .route(
             "/api/notes/{id}",
@@ -2011,6 +2012,32 @@ async fn notes_tree(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(Value::Array(note_tree_level(&notes, None))))
 }
 
+/// 知识库文档全文搜索：?q=关键词（多词 AND，trigram FTS + 短词 LIKE 兜底）
+async fn search_notes(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<Value>> {
+    let kw = q.q.trim();
+    if kw.is_empty() {
+        return Err(ApiError::bad_request("q 不能为空"));
+    }
+    let hits = lock_db(&state)?
+        .search_notes(kw, 20)
+        .map_err(ApiError::internal)?;
+    let list: Vec<Value> = hits
+        .iter()
+        .map(|h| {
+            json!({
+                "id": h.id,
+                "title": h.title,
+                "snippet": h.snippet,
+                "updated_ts": h.updated_ts,
+            })
+        })
+        .collect();
+    Ok(Json(Value::Array(list)))
+}
+
 async fn get_note(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let note = lock_db(&state)?
         .get_note(&id)
@@ -3783,6 +3810,47 @@ mod tests {
     }
 
 
+
+    #[tokio::test]
+    async fn notes_search_api() {
+        let state = test_state(true);
+        // 两篇文档 + 一个目录
+        let (code, body) = call(
+            &state,
+            "POST",
+            "/api/notes",
+            Some(json!({"parent_id": null, "kind": "doc", "title": "Rust 学习笔记", "content_md": "所有权和借用是核心概念"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let doc_id = body["id"].as_str().unwrap().to_string();
+        let (code, _) = call(
+            &state,
+            "POST",
+            "/api/notes",
+            Some(json!({"parent_id": null, "kind": "doc", "title": "菜谱", "content_md": "番茄炒蛋的做法"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        // 正文命中（trigram FTS）
+        let (code, body) = call(&state, "GET", "/api/notes/search?q=所有权", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let hits = body.as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], doc_id);
+        assert_eq!(hits[0]["title"], "Rust 学习笔记");
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("<b>"));
+
+        // 短词 LIKE 兜底
+        let (code, body) = call(&state, "GET", "/api/notes/search?q=番茄", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 1);
+
+        // 空 q → 400
+        let (code, _) = call(&state, "GET", "/api/notes/search?q=", None).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn notes_crud_and_tree_flow() {

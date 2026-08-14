@@ -1,5 +1,36 @@
 <template>
   <div>
+    <!-- 文档全文搜索（本地 trigram 索引，服务端拉取远端后建索引） -->
+    <div class="notes-search">
+      <el-input
+        v-model="searchQ"
+        size="small"
+        clearable
+        placeholder="搜索知识库文档（标题/正文）…"
+        @input="onSearchInput"
+        @clear="searchQ = ''"
+      >
+        <template #prefix><el-icon><Search /></el-icon></template>
+      </el-input>
+    </div>
+
+    <!-- 搜索结果 -->
+    <div v-if="searchActive" class="search-results" v-loading="searching">
+      <div
+        v-for="h in searchHits"
+        :key="h.id"
+        class="search-hit"
+        @click="openHit(h)"
+      >
+        <div class="hit-title">{{ h.title }}</div>
+        <div class="hit-snippet" v-html="renderSnippet(h.snippet)"></div>
+      </div>
+      <div v-if="!searching && searchHits.length === 0" class="search-empty">
+        没有匹配的文档
+      </div>
+    </div>
+
+    <template v-if="!searchActive">
     <!-- ============ 总览模式 ============ -->
     <template v-if="viewMode === 'overview'">
       <div v-if="rootDirs.length === 0 && rootDocs.length === 0" class="overview-empty" v-loading="loadingTree">
@@ -149,6 +180,7 @@
         </el-card>
       </div>
     </template>
+    </template>
 
     <!-- 新建 / 重命名对话框 -->
     <el-dialog v-model="nameDialog" :title="nameDialogTitle" width="420px">
@@ -176,6 +208,7 @@ import {
   Folder,
   FolderAdd,
   Notebook,
+  Search,
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
@@ -227,6 +260,46 @@ const rendered = computed(() => {
   if (!doc.value) return ''
   return DOMPurify.sanitize(marked.parse(doc.value.content_md || ''))
 })
+
+// ---------- 文档全文搜索 ----------
+
+const searchQ = ref('')
+const searchHits = ref([])
+const searching = ref(false)
+const searchActive = computed(() => searchQ.value.trim().length > 0)
+let searchTimer = null
+
+function onSearchInput() {
+  clearTimeout(searchTimer)
+  const q = searchQ.value.trim()
+  if (!q) {
+    searchHits.value = []
+    searching.value = false
+    return
+  }
+  searching.value = true
+  // 300ms 防抖
+  searchTimer = setTimeout(async () => {
+    try {
+      searchHits.value = await api.searchNotes(q)
+    } catch {
+      searchHits.value = []
+    } finally {
+      searching.value = false
+    }
+  }, 300)
+}
+
+// 服务端片段含 <b> 高亮标记，只放行 <b> 其余转义
+function renderSnippet(s) {
+  return DOMPurify.sanitize(s || '', { ALLOWED_TAGS: ['b'] })
+}
+
+function openHit(h) {
+  searchQ.value = ''
+  searchHits.value = []
+  enterDoc({ id: h.id, kind: 'doc', title: h.title })
+}
 
 function findNode(nodes, id) {
   for (const n of nodes) {
@@ -802,5 +875,51 @@ onMounted(async () => {
   border-color: #409eff;
   color: #409eff;
   background: #ecf5ff;
+}
+
+/* 文档全文搜索 */
+.notes-search {
+  margin-bottom: 10px;
+}
+
+.search-results {
+  min-height: 120px;
+}
+
+.search-hit {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.search-hit:hover {
+  background: #ecf5ff;
+}
+
+.hit-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.hit-snippet {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #909399;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hit-snippet :deep(b) {
+  color: #e6a23c;
+  font-weight: 600;
+}
+
+.search-empty {
+  padding: 30px 0;
+  text-align: center;
+  color: #909399;
+  font-size: 13px;
 }
 </style>

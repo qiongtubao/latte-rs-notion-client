@@ -27,18 +27,21 @@ import TodayView from './views/TodayView.vue'
 import MoneyView from './views/MoneyView.vue'
 import CalendarView from './views/CalendarView.vue'
 import ProjectsView from './views/ProjectsView.vue'
+import NotesView from './views/NotesView.vue'
 
 const viewMap = {
   today: TodayView,
   money: MoneyView,
   calendar: CalendarView,
   projects: ProjectsView,
+  notes: NotesView,
 }
 const LABELS = {
   today: '今日任务',
   money: '金钱',
   calendar: '日历',
   projects: '项目',
+  notes: '知识库',
 }
 
 const currentKey = ref('')

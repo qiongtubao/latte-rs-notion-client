@@ -17,7 +17,7 @@ use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use crate::notion::PulledData;
 use crate::models::{
     Category, DailyEntry, DailyItem, DailyKind, Event, Expense, ExtRecord, Idea, IdeaTag, Note,
-    NoteKind, Project, ProjectStatus, PulledDailyEntry, Tag, Task, TaskPriority,
+    NoteKind, NoteSearchHit, Project, ProjectStatus, PulledDailyEntry, Tag, Task, TaskPriority,
 };
 
 pub struct Db {
@@ -167,6 +167,10 @@ impl Db {
                 notion_page_id TEXT,
                 dirty INTEGER NOT NULL DEFAULT 1,
                 deleted INTEGER NOT NULL DEFAULT 0
+            );
+            -- 知识库全文检索索引（trigram 分词，支持中文任意子串匹配，≥3 字符生效）
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                title, content, note_id UNINDEXED, tokenize = 'trigram'
             );
             CREATE TABLE IF NOT EXISTS ext_records (
                 ns TEXT NOT NULL,
@@ -815,6 +819,7 @@ impl Db {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![id, parent_id, kind.label(), title, content_md, now],
         )?;
+        self.fts_note_upsert(&id, title, content_md)?;
         Ok(Note {
             id,
             parent_id: parent_id.map(str::to_string),
@@ -855,6 +860,103 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    // ---------- 知识库全文检索（notes_fts，trigram） ----------
+
+    /// 写入/刷新某笔记的检索索引（title + content）
+    fn fts_note_upsert(&self, id: &str, title: &str, content: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM notes_fts WHERE note_id = ?1", params![id])?;
+        self.conn.execute(
+            "INSERT INTO notes_fts (title, content, note_id) VALUES (?1, ?2, ?3)",
+            params![title, content, id],
+        )?;
+        Ok(())
+    }
+
+    /// 删除某笔记的检索索引
+    fn fts_note_delete(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM notes_fts WHERE note_id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// 全量重建检索索引（启动时调用，兜底任何漏钩子的写入路径）
+    pub fn rebuild_notes_fts(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM notes_fts", [])?;
+        self.conn.execute(
+            "INSERT INTO notes_fts (title, content, note_id)
+             SELECT title, content_md, id FROM notes WHERE deleted = 0",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// 知识库文档全文搜索：多词 AND；≥3 字符走 trigram FTS，短词回退 LIKE。
+    /// 返回按相关度排序（标题命中权重高于正文）。
+    pub fn search_notes(&self, q: &str, limit: usize) -> Result<Vec<NoteSearchHit>> {
+        let terms: Vec<String> = q
+            .split_whitespace()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if terms.is_empty() {
+            return Ok(vec![]);
+        }
+        // 任何词短于 3 字符时 trigram 无法匹配，整体回退 LIKE（逐词 AND）
+        if terms.iter().any(|t| t.chars().count() < 3) {
+            let cond = terms
+                .iter()
+                .map(|_| "(title LIKE ? OR content_md LIKE ?)")
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let sql = format!(
+                "SELECT id, title, substr(content_md, 1, 80), updated_ts FROM notes
+                 WHERE deleted = 0 AND kind = 'doc' AND {cond}
+                 ORDER BY updated_ts DESC LIMIT {}",
+                limit as i64
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+            for t in &terms {
+                let like = format!("%{t}%");
+                params.push(Box::new(like.clone()));
+                params.push(Box::new(like));
+            }
+            let refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
+            let rows = stmt.query_map(refs.as_slice(), |r| {
+                Ok(NoteSearchHit {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    snippet: r.get(2)?,
+                    updated_ts: r.get(3)?,
+                })
+            })?;
+            return Ok(rows.collect::<rusqlite::Result<_>>()?);
+        }
+        // 每个词加引号转义，空格连接即 AND
+        let matcher = terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id, n.title, snippet(notes_fts, 1, '<b>', '</b>', '…', 18), n.updated_ts
+             FROM notes_fts JOIN notes AS n ON n.id = notes_fts.note_id
+             WHERE notes_fts MATCH ?1 AND n.deleted = 0 AND n.kind = 'doc'
+             ORDER BY bm25(notes_fts, 10.0, 1.0, 0.0)
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![matcher, limit as i64], |r| {
+            Ok(NoteSearchHit {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                snippet: r.get(2)?,
+                updated_ts: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// 部分更新条目；parent_id 传 Some(None) 表示移到根。
     /// 返回是否存在该（未删除）行。有任何字段更新时刷新 updated_ts 并置 dirty。
     pub fn update_note(
@@ -891,7 +993,15 @@ impl Db {
         );
         values.push(Box::new(id.to_string()));
         let refs: Vec<&dyn ToSql> = values.iter().map(|v| v.as_ref()).collect();
-        Ok(self.conn.execute(&sql, refs.as_slice())? > 0)
+        let updated = self.conn.execute(&sql, refs.as_slice())? > 0;
+        // 标题/正文可能变化，刷新检索索引
+        if updated
+            && (title.is_some() || content_md.is_some())
+            && let Some(n) = self.get_note(id)?
+        {
+            self.fts_note_upsert(&n.id, &n.title, &n.content_md)?;
+        }
+        Ok(updated)
     }
 
     /// 把 note_id 移到 new_parent_id 下是否会成环（沿 new_parent 的祖先链查找 note_id）
@@ -936,6 +1046,7 @@ impl Db {
         }
         for nid in all {
             self.soft_or_hard_delete("notes", &nid)?;
+            self.fts_note_delete(&nid)?;
         }
         Ok(())
     }
@@ -2000,6 +2111,7 @@ impl Db {
                 "ext_records",
                 "daily_entries",
                 "daily_items",
+                "notes_fts",
             ] {
                 let sql = format!("DELETE FROM {table}");
                 self.conn.execute(&sql, [])?;
@@ -2209,14 +2321,14 @@ impl Db {
         let Some(pid) = n.notion_page_id.as_deref() else {
             return Ok(UpsertKind::NoPageId);
         };
-        match self.row_id_dirty_by_page_id("notes", pid)? {
-            Some((_, true)) => Ok(UpsertKind::SkippedDirty),
+        let kind = match self.row_id_dirty_by_page_id("notes", pid)? {
+            Some((_, true)) => UpsertKind::SkippedDirty,
             Some((id, false)) => {
                 self.conn.execute(
                     "UPDATE notes SET kind=?2, title=?3, content_md=?4, created_ts=?5, updated_ts=?6 WHERE id=?1",
                     params![id, n.kind.label(), n.title, n.content_md, n.created_ts, n.updated_ts],
                 )?;
-                Ok(UpsertKind::Updated)
+                UpsertKind::Updated
             }
             None => {
                 self.conn.execute(
@@ -2224,9 +2336,21 @@ impl Db {
                      VALUES (?1,NULL,?2,?3,?4,?5,?6,?7,0,0)",
                     params![n.id, n.kind.label(), n.title, n.content_md, n.created_ts, n.updated_ts, pid],
                 )?;
-                Ok(UpsertKind::Inserted)
+                UpsertKind::Inserted
             }
+        };
+        // 远端拉取的内容变化同步进检索索引
+        match kind {
+            UpsertKind::Inserted | UpsertKind::Updated => {
+                if n.deleted {
+                    self.fts_note_delete(&n.id)?;
+                } else {
+                    self.fts_note_upsert(&n.id, &n.title, &n.content_md)?;
+                }
+            }
+            _ => {}
         }
+        Ok(kind)
     }
 
     /// 增量拉取第二阶段：按解析出的本地 parent_id 回填（仅未 dirty 的行）
@@ -2661,6 +2785,49 @@ mod tests {
         assert_eq!(due[0].content, "到点提醒");
         // start_ts > now 不提前发
         assert!(db.due_reminders(100, 299).unwrap().is_empty());
+    }
+
+    #[test]
+    fn notes_fts_search() {
+        let db = Db::in_memory().unwrap();
+        let now = 1000;
+        let a = db
+            .add_note(None, NoteKind::Doc, "Rust 学习笔记", "所有权和借用是 Rust 的核心概念", now)
+            .unwrap();
+        let b = db
+            .add_note(None, NoteKind::Doc, "菜谱记录", "番茄炒蛋的做法很简单", now)
+            .unwrap();
+        let _dir = db.add_note(None, NoteKind::Dir, "工作文档", "", now).unwrap();
+
+        // 中文子串（≥3 字符，走 trigram FTS）：正文命中
+        let hits = db.search_notes("所有权", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a.id);
+        assert!(hits[0].snippet.contains("<b>"));
+        // 标题命中
+        let hits = db.search_notes("菜谱", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, b.id);
+        // 多词 AND：同时含两个词的才命中
+        assert!(db.search_notes("番茄 简单", 10).unwrap().len() == 1);
+        assert!(db.search_notes("番茄 所有权", 10).unwrap().is_empty());
+        // 短词回退 LIKE
+        let hits = db.search_notes("菜谱", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        // 目录不命中（只搜 doc）
+        assert!(db.search_notes("工作文档", 10).unwrap().is_empty());
+
+        // 更新后索引刷新
+        db.update_note(&a.id, Some("Rust 进阶"), None, None, now + 1)
+            .unwrap();
+        assert!(db.search_notes("进阶", 10).unwrap().len() == 1);
+        // 删除后不再命中
+        db.delete_note_recursive(&b.id).unwrap();
+        assert!(db.search_notes("番茄", 10).unwrap().is_empty());
+
+        // 全量重建兜底
+        db.rebuild_notes_fts().unwrap();
+        assert_eq!(db.search_notes("所有权", 10).unwrap().len(), 1);
     }
 
     #[test]

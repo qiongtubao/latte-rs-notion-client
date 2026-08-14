@@ -21,7 +21,7 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 const SERVER_URL: &str = "http://127.0.0.1:3210";
 /// 悬浮球 key 列表（与前端 PopupApp 的 viewMap 一一对应）
-const BALL_KEYS: [&str; 4] = ["today", "money", "calendar", "projects"];
+const BALL_KEYS: [&str; 5] = ["today", "money", "calendar", "projects", "notes"];
 /// 弹窗尺寸（逻辑像素）
 const POPUP_W: f64 = 440.0;
 const POPUP_H: f64 = 560.0;
