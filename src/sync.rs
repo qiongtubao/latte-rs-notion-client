@@ -992,6 +992,9 @@ pub async fn sync_loop(
                     // 增量钩子覆盖不了所有路径；索引表小（知识库量级），整表重建最稳
                     if let Ok(g) = db.lock() {
                         let _ = g.rebuild_notes_fts();
+                        if let Ok(notes) = g.all_notes() {
+                            crate::docgraph::export_notes_logged(&notes);
+                        }
                     }
                 }
                 if let Ok(mut s) = status.lock() {

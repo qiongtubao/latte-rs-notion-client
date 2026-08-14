@@ -7,6 +7,7 @@ pub mod ai;
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod docgraph;
 pub mod models;
 pub mod notion;
 pub mod report;

@@ -17,7 +17,7 @@ UI 为**心流工作空间**风格：今日任务为主视图（按钮旁常驻�
 - **日历**：月视图（周一起始），每格显示当日碎片总时长与消费额；点击日期打开 **24 小时时间线**：碎片按真实起止渲染为色块（按标签着色），进行中事件脉冲延伸，今天有当前时刻指示线；点击时间线空白处可直接**补录/安排事件**（支持「到点提醒」，浏览器系统通知）；**图片识别**：上传日程截图，AI 自动抽取事件，可编辑确认后批量入库。
 - **项目**：看板视图（暂存/待办/进行中/已完成/暂停 5 列），拖拽卡片改状态；甘特图视图按开始/截止日期展示时间跨度，未排期项目虚线占位。
 - **好想法**：快速输入（Ctrl+Enter 收集）+ 瀑布流卡片墙，支持置顶、标签（灵感/待办/读书/问题/其他）筛选、编辑/删除；同步到 Notion「好想法」database（首次有条目时自动创建）。
-- **知识库**：总览页卡片展示所有知识库 + 创建入口；进入后左侧目录树（无限层级、拖拽移动）、右侧 Markdown 显示/编辑（Ctrl+S 保存）。顶部**文档全文搜索**：本地 SQLite trigram FTS 索引（增量拉取远端后随写入即时更新、启动时全量重建兜底），中文子串、多词 AND、标题优先排序，点击结果直达文档。Notion 端镜像为「📚 知识库」根页下的嵌套子页面。
+- **知识库**：总览页卡片展示所有知识库 + 创建入口；进入后左侧目录树（无限层级、拖拽移动）、右侧 Markdown 显示/编辑（Ctrl+S 保存）。顶部**文档全文搜索**（双引擎）：① 本地 SQLite trigram FTS 直接命中（中文子串、多词 AND、标题优先）；② **图谱扩展**——笔记树同步物化为 [latte-doc-review-graph](../latte-rs-doc-graph) 工作区（`~/.config/latte/docgraph/docs`，目录树即 wikilink 图边），TF-IDF 召回 + 图扩展给出「相关文档」，即使不含关键词。Notion 端镜像为「📚 知识库」根页下的嵌套子页面。
 - **对外 API**：`/api/ext/{命名空间}/records` 通用记录接口（Bearer token 鉴权），供其他本地应用（如 latte-rs-agents）把任务/文档数据经 Latte 同步进 Notion，详见下文。
 - **Notion 同步**：首次配置时自动在指定父页面下创建 3 个 database + 知识库根页，此后所有增删改自动同步（删除 = Notion 端归档；`remind` 提醒标记仅存本地不同步）。顶栏显示同步状态，可手动「立即同步」。
 
@@ -129,7 +129,7 @@ latte/                  # 根 crate（Web 入口 + 核心库）
 | `GET/POST /api/projects` · `PUT/DELETE /api/projects/:id` | 项目 |
 | `GET/POST /api/ideas` · `PUT/DELETE /api/ideas/:id` | 好想法卡片 |
 | `GET /api/notes/tree` · `POST /api/notes` · `GET/PUT/DELETE /api/notes/:id` | 知识库（无限层级目录/文档） |
-| `GET /api/notes/search?q=` | 知识库文档全文搜索（本地 trigram FTS 索引 + 短词 LIKE 兜底） |
+| `GET /api/notes/search?q=` | 知识库文档搜索：`hits` = trigram FTS 直接命中（短词 LIKE 兜底），`related` = doc-graph 图谱扩展 |
 | `PUT /api/ext/{ns}/records/{id}` · `GET /api/ext/{ns}/records(/:id)` · `DELETE /api/ext/{ns}/records/{id}` | 通用记录（需 Bearer token） |
 | `POST /api/sync` | 立即同步 |
 

@@ -2611,6 +2611,10 @@ impl Db {
                 self.conn.execute_batch("COMMIT")?;
                 // 全量替换会整批改写行 id，检索索引随之整表重建
                 self.rebuild_notes_fts()?;
+                // docgraph 工作区同步物化（供图谱搜索）
+                if let Ok(notes) = self.all_notes() {
+                    crate::docgraph::export_notes_logged(&notes);
+                }
                 Ok(c)
             }
             Err(e) => {

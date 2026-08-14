@@ -18,6 +18,8 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["full"] }
 notify-rust = "4"
 toml = "1.1.4"
+# 知识库图谱搜索（文档图谱：TF-IDF 召回 + wikilink 图扩展）
+latte-doc-review-graph = { path = "../latte-rs-doc-graph" }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 

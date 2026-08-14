@@ -2012,7 +2012,8 @@ async fn notes_tree(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(Value::Array(note_tree_level(&notes, None))))
 }
 
-/// 知识库文档全文搜索：?q=关键词（多词 AND，trigram FTS + 短词 LIKE 兜底）
+/// 知识库文档全文搜索：?q=关键词（多词 AND，trigram FTS + 短词 LIKE 兜底）。
+/// 返回 { hits: 直接命中, related: 图谱扩展（doc-graph，不含已在 hits 中的） }
 async fn search_notes(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
@@ -2024,6 +2025,7 @@ async fn search_notes(
     let hits = lock_db(&state)?
         .search_notes(kw, 20)
         .map_err(ApiError::internal)?;
+    let hit_ids: std::collections::HashSet<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     let list: Vec<Value> = hits
         .iter()
         .map(|h| {
@@ -2035,7 +2037,20 @@ async fn search_notes(
             })
         })
         .collect();
-    Ok(Json(Value::Array(list)))
+    // 图谱扩展：doc-graph（TF-IDF 召回 + wikilink 图扩展），失败降级为空
+    let related: Vec<Value> = crate::docgraph::related_docs(kw, 8)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.note_id.as_deref().is_some_and(|id| !hit_ids.contains(id)))
+        .map(|r| {
+            json!({
+                "id": r.note_id,
+                "title": r.title,
+                "score": r.score,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "hits": list, "related": related })))
 }
 
 async fn get_note(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -2088,6 +2103,9 @@ async fn add_note(
             now,
         )
         .map_err(ApiError::internal)?;
+    if let Ok(notes) = db.all_notes() {
+        crate::docgraph::export_notes_logged(&notes);
+    }
     Ok(Json(note_json(&note)))
 }
 
@@ -2137,6 +2155,9 @@ async fn update_note(
         .get_note(&id)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("知识库条目不存在"))?;
+    if let Ok(notes) = db.all_notes() {
+        crate::docgraph::export_notes_logged(&notes);
+    }
     Ok(Json(note_json(&note)))
 }
 
@@ -2150,6 +2171,9 @@ async fn delete_note(
         return Err(ApiError::not_found("知识库条目不存在"));
     }
     db.delete_note_recursive(&id).map_err(ApiError::internal)?;
+    if let Ok(notes) = db.all_notes() {
+        crate::docgraph::export_notes_logged(&notes);
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -3836,16 +3860,18 @@ mod tests {
         // 正文命中（trigram FTS）
         let (code, body) = call(&state, "GET", "/api/notes/search?q=所有权", None).await;
         assert_eq!(code, StatusCode::OK);
-        let hits = body.as_array().unwrap();
+        let hits = body["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["id"], doc_id);
         assert_eq!(hits[0]["title"], "Rust 学习笔记");
         assert!(hits[0]["snippet"].as_str().unwrap().contains("<b>"));
+        // 图谱扩展字段存在（未建工作区时为空数组）
+        assert!(body["related"].is_array());
 
         // 短词 LIKE 兜底
         let (code, body) = call(&state, "GET", "/api/notes/search?q=番茄", None).await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body["hits"].as_array().unwrap().len(), 1);
 
         // 空 q → 400
         let (code, _) = call(&state, "GET", "/api/notes/search?q=", None).await;

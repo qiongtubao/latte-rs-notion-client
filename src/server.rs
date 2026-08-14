@@ -62,6 +62,9 @@ pub fn build_state(
     let db = Db::open(db_path).context("打开本地数据库失败")?;
     // 重建知识库全文索引（兜底漏钩子的历史数据；表小，重建开销可忽略）
     db.rebuild_notes_fts().context("重建知识库检索索引失败")?;
+    if let Ok(notes) = db.all_notes() {
+        crate::docgraph::export_notes_logged(&notes);
+    }
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         client: Arc::new(NotionClient::new(cfg.token.clone())),

@@ -28,6 +28,17 @@
       <div v-if="!searching && searchHits.length === 0" class="search-empty">
         没有匹配的文档
       </div>
+      <template v-if="!searching && relatedDocs.length > 0">
+        <div class="related-header">相关文档（图谱）</div>
+        <div
+          v-for="r in relatedDocs"
+          :key="r.id"
+          class="search-hit related-hit"
+          @click="openHit(r)"
+        >
+          <div class="hit-title">{{ r.title }}</div>
+        </div>
+      </template>
     </div>
 
     <template v-if="!searchActive">
@@ -265,6 +276,7 @@ const rendered = computed(() => {
 
 const searchQ = ref('')
 const searchHits = ref([])
+const relatedDocs = ref([])
 const searching = ref(false)
 const searchActive = computed(() => searchQ.value.trim().length > 0)
 let searchTimer = null
@@ -274,6 +286,7 @@ function onSearchInput() {
   const q = searchQ.value.trim()
   if (!q) {
     searchHits.value = []
+    relatedDocs.value = []
     searching.value = false
     return
   }
@@ -281,9 +294,12 @@ function onSearchInput() {
   // 300ms 防抖
   searchTimer = setTimeout(async () => {
     try {
-      searchHits.value = await api.searchNotes(q)
+      const res = await api.searchNotes(q)
+      searchHits.value = res.hits || []
+      relatedDocs.value = res.related || []
     } catch {
       searchHits.value = []
+      relatedDocs.value = []
     } finally {
       searching.value = false
     }
@@ -921,5 +937,17 @@ onMounted(async () => {
   text-align: center;
   color: #909399;
   font-size: 13px;
+}
+
+.related-header {
+  margin: 14px 0 4px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: #909399;
+}
+
+.related-hit .hit-title {
+  color: #606266;
+  font-weight: 500;
 }
 </style>
