@@ -979,4 +979,31 @@ html.dark .panel-title { color: #e0e0e0; }
 html.dark .qe-preview { background: #1f1f1f; border-color: #3a3a3a; }
 html.dark .qe-k { color: #888; }
 html.dark .empty-icon { color: #555; }
+
+/* 知识库：dock 精简版（NoteList）+ 完整面板（NotesView）的文档与目录暗色 */
+html.dark .nte-title,
+html.dark .nte-doc-title { color: #e0e0e0; }
+html.dark .nte-doc-header { border-bottom-color: #3a3a3a; }
+html.dark .nte-tree { border-right-color: #3a3a3a; }
+html.dark .nte-node { color: #c0c4cc; }
+html.dark .nte-node:hover { background: #363636; }
+html.dark .nte-node.active { background: #1d3043; color: #66b1ff; }
+html.dark .ntl-empty { border-color: #4a4a4a; }
+html.dark .md-body,
+html.dark .markdown-body { color: #d4d4d4; }
+html.dark .md-body code,
+html.dark .markdown-body code { background: #3d3d3d; color: #e0e0e0; }
+html.dark .md-body pre,
+html.dark .markdown-body pre { background: #1f1f1f; }
+html.dark .md-body pre code,
+html.dark .markdown-body pre code { background: none; }
+html.dark .md-body blockquote,
+html.dark .markdown-body blockquote { color: #909399; border-left-color: #4a4a4a; }
+html.dark .md-body th, html.dark .md-body td,
+html.dark .markdown-body th, html.dark .markdown-body td { border-color: #4a4a4a; }
+/* 知识库右键菜单（Teleport 到 body） */
+html.dark .nte-ctxmenu { background: #2a2a2a; border-color: #3a3a3a; }
+html.dark .nte-ctx-title { border-bottom-color: #3a3a3a; }
+html.dark .nte-ctx-item { color: #d4d4d4; }
+html.dark .nte-ctx-item:hover { background: #1d3043; color: #66b1ff; }
 </style>
