@@ -227,6 +227,7 @@ import DailyView from './views/DailyView.vue'
 import ReportView from './views/ReportView.vue'
 import FloatingButton from './components/FloatingButton.vue'
 import TodayTaskList from './components/TodayTaskList.vue'
+import MoneyExpenseList from './components/MoneyExpenseList.vue'
 import CalendarDayList from './components/CalendarDayList.vue'
 import ProjectList from './components/ProjectList.vue'
 import NoteList from './components/NoteList.vue'
@@ -291,6 +292,19 @@ function subActionHandler(key, action) {
   //   今日任务 - 添加/排序/完成/计时（「报表」走面板）
   //   金钱     - 记一笔（「统计」走面板）
   //   项目     - 看板/甘特（dock 内切换视图）
+  const PANEL_ACTIONS = { today: ['report'], money: ['summary'] }
+  const fire = () => {
+    // 每次赋新对象，保证连续点同一动作也能触发各列表的 watch
+    subAction.value = { key, action }
+  }
+  if ((PANEL_ACTIONS[key] || []).includes(action)) {
+    const fb = floatButtons.value.find((b) => b.key === key)
+    if (fb && activePanel.value !== key) openPanel(fb)
+    // 等面板视图挂载后再下发，否则 watch 收不到
+    nextTick(fire)
+  } else {
+    fire()
+  }
 }
 
 const AI_PANEL_META = {
@@ -395,16 +409,18 @@ function onFloatToggle(fb, opened) {
   // 展开/收起子按钮时，对应精简列表同步显示/隐藏
   if (fb.key in dockOpen) dockOpen[fb.key] = opened
 }
-function makeDockStyle(pos) {
+function makeDockStyle(pos, width = 320) {
   // 面板顶边与按钮顶对齐，并夹在可视区域内
   const top = Math.max(60, Math.min(pos.y - 28, window.innerHeight - 440))
-  return { left: pos.x + 90 + 'px', top: top + 'px' }
+  // 宽面板（项目/知识库）左移，防止超出右边缘
+  const left = Math.max(8, Math.min(pos.x + 90, window.innerWidth - width - 16))
+  return { left: left + 'px', top: top + 'px' }
 }
 const todayDockStyle = computed(() => makeDockStyle(dockPos.today))
 const moneyDockStyle = computed(() => makeDockStyle(dockPos.money))
 const calendarDockStyle = computed(() => makeDockStyle(dockPos.calendar))
-const projectsDockStyle = computed(() => makeDockStyle(dockPos.projects))
-const notesDockStyle = computed(() => makeDockStyle(dockPos.notes))
+const projectsDockStyle = computed(() => makeDockStyle(dockPos.projects, 640))
+const notesDockStyle = computed(() => makeDockStyle(dockPos.notes, 860))
 const ideasDockStyle = computed(() => makeDockStyle(dockPos.ideas))
 
 function openPanel(fb) {
@@ -887,6 +903,13 @@ onUnmounted(() => {
   border-radius: 10px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.08);
   padding: 12px 16px;
+}
+/* 项目（看板/甘特）与知识库（目录+编辑器）需要更宽 */
+.today-dock.dock-wide {
+  width: min(640px, calc(100vw - 32px));
+}
+.today-dock.dock-notes {
+  width: min(860px, calc(100vw - 32px));
 }
 .empty-bg {
   width: min(860px, 92vw);

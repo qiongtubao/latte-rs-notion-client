@@ -11,7 +11,7 @@
       </span>
     </div>
 
-    <!-- 内联记一笔：点子按钮「记一笔」出现 -->
+    <!-- 内联记一笔：点子按钮「记一笔」出现；dock 宽度有限，分两行排布 -->
     <div v-if="showAdd" class="mel-add">
       <el-input
         ref="addInputRef"
@@ -21,20 +21,22 @@
         @keyup.enter="quickAdd"
         @keyup.esc="showAdd = false"
       />
-      <el-input-number
-        v-model="newAmount"
-        size="small"
-        :min="0"
-        :precision="2"
-        :step="5"
-        controls-position="right"
-        style="width: 96px"
-        @keyup.enter="quickAdd"
-      />
-      <el-select v-model="newCategory" size="small" style="width: 84px">
-        <el-option v-for="c in CATEGORIES" :key="c" :label="c" :value="c" />
-      </el-select>
-      <el-button size="small" type="primary" :loading="adding" @click="quickAdd">记</el-button>
+      <div class="mel-addrow">
+        <el-input-number
+          v-model="newAmount"
+          size="small"
+          :min="0"
+          :precision="2"
+          :step="5"
+          controls-position="right"
+          style="flex: 1; min-width: 0"
+          @keyup.enter="quickAdd"
+        />
+        <el-select v-model="newCategory" size="small" style="width: 96px; flex-shrink: 0">
+          <el-option v-for="c in CATEGORIES" :key="c" :label="c" :value="c" />
+        </el-select>
+        <el-button size="small" type="primary" :loading="adding" @click="quickAdd">记</el-button>
+      </div>
     </div>
 
     <!-- 空态 -->
@@ -188,8 +190,13 @@ onMounted(load)
 }
 .mel-add {
   display: flex;
+  flex-direction: column;
   gap: 6px;
   margin-bottom: 8px;
+}
+.mel-addrow {
+  display: flex;
+  gap: 6px;
 }
 .mel-empty {
   border: 1px dashed #dcdfe6;
