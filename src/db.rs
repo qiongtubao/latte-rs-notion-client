@@ -2321,14 +2321,14 @@ impl Db {
         let Some(pid) = n.notion_page_id.as_deref() else {
             return Ok(UpsertKind::NoPageId);
         };
-        let kind = match self.row_id_dirty_by_page_id("notes", pid)? {
-            Some((_, true)) => UpsertKind::SkippedDirty,
+        let (kind, local_id) = match self.row_id_dirty_by_page_id("notes", pid)? {
+            Some((_, true)) => (UpsertKind::SkippedDirty, None),
             Some((id, false)) => {
                 self.conn.execute(
                     "UPDATE notes SET kind=?2, title=?3, content_md=?4, created_ts=?5, updated_ts=?6 WHERE id=?1",
                     params![id, n.kind.label(), n.title, n.content_md, n.created_ts, n.updated_ts],
                 )?;
-                UpsertKind::Updated
+                (UpsertKind::Updated, Some(id))
             }
             None => {
                 self.conn.execute(
@@ -2336,19 +2336,18 @@ impl Db {
                      VALUES (?1,NULL,?2,?3,?4,?5,?6,?7,0,0)",
                     params![n.id, n.kind.label(), n.title, n.content_md, n.created_ts, n.updated_ts, pid],
                 )?;
-                UpsertKind::Inserted
+                (UpsertKind::Inserted, Some(n.id.clone()))
             }
         };
-        // 远端拉取的内容变化同步进检索索引
-        match kind {
-            UpsertKind::Inserted | UpsertKind::Updated => {
-                if n.deleted {
-                    self.fts_note_delete(&n.id)?;
-                } else {
-                    self.fts_note_upsert(&n.id, &n.title, &n.content_md)?;
-                }
+        // 远端拉取的内容变化同步进检索索引。
+        // 注意：拉取解析出的 n.id 是新生成的，本地行沿用旧 id，
+        // 索引必须按「实际落库的本地 id」写入，否则 JOIN 不上
+        if let Some(local_id) = local_id {
+            if n.deleted {
+                self.fts_note_delete(&local_id)?;
+            } else {
+                self.fts_note_upsert(&local_id, &n.title, &n.content_md)?;
             }
-            _ => {}
         }
         Ok(kind)
     }
@@ -2938,6 +2937,35 @@ mod tests {
         let child_local = db.note_id_by_page_id("np-child").unwrap().unwrap();
         let child = db.get_note(&child_local).unwrap().unwrap();
         assert_eq!(child.parent_id.as_deref(), Some(parent_local.as_str()));
+    }
+
+    #[test]
+    fn upsert_pulled_note_fts_uses_local_id() {
+        let db = Db::in_memory().unwrap();
+        let note = |title: &str, content: &str| Note {
+            // 拉取解析每次都生成新 id（本地行不会跟着换 id）
+            id: Uuid::new_v4().to_string(),
+            parent_id: None,
+            kind: crate::models::NoteKind::Doc,
+            title: title.into(),
+            content_md: content.into(),
+            created_ts: 100,
+            updated_ts: 100,
+            notion_page_id: Some("np-1".into()),
+            dirty: false,
+            deleted: false,
+        };
+        assert_eq!(
+            db.upsert_pulled_note(&note("内存碎片", "什么是内存碎片")).unwrap(),
+            UpsertKind::Inserted
+        );
+        // 同 page 再拉一次（新 n.id）：本地行沿用旧 id，索引必须仍能命中
+        assert_eq!(
+            db.upsert_pulled_note(&note("内存碎片", "什么是内存碎片")).unwrap(),
+            UpsertKind::Updated
+        );
+        let hits = db.search_notes("内存碎片", 10).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
