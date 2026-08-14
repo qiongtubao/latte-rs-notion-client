@@ -988,6 +988,11 @@ pub async fn sync_loop(
                     let outcome = sync_once(&db, &client, &cfg).await;
                     last_error = outcome.error;
                     last_sync = Some(Local::now().to_rfc3339());
+                    // 同步后重建知识库检索索引：拉取/重导可能整批改写行 id，
+                    // 增量钩子覆盖不了所有路径；索引表小（知识库量级），整表重建最稳
+                    if let Ok(g) = db.lock() {
+                        let _ = g.rebuild_notes_fts();
+                    }
                 }
                 if let Ok(mut s) = status.lock() {
                     if let Some(t) = last_sync {
