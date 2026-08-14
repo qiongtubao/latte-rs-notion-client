@@ -34,6 +34,10 @@ if (opaque) {
   document.body.style.setProperty('background', meta.value.color, 'important')
 }
 
+// 原生输入接管模式（Linux X11：xrdp 等环境 webview 收不到鼠标按键，
+// 由壳通过 ?native_input=1 下发）：点击/拖拽由壳在 X11 层处理，前端不再处理
+const nativeInput = new URLSearchParams(location.search).has('native_input')
+
 const win = getCurrentWindow()
 const DRAG_THRESHOLD = 4 // px，超过才算拖拽，避免手抖吞掉点击
 
@@ -42,7 +46,7 @@ let downY = 0
 let dragging = false
 
 function onDown(e) {
-  if (e.button !== 0) return
+  if (e.button !== 0 || nativeInput) return
   downX = e.clientX
   downY = e.clientY
   dragging = false
@@ -100,18 +104,21 @@ html, body {
   transform: scale(1.08);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
-/* 不透明模式：整窗一块圆角色块（body 已刷成球色，直接铺满窗口，图标随窗口缩放） */
+/* 不透明模式：整窗铺满同色（配合壳的 X Shape 圆形裁剪成正圆球）；
+   不要阴影/圆角，否则裁剪后会在圆内留下一条暗边 */
 .ball.opaque {
-  width: 100%;
-  height: 100%;
+  width: 100vw;
+  height: 100vh;
   margin: 0;
-  border-radius: 12px;
+  border-radius: 0;
+  box-shadow: none;
 }
 .ball.opaque .ball-icon {
-  font-size: max(20px, 28vmin);
+  font-size: 24px;
 }
 .ball.opaque:hover {
   transform: none;
+  box-shadow: none;
 }
 .ball-icon {
   font-size: 20px;

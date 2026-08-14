@@ -26,3 +26,6 @@ tauri-plugin-log = "2"
 latte = { path = ".." }
 tokio = { version = "1", features = ["full"] }
 tauri-plugin-global-shortcut = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["shape", "xinput"] }

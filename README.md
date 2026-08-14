@@ -84,7 +84,8 @@ CI=false cargo tauri build
 - 启动后主窗口默认不弹出，程序驻留**系统托盘**（菜单：打开主窗口 / 退出）；主窗口关闭按钮仅隐藏不退出，提醒与同步照常运行。
 - 屏幕右边缘有 4 个**悬浮球**（今日任务/金钱/日历/项目），可拖拽换位（位置自动记住），点击在球旁弹出对应功能的**快捷弹窗**；再点一次同球或弹窗右上角关闭。
 - 全局快捷键 **Alt+Q** 随时唤起主窗口并触发快速录入；可在 `~/.config/latte/config.toml` 改 `global_shortcut` 字段（如 `Ctrl+Shift+L`）。
-- 悬浮球样式：Wayland/macOS 为透明圆球；Linux X11 默认不透明圆角色块（X11 下无法可靠判断合成器是否真的混合 ARGB——xrdp/软渲染等场景透明窗口会退化成白方块，故保守取不透明）。确认合成器正常时可在 `~/.config/latte/config.toml` 设 `ball_transparent = true` 恢复透明圆球。
+- 悬浮球样式：Wayland/macOS 为透明圆球；Linux X11 默认用 X Shape 扩展把窗口直接裁成**正圆球**（不透明但真圆形，不依赖合成器——xrdp/软渲染等场景透明窗口会退化成白方块，故不用透明方案）。确认合成器正常时也可在 `~/.config/latte/config.toml` 设 `ball_transparent = true` 改用透明圆球。
+- X11 下悬浮球的点击/拖拽由壳在 X11 层原生接管（监听 XI2 raw 事件，命中球窗几何直接触发弹窗/拖拽），绕过了 xrdp 等环境 wry webview 丢失鼠标按键的已知问题；弹窗内部仍走 webview，在这类环境下弹窗内按钮可能无法点击（弹窗内容仅供查看），正常桌面环境不受影响。
 
 ### Workspace 结构
 
