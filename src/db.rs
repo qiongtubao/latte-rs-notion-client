@@ -243,8 +243,6 @@ impl Db {
                 created_ts INTEGER NOT NULL,
                 UNIQUE(item_id, date)
             );
-            CREATE INDEX IF NOT EXISTS idx_daily_items_remind
-                ON daily_items(remind_at) WHERE remind_at IS NOT NULL;
         ",
         )?;
         self.migrate()?;
@@ -276,6 +274,11 @@ impl Db {
                 .execute("UPDATE notes SET notion_page_id = NULL, dirty = 1", []);
             self.conn.execute_batch("PRAGMA user_version = 1")?;
         }
+        // 索引依赖 remind_at 列，必须放在补列之后创建（旧库 add_column 前该列不存在）
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_daily_items_remind
+                ON daily_items(remind_at) WHERE remind_at IS NOT NULL;",
+        )?;
         Ok(())
     }
 
@@ -3111,6 +3114,41 @@ mod tests {
         assert_eq!(db.pending_count().unwrap(), 1);
         db.delete_note_recursive(&dir.id).unwrap();
         assert_eq!(db.pending_count().unwrap(), 0);
+        drop(db);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn old_db_daily_items_without_remind_columns_opens_and_indexes() {
+        // 复现 regression：旧库的 daily_items 无 remind_at/remind_days 列，
+        // 若在补列之前创建索引会报 "no such column: remind_at"。
+        let path = std::env::temp_dir().join(format!("latte-test-{}.db", Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_items (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK (kind IN ('打卡','记录')),
+                    name TEXT NOT NULL,
+                    unit TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    created_ts INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        // 打开应成功（migrate 先补列再建索引），且索引真实存在
+        let db = Db::open(&path).unwrap();
+        let idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_daily_items_remind'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "提醒索引应已创建");
         drop(db);
         std::fs::remove_file(&path).ok();
     }

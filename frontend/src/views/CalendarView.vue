@@ -42,7 +42,8 @@
             <el-button size="small" @click="shiftDay(1)">→</el-button>
           </el-button-group>
           <span class="drawer-title">{{ selectedDate }} {{ weekdayLabel }}</span>
-          <el-button size="small" class="ai-btn" @click="openAi">图片识别</el-button>
+          <el-button size="small" type="primary" class="add-btn" @click="openCreate">添加事件</el-button>
+          <el-button size="small" @click="openAi">图片识别</el-button>
         </div>
       </template>
 
@@ -337,6 +338,23 @@ function onTrackHover(e) {
   const rect = e.currentTarget.getBoundingClientRect()
   const snapped = yToSnappedMinutes(e.clientY - rect.top)
   hoverTop.value = (snapped / 1440) * TOTAL_H
+}
+
+// 「添加事件」按钮：默认开始时间为当天当前时刻的下一整点（非今天则 9:00），时长 1 小时
+function openCreate() {
+  const { start } = dayBounds.value
+  const now = dayjs().unix()
+  const startTs =
+    selectedDate.value === todayStr
+      ? Math.min(start + 82800, Math.ceil(now / 3600) * 3600)
+      : start + 9 * 3600
+  editingId.value = null
+  createForm.start_ts = String(startTs)
+  createForm.end_ts = String(startTs + 3600)
+  createForm.content = ''
+  createForm.tag = '工作'
+  createForm.remind = false
+  createDialog.value = true
 }
 
 function onTrackClick(e) {
@@ -706,7 +724,7 @@ onUnmounted(() => clearInterval(nowTimer))
   font-weight: 600;
 }
 
-.ai-btn {
+.add-btn {
   margin-left: auto;
 }
 

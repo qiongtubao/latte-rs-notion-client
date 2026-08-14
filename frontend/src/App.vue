@@ -212,7 +212,7 @@
 </template>
 
 <script setup>
-import { computed, inject, nextTick, onMounted, onUnmounted, provide, reactive, ref, watch } from 'vue'
+import { computed, inject, markRaw, nextTick, onMounted, onUnmounted, provide, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from './api'
 import { Bell, BellFilled, Close, Loading, Moon, Refresh, Sunny, Warning } from '@element-plus/icons-vue'
