@@ -236,26 +236,23 @@ fn native_ball_input_loop(app: tauri::AppHandle) -> Result<(), Box<dyn std::erro
     let name_atom = conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
     let my_pid = std::process::id();
     const DRAG_THRESHOLD: f64 = 8.0;
-    // 左键按下状态：Some((球 key, 按下 x, y, 是否已转为拖拽))
-    let mut pressed: Option<(String, f64, f64, bool)> = None;
+    // 左键按下状态：Some((命中的球 key[可空], 按下 x, y, 是否已转为拖拽))
+    let mut pressed: Option<(Option<String>, f64, f64, bool)> = None;
 
     loop {
         match conn.wait_for_event()? {
             Event::XinputRawButtonPress(e) if e.detail == 1 => {
                 let pt = xinput::xi_query_pointer(&conn, root, e.deviceid)?.reply()?;
                 let (px, py) = (fp(pt.root_x), fp(pt.root_y));
-                if let Some(key) =
-                    hit_ball(&conn, root, pid_atom, name_atom, my_pid, px, py)
-                {
-                    pressed = Some((key, px, py, false));
-                }
+                let key = hit_ball(&conn, root, pid_atom, name_atom, my_pid, px, py);
+                pressed = Some((key, px, py, false));
             }
             Event::XinputRawMotion(e) => {
-                if let Some((key, x0, y0, false)) = pressed.clone() {
+                if let Some((Some(key), x0, y0, false)) = pressed.clone() {
                     let pt = xinput::xi_query_pointer(&conn, root, e.deviceid)?.reply()?;
                     let (px, py) = (fp(pt.root_x), fp(pt.root_y));
                     if (px - x0).hypot(py - y0) > DRAG_THRESHOLD {
-                        pressed = Some((key.clone(), x0, y0, true));
+                        pressed = Some((Some(key.clone()), x0, y0, true));
                         let app2 = app.clone();
                         let _ = app.run_on_main_thread(move || {
                             if let Some(w) = app2.get_webview_window(&format!("ball-{key}")) {
@@ -266,11 +263,39 @@ fn native_ball_input_loop(app: tauri::AppHandle) -> Result<(), Box<dyn std::erro
                 }
             }
             Event::XinputRawButtonRelease(e) if e.detail == 1 => {
-                if let Some((key, _, _, false)) = pressed.take() {
-                    let app2 = app.clone();
-                    let _ = app.run_on_main_thread(move || {
-                        let _ = toggle_popup(app2, key);
-                    });
+                let Some((key, x0, y0, dragged)) = pressed.take() else {
+                    continue;
+                };
+                if dragged {
+                    continue;
+                }
+                match key {
+                    // 球上松开：切换弹窗
+                    Some(key) => {
+                        let app2 = app.clone();
+                        let _ = app.run_on_main_thread(move || {
+                            let _ = toggle_popup(app2, key);
+                        });
+                    }
+                    // 弹窗头部操作区松开（按下点也在同一区内才算点击）：
+                    // 右上角 = 关闭，其次 = 打开主窗口
+                    None => {
+                        let pt = xinput::xi_query_pointer(&conn, root, e.deviceid)?.reply()?;
+                        let (px, py) = (fp(pt.root_x), fp(pt.root_y));
+                        let zone_at = |qx: f64, qy: f64| {
+                            hit_popup_chrome(&conn, root, pid_atom, name_atom, my_pid, qx, qy)
+                        };
+                        match (zone_at(x0, y0), zone_at(px, py)) {
+                            (Some(a), Some(b)) if a == b => {
+                                let app2 = app.clone();
+                                let _ = app.run_on_main_thread(move || match a {
+                                    "close" => hide_popup(app2),
+                                    _ => show_main(app2),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             _ => {}
@@ -319,6 +344,68 @@ fn hit_ball(
         if (px - cx).hypot(py - cy) <= r {
             return Some(key.to_string());
         }
+    }
+    None
+}
+
+/// 弹窗头部操作区命中测试：返回 "close"（右上）或 "main"（其次），未命中返回 None。
+/// 弹窗内部是 webview，xrdp 下按钮点不动，这两个头部操作由壳原生接管。
+/// 区域按 PopupApp.vue 头部布局：高 44px，右侧两个约 44px 宽的按钮位。
+#[cfg(target_os = "linux")]
+fn hit_popup_chrome(
+    conn: &impl x11rb::connection::Connection,
+    root: u32,
+    pid_atom: u32,
+    name_atom: u32,
+    my_pid: u32,
+    px: f64,
+    py: f64,
+) -> Option<&'static str> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, MapState};
+
+    let tree = conn.query_tree(root).ok()?.reply().ok()?;
+    for win in tree.children {
+        let is_mine = conn
+            .get_property(false, win, pid_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut it| it.next()))
+            == Some(my_pid);
+        if !is_mine {
+            continue;
+        }
+        let name = conn
+            .get_property(false, win, name_atom, AtomEnum::ANY, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| String::from_utf8_lossy(&r.value).into_owned())
+            .unwrap_or_default();
+        if name != "latte-popup" {
+            continue;
+        }
+        // 隐藏中的弹窗不参与命中
+        let mapped = conn
+            .get_window_attributes(win)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|a| a.map_state == MapState::VIEWABLE);
+        if !mapped {
+            return None;
+        }
+        let g = conn.get_geometry(win).ok()?.reply().ok()?;
+        let (rx, ry) = (px - g.x as f64, py - g.y as f64);
+        let w = g.width as f64;
+        const HEADER_H: f64 = 44.0;
+        const BTN_W: f64 = 44.0;
+        if (0.0..HEADER_H).contains(&ry) && (0.0..w).contains(&rx) {
+            if rx >= w - BTN_W {
+                return Some("close");
+            }
+            if rx >= w - BTN_W * 2.0 {
+                return Some("main");
+            }
+        }
+        return None;
     }
     None
 }
@@ -523,7 +610,7 @@ fn create_floating_windows(app: &tauri::AppHandle) {
         start_native_ball_input(app);
     }
 
-    if let Err(e) = WebviewWindowBuilder::new(
+    match WebviewWindowBuilder::new(
         app,
         "popup",
         WebviewUrl::External(format!("{SERVER_URL}/?popup=1").parse().unwrap()),
@@ -537,7 +624,16 @@ fn create_floating_windows(app: &tauri::AppHandle) {
     .inner_size(POPUP_W, POPUP_H)
     .build()
     {
-        eprintln!("创建弹窗失败：{e:?}");
+        Ok(p) => {
+            // 失焦自动隐藏（点弹窗以外的地方即收起）
+            let p2 = p.clone();
+            p.on_window_event(move |event| {
+                if let WindowEvent::Focused(false) = event {
+                    let _ = p2.hide();
+                }
+            });
+        }
+        Err(e) => eprintln!("创建弹窗失败：{e:?}"),
     }
 }
 
