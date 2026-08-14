@@ -2609,6 +2609,8 @@ impl Db {
         match res {
             Ok(c) => {
                 self.conn.execute_batch("COMMIT")?;
+                // 全量替换会整批改写行 id，检索索引随之整表重建
+                self.rebuild_notes_fts()?;
                 Ok(c)
             }
             Err(e) => {
