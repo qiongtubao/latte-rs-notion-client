@@ -1,7 +1,7 @@
 <template>
   <div
     class="ball"
-    :class="{ opaque }"
+    :class="{ opaque, circle_mask }"
     :style="{ background: meta.color }"
     :title="meta.label"
     @mousedown="onDown"
@@ -31,7 +31,9 @@ const meta = computed(() => META[props.ballKey] || { icon: '☕', label: props.b
 // 不透明模式（Linux X11 无合成器时透明失效，由壳通过 ?opaque=1 下发）：
 // 窗口整窗不透明，body 底色刷成球色，圆角窗外不露白
 const opaque = new URLSearchParams(location.search).has('opaque')
-if (opaque) {
+// macOS：壳用 CALayer mask 把球窗裁成圆形，前端铺满球色，避免 WKWebView 白底外漏
+const circle_mask = new URLSearchParams(location.search).has('circle_mask')
+if (opaque || circle_mask) {
   document.body.style.setProperty('background', meta.value.color, 'important')
 }
 
@@ -87,6 +89,7 @@ html, body {
 }
 #app {
   min-height: 0 !important;
+  background: transparent !important;
 }
 .ball {
   width: 48px;
@@ -118,6 +121,21 @@ html, body {
   font-size: 24px;
 }
 .ball.opaque:hover {
+  transform: none;
+  box-shadow: none;
+}
+/* macOS circle_mask：整窗铺满球色，由壳负责裁成圆形 */
+.ball.circle_mask {
+  width: 100vw;
+  height: 100vh;
+  margin: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.ball.circle_mask .ball-icon {
+  font-size: 24px;
+}
+.ball.circle_mask:hover {
   transform: none;
   box-shadow: none;
 }

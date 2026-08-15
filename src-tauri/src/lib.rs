@@ -2,6 +2,7 @@
 //!
 //! 复用 Web 版核心（`latte::server`）：壳进程内启动 axum 本地服务（127.0.0.1:3210），
 //! 各窗口 Webview 直接加载该地址，前端与 Web 版完全一致，走同一套 HTTP API。
+#![allow(unexpected_cfgs)]
 //!
 //! 窗口结构：
 //! - `main`：主窗口（标签页界面），默认隐藏，托盘/弹窗可唤起，关闭时仅隐藏；
@@ -19,6 +20,9 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
+#[cfg(debug_assertions)]
+const SERVER_URL: &str = "http://127.0.0.1:5173";
+#[cfg(not(debug_assertions))]
 const SERVER_URL: &str = "http://127.0.0.1:3210";
 /// 悬浮球 key 列表（与前端 PopupApp 的 viewMap 一一对应）
 const BALL_KEYS: [&str; 5] = ["today", "money", "calendar", "projects", "notes"];
@@ -180,6 +184,41 @@ fn apply_round_shape() {
 #[cfg(not(target_os = "linux"))]
 fn apply_round_shape() {}
 
+/// macOS：把悬浮球窗口裁成圆形，并把窗口背景/内容视图设透明。
+/// 由于 WKWebView 在 macOS 上透明经常不彻底，这里直接用 CALayer mask
+/// 把整窗（包括可能残留的白色背景）裁成和球一样大的正圆。
+#[cfg(target_os = "macos")]
+fn make_webview_transparent<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
+    use cocoa::base::{NO, YES};
+    use cocoa::foundation::NSRect;
+    use objc::runtime::{Class, Object};
+    use objc::{msg_send, sel, sel_impl};
+
+    unsafe {
+        let Ok(ptr) = win.ns_window() else { return };
+        let ns_window = ptr as *mut Object;
+        let clear: *mut Object = msg_send![Class::get("NSColor").unwrap(), clearColor];
+        let _: () = msg_send![ns_window, setOpaque: NO];
+        let _: () = msg_send![ns_window, setBackgroundColor: clear];
+
+        let content_view: *mut Object = msg_send![ns_window, contentView];
+        let _: () = msg_send![content_view, setWantsLayer: YES];
+        let _: () = msg_send![content_view, setOpaque: NO];
+        let _: () = msg_send![content_view, setBackgroundColor: clear];
+
+        let layer: *mut Object = msg_send![content_view, layer];
+        if !layer.is_null() {
+            let bounds: NSRect = msg_send![content_view, bounds];
+            let shape_layer: *mut Object = msg_send![Class::get("CAShapeLayer").unwrap(), layer];
+            let _: () = msg_send![shape_layer, setFrame: bounds];
+            let path: *mut Object = msg_send![Class::get("NSBezierPath").unwrap(), bezierPathWithOvalInRect: bounds];
+            let cg_path: *mut Object = msg_send![path, CGPath];
+            let _: () = msg_send![shape_layer, setPath: cg_path];
+            let _: () = msg_send![layer, setMask: shape_layer];
+        }
+    }
+}
+
 // ---------- X11 悬浮球原生输入接管 ----------
 //
 // xrdp 等残缺 X11 环境下，wry 嵌入的 webview 收不到鼠标按键事件
@@ -205,6 +244,9 @@ fn start_native_ball_input(app: &tauri::AppHandle) {
         }
     });
 }
+
+#[cfg(not(target_os = "linux"))]
+fn start_native_ball_input(_app: &tauri::AppHandle) {}
 
 #[cfg(target_os = "linux")]
 fn native_ball_input_loop(app: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -421,6 +463,14 @@ fn show_main(app: tauri::AppHandle) {
     }
 }
 
+/// 设置完成后关闭浮层设置卡片
+#[tauri::command]
+fn setup_done(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("setup") {
+        let _ = w.close();
+    }
+}
+
 #[tauri::command]
 fn hide_popup(app: tauri::AppHandle) {
     if let Some(p) = app.get_webview_window("popup") {
@@ -534,6 +584,26 @@ fn set_global_shortcut(app: tauri::AppHandle, new_key: String) -> Result<String,
 
  // ---------- 窗口创建 ----------
 
+const SETUP_W: f64 = 600.0;
+const SETUP_H: f64 = 720.0;
+
+/// 首次启动时的浮层设置卡片（不占用主窗口）
+fn create_setup_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tauri::WebviewWindow<R>> {
+    let url = format!("{SERVER_URL}/?setup=1");
+    WebviewWindowBuilder::new(app, "setup", WebviewUrl::External(url.parse().unwrap()))
+        .title("Latte 设置")
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(false)
+        .resizable(true)
+        .shadow(true)
+        .focused(true)
+        .center()
+        .inner_size(SETUP_W, SETUP_H)
+        .min_inner_size(SETUP_W, 360.0)
+        .build()
+}
+
 /// 创建 4 个悬浮球窗口和 1 个共享弹窗（需主线程调用，服务就绪后进行）
 fn create_floating_windows(app: &tauri::AppHandle) {
     let positions = load_positions();
@@ -564,6 +634,11 @@ fn create_floating_windows(app: &tauri::AppHandle) {
             // 原生输入接管：前端不再处理点击/拖拽
             url.push_str("&native_input=1");
         }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS：用 CALayer mask 把球窗裁成圆形，前端铺满球色即可
+            url.push_str("&circle_mask=1");
+        }
         let win = match WebviewWindowBuilder::new(app, format!("ball-{key}"), WebviewUrl::External(url.parse().unwrap()))
             .title(format!("latte-ball-{key}"))
             .transparent(transparent)
@@ -573,6 +648,7 @@ fn create_floating_windows(app: &tauri::AppHandle) {
             .resizable(false)
             .shadow(false)
             .focused(false)
+            .visible(false)
             .inner_size(BALL_PHYSICAL_PX, BALL_PHYSICAL_PX)
             .build()
         {
@@ -582,6 +658,9 @@ fn create_floating_windows(app: &tauri::AppHandle) {
                 continue;
             }
         };
+        #[cfg(target_os = "macos")]
+        make_webview_transparent(&win);
+        let _ = win.show();
         // saved/default 位置均为物理坐标
         let _ = win.set_position(PhysicalPosition::new(x, y));
         // 拖拽移动后持久化位置（Moved 事件对程序内 set_position 也会触发，重写相同值无害）
@@ -724,12 +803,22 @@ pub fn run() {
                 if FLOATING_UI_ENABLED {
                     // 窗口创建必须在主线程
                     let h2 = handle.clone();
-                    let _ = handle.run_on_main_thread(move || create_floating_windows(&h2));
+                    let _ = handle.run_on_main_thread(move || {
+                        create_floating_windows(&h2);
+                        // 首次未配置时弹一个浮层设置卡片，而不是主窗口
+                        let unconfigured = latte::config::load()
+                            .ok()
+                            .flatten()
+                            .map_or(true, |c| !latte::config::is_configured(&c));
+                        if unconfigured {
+                            let _ = create_setup_window(&h2);
+                        }
+                    });
                 }
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![show_main, hide_popup, toggle_popup, get_global_shortcut, set_global_shortcut])
+        .invoke_handler(tauri::generate_handler![show_main, hide_popup, toggle_popup, get_global_shortcut, set_global_shortcut, setup_done])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

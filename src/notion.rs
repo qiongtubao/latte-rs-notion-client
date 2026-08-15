@@ -46,7 +46,7 @@ pub struct PulledData {
 pub struct SetupVerifyResult {
     /// token 是否有效（能调通 Notion API）
     pub token_valid: bool,
-    /// 父页面下找到的数据库列表
+    /// 父页面下找到的数据库列表（兼容旧字段）
     pub databases: Vec<FoundDatabase>,
     /// 找到的知识库 database id（None 表示未找到，未配置也不影响 setup）
     pub notes_db_id: Option<String>,
@@ -56,6 +56,8 @@ pub struct SetupVerifyResult {
     pub resolved_page_id: Option<String>,
     /// 解析/查询过程中的可读错误（token 有效但对象不可访问等），供前端直接展示
     pub error: Option<String>,
+    /// 所有 Latte 候选数据库（含行数、schema 状态），供前端选择/管理
+    pub candidates: Vec<SetupCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +65,17 @@ pub struct FoundDatabase {
     pub title: String,
     pub id: String,
 }
+
+/// 设置页展示的数据库候选（含行数与 schema 匹配状态）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupCandidate {
+    pub id: String,
+    pub title: String,
+    pub kind: DatabaseKind,
+    pub row_count: usize,
+    pub schema_ok: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseKind {
@@ -86,6 +99,22 @@ impl DatabaseKind {
             Self::Tasks => "今日任务",
             Self::Daily => "✅ 每日打卡",
         }
+    }
+
+    pub fn from_title(title: &str) -> Option<Self> {
+        Self::all().into_iter().find(|k| k.title() == title)
+    }
+
+    pub const fn all() -> [Self; 7] {
+        [
+            Self::Events,
+            Self::Expenses,
+            Self::Projects,
+            Self::Notes,
+            Self::Ideas,
+            Self::Tasks,
+            Self::Daily,
+        ]
     }
 }
 
@@ -495,34 +524,113 @@ impl NotionClient {
         Ok(resolved)
     }
 
+    /// 汇总可能已存在的 Latte 数据库：先在根页面（含嵌套子页面）下遍历，再叠加全局 `/search`。
+    ///
+    /// 两种方式互补：
+    /// - `/search` 能搜到任意位置的 database 对象；
+    /// - 根页面遍历能捕获只作为 `child_database` block 存在的内联库（某些情况下 `/search` 不会返回）。
+    ///
+    /// 对同一 id 去重后按标题匹配 Latte 标准库名；schema 完全匹配优先，只有标题匹配也作为兜底候选，
+    /// 尽量避免把已存在的库误判为缺失而重复创建。
+    async fn find_existing_databases(
+        &self,
+        root_page_id: &str,
+    ) -> Result<std::collections::HashMap<DatabaseKind, Vec<(String, bool)>>> {
+        use std::collections::HashSet;
+        let mut ids = HashSet::new();
+
+        if let Ok(root_ids) = self.root_database_ids(root_page_id).await {
+            ids.extend(root_ids);
+        }
+        match self.find_latte_databases().await {
+            Ok(list) => {
+                ids.extend(list.into_iter().map(|(id, _)| id));
+            }
+            Err(e) => {
+                eprintln!("[setup] 全局搜索数据库失败，将只使用根页面遍历结果: {e:#}");
+            }
+        }
+
+        let kinds = [
+            DatabaseKind::Events,
+            DatabaseKind::Expenses,
+            DatabaseKind::Projects,
+            DatabaseKind::Notes,
+            DatabaseKind::Ideas,
+            DatabaseKind::Tasks,
+            DatabaseKind::Daily,
+        ];
+
+        let mut map: std::collections::HashMap<DatabaseKind, Vec<(String, bool)>> =
+            std::collections::HashMap::new();
+        for id in ids {
+            let Ok(db) = self.database_object(&id).await else { continue };
+            let title = database_title(&db);
+            let Some(kind) = kinds.into_iter().find(|k| k.title() == title) else {
+                continue;
+            };
+            let schema_ok = database_matches(&db, kind);
+            eprintln!("[setup] 发现数据库 id={id} 标题='{title}' kind={kind:?} schema_ok={schema_ok}");
+            let entry = map.entry(kind).or_default();
+            if schema_ok {
+                entry.insert(0, (id, true));
+            } else {
+                entry.push((id, false));
+            }
+        }
+        Ok(map)
+    }
+
+    /// 为某个 kind 选择数据库：用户指定 > 自动复用 > 新建。
+    async fn pick_or_create_db(
+        &self,
+        kind: DatabaseKind,
+        existing: &std::collections::HashMap<DatabaseKind, Vec<(String, bool)>>,
+        selected: &std::collections::HashMap<DatabaseKind, String>,
+        root_page_id: &str,
+    ) -> Result<String> {
+        if let Some(sel_id) = selected.get(&kind) {
+            if let Some(list) = existing.get(&kind) {
+                if let Some((id, _)) = list.iter().find(|(id, _)| id == sel_id) {
+                    return Ok(id.clone());
+                }
+            }
+        }
+        if let Some((id, _)) = existing.get(&kind).and_then(|v| v.first()) {
+            return Ok(id.clone());
+        }
+        match kind {
+            DatabaseKind::Events => self.create_db_return(events_db_body(root_page_id)).await,
+            DatabaseKind::Expenses => self.create_db_return(expenses_db_body(root_page_id)).await,
+            DatabaseKind::Projects => self.create_db_return(projects_db_body(root_page_id)).await,
+            DatabaseKind::Notes => self.create_notes_db(root_page_id).await,
+            other => bail!("setup 不支持自动创建 {:?}", other),
+        }
+    }
+
+    /// 完成 setup：复用/创建 Latte 所需的 4 个数据库。
+    ///
+    /// `selected` 允许用户为每个 kind 强制指定一个已有库 id；若指定 id 不在候选列表中，
+    /// 或未指定，则自动复用第一个候选或创建新库。
     pub async fn setup_databases(
         &self,
         parent_page_id: &str,
+        selected: &std::collections::HashMap<DatabaseKind, String>,
     ) -> Result<(DatabaseIds, String)> {
         let (root_page_id, _) = self.resolve_root(parent_page_id).await?;
-        let ids = self.root_database_ids(&root_page_id).await?;
-        let events_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Events, None, true).await? {
-            Some(id) => id,
-            None => self.create_db_return(events_db_body(&root_page_id)).await?,
-        };
-        let expenses_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Expenses, None, true).await? {
-            Some(id) => id,
-            None => self.create_db_return(expenses_db_body(&root_page_id)).await?,
-        };
-        let projects_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Projects, None, true).await? {
-            Some(id) => id,
-            None => self.create_db_return(projects_db_body(&root_page_id)).await?,
-        };
-        let notes_db_id = match self.resolve_kind_from_ids(&ids, DatabaseKind::Notes, None, true).await? {
-            Some(id) => id,
-            None => self.create_notes_db(&root_page_id).await?,
-        };
+        let existing = self.find_existing_databases(&root_page_id).await?;
+        eprintln!("[setup] 已存在数据库汇总: {:?}", existing.keys().collect::<Vec<_>>());
+
+        let events_db_id = self.pick_or_create_db(DatabaseKind::Events, &existing, selected, &root_page_id).await?;
+        let expenses_db_id = self.pick_or_create_db(DatabaseKind::Expenses, &existing, selected, &root_page_id).await?;
+        let projects_db_id = self.pick_or_create_db(DatabaseKind::Projects, &existing, selected, &root_page_id).await?;
+        let notes_db_id = self.pick_or_create_db(DatabaseKind::Notes, &existing, selected, &root_page_id).await?;
+
         Ok((
             DatabaseIds { events_db_id, expenses_db_id, projects_db_id, notes_db_id },
             root_page_id,
         ))
     }
-
 
     /// 从 /search 返回的 database 对象中提取显示标题。
     ///
@@ -602,6 +710,87 @@ impl NotionClient {
             .map(|(id, _)| id))
     }
 
+    /// 清理未在配置中引用的空 Latte 数据库（用于清理重复初始化产生的空库）。
+    ///
+    /// 逻辑：
+    /// 1. 全局搜索标题为 Latte 标准库名的 database；
+    /// 2. 跳过当前配置里正在使用的那几个库；
+    /// 3. 查询每个候选库，若没有任何 page 行，则调用 DELETE /databases/{id} 归档删除
+    ///    （`dry_run=true` 时只返回列表，不真正删除）。
+    ///
+    /// 返回被删除/将要删除的 `(id, title)` 列表。
+    pub async fn cleanup_empty_duplicate_databases(
+        &self,
+        cfg: &Config,
+        dry_run: bool,
+    ) -> Result<Vec<(String, String)>> {
+        use std::collections::HashSet;
+
+        let mut protected = HashSet::new();
+        for id in [&cfg.events_db_id, &cfg.expenses_db_id, &cfg.projects_db_id] {
+            if !id.is_empty() {
+                protected.insert(id.clone());
+            }
+        }
+        for opt in [&cfg.notes_db_id, &cfg.ideas_db_id, &cfg.tasks_db_id, &cfg.daily_db_id] {
+            if let Some(id) = opt {
+                protected.insert(id.clone());
+            }
+        }
+
+        let latte_titles: HashSet<&str> = [
+            DatabaseKind::Events.title(),
+            DatabaseKind::Expenses.title(),
+            DatabaseKind::Projects.title(),
+            DatabaseKind::Notes.title(),
+            DatabaseKind::Ideas.title(),
+            DatabaseKind::Tasks.title(),
+            DatabaseKind::Daily.title(),
+        ]
+        .into_iter()
+        .collect();
+
+        let all = self.find_latte_databases().await?;
+        let mut candidates = Vec::new();
+        for (id, title) in all {
+            if !latte_titles.contains(title.as_str()) {
+                continue;
+            }
+            if protected.contains(&id) {
+                continue;
+            }
+            let query = json!({ "page_size": 1 });
+            let resp = self
+                .send(
+                    reqwest::Method::POST,
+                    &format!("/databases/{id}/query"),
+                    &query,
+                )
+                .await
+                .with_context(|| format!("查询数据库 {} 是否为空失败", id))?;
+            let is_empty = resp["results"]
+                .as_array()
+                .map(|r| r.is_empty())
+                .unwrap_or(true);
+            if is_empty {
+                candidates.push((id, title));
+            }
+        }
+
+        if dry_run {
+            return Ok(candidates);
+        }
+
+        let mut deleted = Vec::with_capacity(candidates.len());
+        for (id, title) in candidates {
+            self.send(reqwest::Method::DELETE, &format!("/databases/{id}"), &Value::Null)
+                .await
+                .with_context(|| format!("删除空数据库 {} 失败", id))?;
+            deleted.push((id, title));
+        }
+        Ok(deleted)
+    }
+
     /// 解析 page_id 实际指向的对象类型，必要时向上爬升到普通页面。
     ///
     /// 用户可能粘了某个 database 的 URL（而非根页面 URL）：此时在该 database 下
@@ -652,10 +841,99 @@ impl NotionClient {
         Ok(())
     }
 
-    /// 验证配置：校验 token + 查询父页面下已有的 Latte 数据库。
+    /// 统计 database 中的 page 行数（拉取全部结果后计数）。
+    pub async fn count_database_rows(&self, db_id: &str) -> Result<usize> {
+        Ok(self.query_database(db_id).await?.len())
+    }
+
+    /// 删除（归档）一个 database。
+    pub async fn delete_database(&self, db_id: &str) -> Result<()> {
+        self.send(reqwest::Method::DELETE, &format!("/databases/{db_id}"), &Value::Null)
+            .await
+            .with_context(|| format!("删除数据库 {db_id} 失败"))?;
+        Ok(())
+    }
+
+    /// 把多个同类型 source 数据库的行复制到 target 数据库。
+    ///
+    /// - 复制时先把源 page 解析为本地模型，再用对应的 `*_properties` 重建，避免直接复制
+    ///   page id 和 relation id。
+    /// - Notes 库含自关联 relation，暂不支持合并。
+    /// - `delete_sources=true` 时，复制成功后逐个删除源库。
+    pub async fn merge_databases(
+        &self,
+        kind: DatabaseKind,
+        target_id: &str,
+        source_ids: &[String],
+        delete_sources: bool,
+    ) -> Result<usize> {
+        // 校验 target_id 与所有 source_ids 都是同一 kind
+        for db_id in std::iter::once(target_id).chain(source_ids.iter().map(|s| s.as_str())) {
+            let db = self.database_object(db_id).await?;
+            let title = database_title(&db);
+            let k = DatabaseKind::from_title(&title)
+                .with_context(|| format!("数据库 {db_id} 标题 '{title}' 不是 Latte 标准库"))?;
+            if k != kind {
+                bail!("数据库 {db_id} 类型为 {k:?}，与目标类型 {kind:?} 不一致");
+            }
+        }
+
+        let mut copied = 0usize;
+        for sid in source_ids {
+            let pages = self.query_database(sid).await?;
+            for page in pages {
+                let maybe_props = match kind {
+                    DatabaseKind::Events => {
+                        parse_event_page(&page).map(|ev| event_properties(&ev))
+                    }
+                    DatabaseKind::Expenses => {
+                        parse_expense_page(&page).map(|ex| expense_properties(&ex))
+                    }
+                    DatabaseKind::Projects => {
+                        parse_project_page(&page).map(|p| project_properties(&p))
+                    }
+                    DatabaseKind::Ideas => {
+                        parse_idea_page(&page).map(|idea| idea_properties(&idea))
+                    }
+                    DatabaseKind::Tasks => parse_task_page(&page)
+                        .map(|(task, project_name)| task_properties(&task, project_name.as_deref())),
+                    DatabaseKind::Daily => parse_daily_entry_page(&page).map(|entry| {
+                        daily_entry_properties(
+                            &entry.item_name,
+                            entry.kind,
+                            &entry.date,
+                            entry.done,
+                            entry.value,
+                        )
+                    }),
+                    DatabaseKind::Notes => bail!("📚 知识库 暂不支持合并"),
+                };
+                let Some(props) = maybe_props else {
+                    eprintln!("[merge] 跳过无法解析的 page");
+                    continue;
+                };
+                match self.create_page(target_id, &props).await {
+                    Ok(_) => copied += 1,
+                    Err(e) => eprintln!("[merge] 复制 page 到 {target_id} 失败: {e:#}"),
+                }
+            }
+        }
+
+        if delete_sources {
+            for sid in source_ids {
+                if let Err(e) = self.delete_database(sid).await {
+                    eprintln!("[merge] 删除源库 {sid} 失败: {e:#}");
+                }
+            }
+        }
+
+        Ok(copied)
+    }
+
+    /// 验证配置：校验 token + 查询根页面下已有的 Latte 数据库，并返回带行数的候选列表。
     ///
     /// 即使 token 有效但父页面查询失败（如类型非页面），仍返回 `token_valid`，
-    /// 由调用方读取 `databases` / `notes_db_id` 判断缺失项。
+    /// 由调用方读取 `candidates` / `databases` / `notes_db_id` 判断缺失项。
     pub async fn verify_setup(&self, page_id: &str) -> SetupVerifyResult {
         let token_valid = self.verify_token().await.is_ok();
         if !token_valid {
@@ -666,6 +944,7 @@ impl NotionClient {
                 is_database: false,
                 resolved_page_id: None,
                 error: Some("Token 无效或无权访问 Notion".into()),
+                candidates: Vec::new(),
             };
         }
         // 解析输入对象类型：若为 database 则向上爬升到父页面
@@ -679,12 +958,19 @@ impl NotionClient {
                     is_database: false,
                     resolved_page_id: None,
                     error: Some(format!("{e:#}")),
+                    candidates: Vec::new(),
                 };
             }
         };
-        // 全局搜索 integration 可访问的数据库（任意嵌套层级），按标题匹配 Latte 的 3 个库
-        let found_dbs = match self.find_latte_databases().await {
-            Ok(v) => v,
+        // 汇总可能存在的 Latte 数据库：根页面遍历 + 全局 /search，互补覆盖内联库与独立库
+        let mut db_ids = HashSet::new();
+        if let Ok(root_ids) = self.root_database_ids(&root_page_id).await {
+            db_ids.extend(root_ids);
+        }
+        match self.find_latte_databases().await {
+            Ok(list) => {
+                db_ids.extend(list.into_iter().map(|(id, _)| id));
+            }
             Err(e) => {
                 return SetupVerifyResult {
                     token_valid,
@@ -693,20 +979,32 @@ impl NotionClient {
                     is_database,
                     resolved_page_id: Some(root_page_id),
                     error: Some(format!("{e:#}")),
+                    candidates: Vec::new(),
                 };
             }
         };
+
         let mut databases = Vec::new();
         let mut notes_db_id = None;
-        for (id, title) in &found_dbs {
-            match title.as_str() {
-                "时间碎片" | "金钱记录" | "项目管理" => {
-                    databases.push(FoundDatabase {
-                        title: title.clone(),
-                        id: id.clone(),
-                    });
+        let mut candidates = Vec::new();
+        for id in db_ids {
+            let Ok(db) = self.database_object(&id).await else { continue };
+            let title = database_title(&db);
+            let Some(kind) = DatabaseKind::from_title(&title) else { continue };
+            let schema_ok = database_matches(&db, kind);
+            let row_count = self.count_database_rows(&id).await.unwrap_or(0);
+            candidates.push(SetupCandidate {
+                id: id.clone(),
+                title: title.clone(),
+                kind,
+                row_count,
+                schema_ok,
+            });
+            match kind {
+                DatabaseKind::Events | DatabaseKind::Expenses | DatabaseKind::Projects => {
+                    databases.push(FoundDatabase { title, id });
                 }
-                "📚 知识库" => notes_db_id = Some(id.clone()),
+                DatabaseKind::Notes => notes_db_id = Some(id),
                 _ => {}
             }
         }
@@ -717,6 +1015,7 @@ impl NotionClient {
             is_database,
             resolved_page_id: Some(root_page_id),
             error: None,
+            candidates,
         }
     }
 

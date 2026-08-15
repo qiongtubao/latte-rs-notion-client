@@ -17,12 +17,13 @@
         "resizable": true,
         "fullscreen": false,
         "visible": false,
-        "url": "http://127.0.0.1:3210"
+        "url": "/"
       }
     ],
     "security": {
       "csp": null
-    }
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,

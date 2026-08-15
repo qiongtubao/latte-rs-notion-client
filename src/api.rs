@@ -264,6 +264,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(get_status))
         .route("/api/setup", post(setup))
         .route("/api/setup/verify", post(setup_verify))
+        .route("/api/setup/delete", post(setup_delete))
+        .route("/api/setup/merge", post(setup_merge))
         .merge(protected)
         .merge(ext)
         .with_state(state)
@@ -319,6 +321,10 @@ async fn toggle_reminders(
 struct SetupBody {
     token: String,
     page_url: String,
+    events_db_id: Option<String>,
+    expenses_db_id: Option<String>,
+    projects_db_id: Option<String>,
+    notes_db_id: Option<String>,
 }
 
 async fn setup(
@@ -331,10 +337,24 @@ async fn setup(
     }
     let page_id = config::parse_page_id(&body.page_url)
         .ok_or_else(|| ApiError::bad_request("无法从 page_url 解析出 Notion page id"))?;
+    // 收集用户手动指定的数据库 id（如果传了的话）
+    let mut selected = std::collections::HashMap::new();
+    if let Some(id) = body.events_db_id.filter(|s| !s.is_empty()) {
+        selected.insert(crate::notion::DatabaseKind::Events, id);
+    }
+    if let Some(id) = body.expenses_db_id.filter(|s| !s.is_empty()) {
+        selected.insert(crate::notion::DatabaseKind::Expenses, id);
+    }
+    if let Some(id) = body.projects_db_id.filter(|s| !s.is_empty()) {
+        selected.insert(crate::notion::DatabaseKind::Projects, id);
+    }
+    if let Some(id) = body.notes_db_id.filter(|s| !s.is_empty()) {
+        selected.insert(crate::notion::DatabaseKind::Notes, id);
+    }
     // 用新 token 临时建一个客户端；「先查询已有数据库 → 复用 → 只为缺失的创建」，
     // 与 verify 共用 discover 逻辑，避免用户手动建好的库被重复创建而报错
     let (ids, resolved_page_id) = NotionClient::new(token)
-        .setup_databases(&page_id)
+        .setup_databases(&page_id, &selected)
         .await
         .map_err(|e| {
             ApiError::new(
@@ -421,7 +441,60 @@ async fn setup_verify(
         "resolved_page_id": result.resolved_page_id,
         "error": result.error,
         "ok": result.token_valid && result.error.is_none() && missing.is_empty(),
+        "candidates": result.candidates,
     })))
+}
+
+#[derive(Deserialize)]
+struct SetupDeleteBody {
+    token: String,
+    database_id: String,
+}
+
+async fn setup_delete(
+    State(_state): State<AppState>,
+    Json(body): Json<SetupDeleteBody>,
+) -> ApiResult<Json<Value>> {
+    let token = body.token.trim();
+    if token.is_empty() {
+        return Err(ApiError::bad_request("token 不能为空"));
+    }
+    if body.database_id.is_empty() {
+        return Err(ApiError::bad_request("database_id 不能为空"));
+    }
+    NotionClient::new(token)
+        .delete_database(&body.database_id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("删除数据库失败: {e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SetupMergeBody {
+    token: String,
+    kind: crate::notion::DatabaseKind,
+    target_id: String,
+    source_ids: Vec<String>,
+    #[serde(default)]
+    delete_sources: bool,
+}
+
+async fn setup_merge(
+    State(_state): State<AppState>,
+    Json(body): Json<SetupMergeBody>,
+) -> ApiResult<Json<Value>> {
+    let token = body.token.trim();
+    if token.is_empty() {
+        return Err(ApiError::bad_request("token 不能为空"));
+    }
+    if body.target_id.is_empty() || body.source_ids.is_empty() {
+        return Err(ApiError::bad_request("目标库和源库不能为空"));
+    }
+    let copied = NotionClient::new(token)
+        .merge_databases(body.kind, &body.target_id, &body.source_ids, body.delete_sources)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("合并数据库失败: {e:#}")))?;
+    Ok(Json(json!({ "ok": true, "copied": copied })))
 }
 
 async fn sync_now(State(state): State<AppState>) -> ApiResult<Json<Value>> {

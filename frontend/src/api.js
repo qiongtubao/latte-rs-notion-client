@@ -13,8 +13,10 @@ function unwrap(promise) {
 
 export const api = {
   getStatus: () => unwrap(http.get('/status')),
-  setup: (token, page_url) => unwrap(http.post('/setup', { token, page_url })),
+  setup: (payload) => unwrap(http.post('/setup', payload)),
   verifySetup: (token, page_url) => unwrap(http.post('/setup/verify', { token, page_url })),
+  deleteDatabase: (payload) => unwrap(http.post('/setup/delete', payload)),
+  mergeDatabases: (payload) => unwrap(http.post('/setup/merge', payload)),
   pullFromNotion: () => unwrap(http.post('/sync/pull')),
   sync: () => unwrap(http.post('/sync')),
   resetLocalData: () => unwrap(http.post('/data/reset')),
