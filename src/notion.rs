@@ -27,6 +27,11 @@ pub struct DatabaseIds {
     pub expenses_db_id: String,
     pub projects_db_id: String,
     pub notes_db_id: String,
+    /// 懒建库：setup 只解析已有候选（用户指定或自动复用），找不到时为 None，
+    /// 由调用方决定保留旧配置，后续同步循环按需补建
+    pub ideas_db_id: Option<String>,
+    pub tasks_db_id: Option<String>,
+    pub daily_db_id: Option<String>,
 }
 
 /// 从 Notion 拉取并解析后的全量数据（覆盖本地用）
@@ -709,10 +714,10 @@ impl NotionClient {
         }
     }
 
-    /// 完成 setup：复用/创建 Latte 所需的 4 个数据库。
+    /// 完成 setup：复用/创建 Latte 所需的 4 个核心数据库，并解析 3 个懒建库（好想法/今日任务/每日打卡）的已有候选。
     ///
     /// `selected` 允许用户为每个 kind 强制指定一个已有库 id；若指定 id 不在候选列表中，
-    /// 或未指定，则自动复用第一个候选或创建新库。
+    /// 或未指定，则自动复用第一个候选或创建新库（懒建库不新建，找不到返回 None）。
     pub async fn setup_databases(
         &self,
         parent_page_id: &str,
@@ -727,8 +732,25 @@ impl NotionClient {
         let projects_db_id = self.pick_or_create_db(DatabaseKind::Projects, &existing, selected, &root_page_id).await?;
         let notes_db_id = self.pick_or_create_db(DatabaseKind::Notes, &existing, selected, &root_page_id).await?;
 
+        // 懒建库（好想法/今日任务/每日打卡）：只复用已有候选，不在 setup 阶段新建；
+        // 找不到时返回 None，由调用方保留旧配置，同步循环会按需懒建
+        let pick_existing = |kind: DatabaseKind| -> Option<String> {
+            if let Some(sel_id) = selected.get(&kind) {
+                if let Some((id, _)) = existing
+                    .get(&kind)
+                    .and_then(|list| list.iter().find(|(id, _)| id == sel_id))
+                {
+                    return Some(id.clone());
+                }
+            }
+            existing.get(&kind).and_then(|v| v.first()).map(|(id, _)| id.clone())
+        };
+        let ideas_db_id = pick_existing(DatabaseKind::Ideas);
+        let tasks_db_id = pick_existing(DatabaseKind::Tasks);
+        let daily_db_id = pick_existing(DatabaseKind::Daily);
+
         Ok((
-            DatabaseIds { events_db_id, expenses_db_id, projects_db_id, notes_db_id },
+            DatabaseIds { events_db_id, expenses_db_id, projects_db_id, notes_db_id, ideas_db_id, tasks_db_id, daily_db_id },
             root_page_id,
         ))
     }

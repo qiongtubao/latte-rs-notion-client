@@ -336,6 +336,9 @@ struct SetupBody {
     expenses_db_id: Option<String>,
     projects_db_id: Option<String>,
     notes_db_id: Option<String>,
+    ideas_db_id: Option<String>,
+    tasks_db_id: Option<String>,
+    daily_db_id: Option<String>,
 }
 
 /// 请求体里的 token/page_url 为空时回退到已保存配置；两者都拿不到则报错
@@ -388,6 +391,15 @@ async fn setup(
     if let Some(id) = body.notes_db_id.filter(|s| !s.is_empty()) {
         selected.insert(crate::notion::DatabaseKind::Notes, id);
     }
+    if let Some(id) = body.ideas_db_id.filter(|s| !s.is_empty()) {
+        selected.insert(crate::notion::DatabaseKind::Ideas, id);
+    }
+    if let Some(id) = body.tasks_db_id.filter(|s| !s.is_empty()) {
+        selected.insert(crate::notion::DatabaseKind::Tasks, id);
+    }
+    if let Some(id) = body.daily_db_id.filter(|s| !s.is_empty()) {
+        selected.insert(crate::notion::DatabaseKind::Daily, id);
+    }
     // 用新 token 临时建一个客户端；「先查询已有数据库 → 复用 → 只为缺失的创建」，
     // 与 verify 共用 discover 逻辑，避免用户手动建好的库被重复创建而报错
     let (ids, resolved_page_id) = NotionClient::new(token.clone())
@@ -427,9 +439,10 @@ async fn setup(
         expenses_db_id: ids.expenses_db_id,
         projects_db_id: ids.projects_db_id,
         notes_db_id: Some(ids.notes_db_id),
-        ideas_db_id,
-        tasks_db_id,
-        daily_db_id,
+        // 懒建库：优先用本次 setup 解析到的候选（用户指定或自动复用），找不到则保留旧配置 id
+        ideas_db_id: ids.ideas_db_id.or(ideas_db_id),
+        tasks_db_id: ids.tasks_db_id.or(tasks_db_id),
+        daily_db_id: ids.daily_db_id.or(daily_db_id),
         api_token,
         remind_enabled,
         global_shortcut,

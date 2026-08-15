@@ -230,6 +230,9 @@ const kindList = [
   { key: 'expenses', label: '金钱记录' },
   { key: 'projects', label: '项目管理' },
   { key: 'notes', label: '📚 知识库' },
+  { key: 'ideas', label: '好想法' },
+  { key: 'tasks', label: '今日任务' },
+  { key: 'daily', label: '✅ 每日打卡' },
 ]
 
 const selectedIds = reactive({
@@ -237,6 +240,9 @@ const selectedIds = reactive({
   expenses: '',
   projects: '',
   notes: '',
+  ideas: '',
+  tasks: '',
+  daily: '',
 })
 
 const mergeSelection = ref([])
@@ -390,10 +396,7 @@ async function testConfig() {
     const res = await api.verifySetup(form.token.trim(), form.page_url.trim())
     candidates.value = res.candidates || []
     // 清空已选
-    selectedIds.events = ''
-    selectedIds.expenses = ''
-    selectedIds.projects = ''
-    selectedIds.notes = ''
+    for (const k of kindList) selectedIds[k.key] = ''
     mergeSelection.value = []
 
     if (!res.token_valid) {
@@ -521,6 +524,9 @@ async function submit() {
       expenses_db_id: selectedIds.expenses || undefined,
       projects_db_id: selectedIds.projects || undefined,
       notes_db_id: selectedIds.notes || undefined,
+      ideas_db_id: selectedIds.ideas || undefined,
+      tasks_db_id: selectedIds.tasks || undefined,
+      daily_db_id: selectedIds.daily || undefined,
     }
     await api.setup(payload)
     ElMessage.success('配置成功')
