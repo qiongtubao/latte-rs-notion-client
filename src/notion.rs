@@ -128,15 +128,24 @@ fn database_title(db: &Value) -> String {
         })
         .unwrap_or_default()
 }
+/// 取 database 某属性的类型：优先读标准 "type" 字段（真实 API 响应必有）；
+/// 缺失时（如测试 fixture 只有 `{ "date": {} }` 形态）回退为「第一个元数据之外的键」，
+/// 需排除 id/name/type/description 等元数据键
 fn property_type<'a>(db: &'a Value, name: &str) -> Option<&'a str> {
-    db["properties"][name]
-        .as_object()
-        .and_then(|p| p.keys().find(|key| *key != "id" && *key != "name"))
-        .map(String::as_str)
+    let p = &db["properties"][name];
+    p["type"].as_str().or_else(|| {
+        p.as_object()
+            .and_then(|o| {
+                o.keys()
+                    .find(|k| !matches!(k.as_str(), "id" | "name" | "type" | "description"))
+            })
+            .map(String::as_str)
+    })
 }
 
-fn database_schema_matches(db: &Value, kind: DatabaseKind) -> bool {
-    let required: &[(&str, &str)] = match kind {
+/// 各类 Latte 标准库的必需字段清单：(列名, 类型)
+fn required_schema(kind: DatabaseKind) -> &'static [(&'static str, &'static str)] {
+    match kind {
         DatabaseKind::Events => &[("名称", "title"), ("开始", "date"), ("结束", "date"), ("内容", "rich_text"), ("标签", "select")],
         DatabaseKind::Expenses => &[("事项", "title"), ("金额", "number"), ("时间", "date"), ("分类", "select")],
         DatabaseKind::Projects => &[("名称", "title"), ("状态", "select"), ("开始", "date"), ("截止", "date"), ("备注", "rich_text")],
@@ -144,14 +153,106 @@ fn database_schema_matches(db: &Value, kind: DatabaseKind) -> bool {
         DatabaseKind::Ideas => &[("名称", "title"), ("内容", "rich_text"), ("置顶", "checkbox"), ("标签", "select")],
         DatabaseKind::Tasks => &[("名称", "title"), ("日期", "date"), ("完成", "checkbox"), ("优先级", "select")],
         DatabaseKind::Daily => &[("名称", "title"), ("日期", "date"), ("完成", "checkbox"), ("类型", "select")],
-    };
-    required.iter().all(|(name, ty)| property_type(db, name) == Some(*ty))
+    }
+}
+
+fn database_schema_matches(db: &Value, kind: DatabaseKind) -> bool {
+    required_schema(kind)
+        .iter()
+        .all(|(name, ty)| property_type(db, name) == Some(*ty))
+}
+
+/// database 对象是否已归档（在 Notion 回收站）。
+/// 回收站里的库在 /search 与块遍历中可能短暂出现，所有匹配/列举逻辑都要排除
+fn database_is_archived(db: &Value) -> bool {
+    db["archived"].as_bool().unwrap_or(false) || db["in_trash"].as_bool().unwrap_or(false)
 }
 
 fn database_matches(db: &Value, kind: DatabaseKind) -> bool {
     db["object"].as_str() == Some("database")
+        && !database_is_archived(db)
         && database_title(db) == kind.title()
         && database_schema_matches(db, kind)
+}
+
+/// 结构修复结果
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SchemaFixResult {
+    /// 补齐的字段名
+    pub added: Vec<String>,
+    /// title 列重命名：(旧名, 新名)
+    pub renamed_title: Option<(String, String)>,
+    /// 已存在但类型不一致、无法自动修复的字段描述
+    pub conflicts: Vec<String>,
+}
+
+/// 各类 Latte 标准库的完整属性定义（建库 body 的 properties 部分），修复时按此补齐；
+/// 知识库的自关联「父级」建库时无法定义，这里用 notes_relation_schema 补上
+fn standard_properties(kind: DatabaseKind, self_db_id: &str) -> Value {
+    let body = match kind {
+        DatabaseKind::Events => events_db_body(""),
+        DatabaseKind::Expenses => expenses_db_body(""),
+        DatabaseKind::Projects => projects_db_body(""),
+        DatabaseKind::Notes => notes_db_body(""),
+        DatabaseKind::Ideas => ideas_db_body(""),
+        DatabaseKind::Tasks => tasks_db_body(""),
+        DatabaseKind::Daily => daily_db_body(""),
+    };
+    let mut props = body["properties"].clone();
+    if kind == DatabaseKind::Notes
+        && let (Some(p), Some(extra)) = (
+            props.as_object_mut(),
+            notes_relation_schema(self_db_id).as_object(),
+        )
+    {
+        for (k, v) in extra {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    props
+}
+
+/// 计算结构修复补丁：用标准属性定义逐一对比现状。
+/// - 缺失的字段 → 加入 PATCH 补丁（含 select 选项定义）
+/// - 缺失的标准 title 列名 → 重命名现有 title 列（database 必有且仅有一个 title）
+/// - 已存在但类型不一致 → 记入 conflicts（Notion API 不支持改列类型）
+/// 返回 (PATCH properties, 修复结果)；patch 为空表示无需调用 API。
+fn schema_fix_plan(db: &Value, kind: DatabaseKind, self_db_id: &str) -> (Value, SchemaFixResult) {
+    let standard = standard_properties(kind, self_db_id);
+    let mut patch = serde_json::Map::new();
+    let mut result = SchemaFixResult::default();
+    let current_title = db["properties"].as_object().and_then(|m| {
+        m.keys().find(|k| property_type(db, k) == Some("title")).cloned()
+    });
+    if let Some(obj) = standard.as_object() {
+        for (name, def) in obj {
+            let expected_ty = def
+                .as_object()
+                .and_then(|d| {
+                    d.keys()
+                        .find(|k| !matches!(k.as_str(), "id" | "name" | "type" | "description"))
+                })
+                .map(String::as_str);
+            match property_type(db, name) {
+                Some(actual) if Some(actual) == expected_ty => {} // 已就绪
+                Some(actual) => {
+                    result.conflicts.push(format!("{name}（现有类型 {actual}）"));
+                }
+                None => {
+                    if expected_ty == Some("title") {
+                        if let Some(cur) = &current_title {
+                            patch.insert(cur.clone(), json!({ "name": name }));
+                            result.renamed_title = Some((cur.clone(), name.clone()));
+                        }
+                    } else {
+                        patch.insert(name.clone(), def.clone());
+                        result.added.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    (Value::Object(patch), result)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,12 +947,37 @@ impl NotionClient {
         Ok(self.query_database(db_id).await?.len())
     }
 
-    /// 删除（归档）一个 database。
+    /// 删除（归档）一个 database：Notion API 没有 DELETE /databases，
+    /// 用 PATCH archived=true 归档，效果等同移入回收站（可恢复）
     pub async fn delete_database(&self, db_id: &str) -> Result<()> {
-        self.send(reqwest::Method::DELETE, &format!("/databases/{db_id}"), &Value::Null)
-            .await
-            .with_context(|| format!("删除数据库 {db_id} 失败"))?;
+        self.send(
+            reqwest::Method::PATCH,
+            &format!("/databases/{db_id}"),
+            &json!({ "archived": true }),
+        )
+        .await
+        .with_context(|| format!("删除数据库 {db_id} 失败"))?;
         Ok(())
+    }
+
+    /// 修复 database 结构：按 Latte 标准 schema 补齐缺失字段、把 title 列重命名为标准名。
+    /// 已存在但类型不一致的字段无法通过 API 改类型，列入 conflicts 由用户手动处理。
+    pub async fn fix_database_schema(&self, db_id: &str) -> Result<SchemaFixResult> {
+        let db = self.database_object(db_id).await?;
+        let title = database_title(&db);
+        let kind = DatabaseKind::from_title(&title)
+            .with_context(|| format!("数据库标题 '{title}' 不是 Latte 标准库，无法自动修复"))?;
+        let (patch, result) = schema_fix_plan(&db, kind, db_id);
+        if patch.as_object().is_some_and(|p| !p.is_empty()) {
+            self.send(
+                reqwest::Method::PATCH,
+                &format!("/databases/{db_id}"),
+                &json!({ "properties": patch }),
+            )
+            .await
+            .with_context(|| format!("修复数据库 {db_id} 结构失败"))?;
+        }
+        Ok(result)
     }
 
     /// 把多个同类型 source 数据库的行复制到 target 数据库。
@@ -989,6 +1115,10 @@ impl NotionClient {
         let mut candidates = Vec::new();
         for id in db_ids {
             let Ok(db) = self.database_object(&id).await else { continue };
+            // 跳过回收站里的库：search / 根页面遍历可能短暂返回刚归档的库
+            if database_is_archived(&db) {
+                continue;
+            }
             let title = database_title(&db);
             let Some(kind) = DatabaseKind::from_title(&title) else { continue };
             let schema_ok = database_matches(&db, kind);
@@ -2012,6 +2142,61 @@ mod tests {
         db["title"][0]["text"]["content"] = json!("时间碎片");
         db["properties"]["标签"] = json!({"rich_text": {}});
         assert!(!database_matches(&db, DatabaseKind::Events));
+    }
+
+    #[test]
+    fn schema_fix_plan_adds_missing_and_renames_title() {
+        // 模拟旧版「金钱记录」：title 列叫「名称」，缺「时间」，「金额」类型错（rich_text）
+        let mut db = expenses_db_body("root");
+        db["object"] = json!("database");
+        db["id"] = json!("exp-1");
+        let mut props = db["properties"].as_object().unwrap().clone();
+        let title_def = props.remove("事项").unwrap();
+        props.insert("名称".into(), title_def);
+        props.remove("时间");
+        props.insert("金额".into(), json!({ "rich_text": {} }));
+        db["properties"] = Value::Object(props);
+
+        let (patch, result) = schema_fix_plan(&db, DatabaseKind::Expenses, "exp-1");
+        // title 列重命名：名称 → 事项
+        assert_eq!(patch["名称"]["name"], "事项");
+        assert_eq!(
+            result.renamed_title,
+            Some(("名称".to_string(), "事项".to_string()))
+        );
+        // 补齐缺失的「时间」
+        assert!(patch["时间"]["date"].is_object());
+        assert!(result.added.contains(&"时间".to_string()));
+        // 类型不一致的「金额」进 conflicts，不进补丁（API 改不了列类型）
+        assert!(patch.get("金额").is_none());
+        assert_eq!(result.conflicts.len(), 1);
+        assert!(result.conflicts[0].contains("金额"));
+    }
+
+    #[test]
+    fn schema_fix_plan_noop_when_matched() {
+        let mut db = events_db_body("root");
+        db["object"] = json!("database");
+        db["id"] = json!("events-1");
+        let (patch, result) = schema_fix_plan(&db, DatabaseKind::Events, "events-1");
+        assert!(patch.as_object().unwrap().is_empty());
+        assert!(result.added.is_empty());
+        assert!(result.renamed_title.is_none());
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn schema_fix_plan_notes_adds_self_relation() {
+        // 知识库缺自关联「父级」：补丁里 relation 应指向库自身
+        let mut db = notes_db_body("root");
+        db["object"] = json!("database");
+        db["id"] = json!("notes-1");
+        let (patch, result) = schema_fix_plan(&db, DatabaseKind::Notes, "notes-1");
+        assert_eq!(
+            patch["父级"]["relation"]["database_id"],
+            json!("notes-1")
+        );
+        assert!(result.added.contains(&"父级".to_string()));
     }
 
     #[test]

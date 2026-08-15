@@ -269,8 +269,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(get_status))
         .route("/api/setup", post(setup))
         .route("/api/setup/verify", post(setup_verify))
+        .route("/api/setup/candidates", get(setup_candidates))
         .route("/api/setup/delete", post(setup_delete))
         .route("/api/setup/merge", post(setup_merge))
+        .route("/api/setup/fix", post(setup_fix_schema))
         .merge(protected)
         .merge(ext)
         .with_state(state)
@@ -324,7 +326,11 @@ async fn toggle_reminders(
 
 #[derive(Deserialize)]
 struct SetupBody {
+    /// 为空时回退到已保存配置里的 token（数据库管理页重绑场景）
+    #[serde(default)]
     token: String,
+    /// 为空时回退到已保存配置里的 parent_page_id
+    #[serde(default)]
     page_url: String,
     events_db_id: Option<String>,
     expenses_db_id: Option<String>,
@@ -332,16 +338,42 @@ struct SetupBody {
     notes_db_id: Option<String>,
 }
 
+/// 请求体里的 token/page_url 为空时回退到已保存配置；两者都拿不到则报错
+fn resolve_token_page(
+    state: &AppState,
+    token: &str,
+    page_url: &str,
+) -> ApiResult<(String, String)> {
+    let (saved_token, saved_page_id) = state
+        .config
+        .lock()
+        .map(|c| (c.token.clone(), c.parent_page_id.clone()))
+        .unwrap_or_default();
+    let token = if token.trim().is_empty() {
+        saved_token
+    } else {
+        token.trim().to_string()
+    };
+    if token.is_empty() {
+        return Err(ApiError::bad_request("token 不能为空"));
+    }
+    let page_id = if page_url.trim().is_empty() {
+        if saved_page_id.is_empty() {
+            return Err(ApiError::bad_request("无法从 page_url 解析出 Notion page id"));
+        }
+        saved_page_id
+    } else {
+        config::parse_page_id(page_url)
+            .ok_or_else(|| ApiError::bad_request("无法从 page_url 解析出 Notion page id"))?
+    };
+    Ok((token, page_id))
+}
+
 async fn setup(
     State(state): State<AppState>,
     Json(body): Json<SetupBody>,
 ) -> ApiResult<Json<Value>> {
-    let token = body.token.trim();
-    if token.is_empty() {
-        return Err(ApiError::bad_request("token 不能为空"));
-    }
-    let page_id = config::parse_page_id(&body.page_url)
-        .ok_or_else(|| ApiError::bad_request("无法从 page_url 解析出 Notion page id"))?;
+    let (token, page_id) = resolve_token_page(&state, &body.token, &body.page_url)?;
     // 收集用户手动指定的数据库 id（如果传了的话）
     let mut selected = std::collections::HashMap::new();
     if let Some(id) = body.events_db_id.filter(|s| !s.is_empty()) {
@@ -358,7 +390,7 @@ async fn setup(
     }
     // 用新 token 临时建一个客户端；「先查询已有数据库 → 复用 → 只为缺失的创建」，
     // 与 verify 共用 discover 逻辑，避免用户手动建好的库被重复创建而报错
-    let (ids, resolved_page_id) = NotionClient::new(token)
+    let (ids, resolved_page_id) = NotionClient::new(token.clone())
         .setup_databases(&page_id, &selected)
         .await
         .map_err(|e| {
@@ -388,7 +420,7 @@ async fn setup(
         api_token = uuid::Uuid::new_v4().to_string();
     }
     let cfg = Config {
-        token: token.to_string(),
+        token: token.clone(),
         // 用解析后的根页面 id（用户若粘了 database URL，已向上爬升到父页面）
         parent_page_id: resolved_page_id,
         events_db_id: ids.events_db_id,
@@ -413,6 +445,33 @@ async fn setup(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// verify / candidates 共用的响应构造：统计缺失的核心数据库并组装 JSON
+fn setup_verify_json(result: crate::notion::SetupVerifyResult) -> Json<Value> {
+    // 统计已找到的数据库
+    let found_db_titles: Vec<&str> = result
+        .databases
+        .iter()
+        .map(|d| d.title.as_str())
+        .collect();
+    let missing: Vec<&str> = ["时间碎片", "金钱记录", "项目管理"]
+        .iter()
+        .filter(|t| !found_db_titles.contains(t))
+        .copied()
+        .collect();
+    Json(json!({
+        "token_valid": result.token_valid,
+        "databases": result.databases,
+        "notes_db_id": result.notes_db_id,
+        "missing": missing,
+        // 输入指向 database 时已自动爬升到父页面；前端据此提示用户
+        "is_database": result.is_database,
+        "resolved_page_id": result.resolved_page_id,
+        "error": result.error,
+        "ok": result.token_valid && result.error.is_none() && missing.is_empty(),
+        "candidates": result.candidates,
+    }))
+}
+
 /// 验证配置：校验 token + 查询父页面下已有的 Latte 数据库，不创建任何对象。
 async fn setup_verify(
     State(_state): State<AppState>,
@@ -425,45 +484,30 @@ async fn setup_verify(
     let page_id = config::parse_page_id(&body.page_url)
         .ok_or_else(|| ApiError::bad_request("无法从 page_url 解析出 Notion page id"))?;
     let result = NotionClient::new(token).verify_setup(&page_id).await;
-    // 统计已找到的数据库
-    let found_db_titles: Vec<&str> = result
-        .databases
-        .iter()
-        .map(|d| d.title.as_str())
-        .collect();
-    let missing: Vec<&str> = ["时间碎片", "金钱记录", "项目管理"]
-        .iter()
-        .filter(|t| !found_db_titles.contains(t))
-        .copied()
-        .collect();
-    Ok(Json(json!({
-        "token_valid": result.token_valid,
-        "databases": result.databases,
-        "notes_db_id": result.notes_db_id,
-        "missing": missing,
-        // 输入指向 database 时已自动爬升到父页面；前端据此提示用户
-        "is_database": result.is_database,
-        "resolved_page_id": result.resolved_page_id,
-        "error": result.error,
-        "ok": result.token_valid && result.error.is_none() && missing.is_empty(),
-        "candidates": result.candidates,
-    })))
+    Ok(setup_verify_json(result))
+}
+
+/// 已配置状态下直接列出父页面下的候选数据库（含行数），
+/// 供数据库管理页（合并/删除/重新绑定）免填 token 展示
+async fn setup_candidates(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let (token, page_id) = resolve_token_page(&state, "", "")?;
+    let result = NotionClient::new(token).verify_setup(&page_id).await;
+    Ok(setup_verify_json(result))
 }
 
 #[derive(Deserialize)]
 struct SetupDeleteBody {
+    /// 为空时回退到已保存配置里的 token
+    #[serde(default)]
     token: String,
     database_id: String,
 }
 
 async fn setup_delete(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<SetupDeleteBody>,
 ) -> ApiResult<Json<Value>> {
-    let token = body.token.trim();
-    if token.is_empty() {
-        return Err(ApiError::bad_request("token 不能为空"));
-    }
+    let (token, _) = resolve_token_page(&state, &body.token, "")?;
     if body.database_id.is_empty() {
         return Err(ApiError::bad_request("database_id 不能为空"));
     }
@@ -476,6 +520,8 @@ async fn setup_delete(
 
 #[derive(Deserialize)]
 struct SetupMergeBody {
+    /// 为空时回退到已保存配置里的 token
+    #[serde(default)]
     token: String,
     kind: crate::notion::DatabaseKind,
     target_id: String,
@@ -485,13 +531,10 @@ struct SetupMergeBody {
 }
 
 async fn setup_merge(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<SetupMergeBody>,
 ) -> ApiResult<Json<Value>> {
-    let token = body.token.trim();
-    if token.is_empty() {
-        return Err(ApiError::bad_request("token 不能为空"));
-    }
+    let (token, _) = resolve_token_page(&state, &body.token, "")?;
     if body.target_id.is_empty() || body.source_ids.is_empty() {
         return Err(ApiError::bad_request("目标库和源库不能为空"));
     }
@@ -500,6 +543,36 @@ async fn setup_merge(
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("合并数据库失败: {e:#}")))?;
     Ok(Json(json!({ "ok": true, "copied": copied })))
+}
+
+#[derive(Deserialize)]
+struct SetupFixBody {
+    /// 为空时回退到已保存配置里的 token
+    #[serde(default)]
+    token: String,
+    database_id: String,
+}
+
+/// 修复远端数据库结构：补齐缺失字段、title 列重命名为标准名；
+/// 类型不一致的字段无法自动修复，以 conflicts 返回给前端提示
+async fn setup_fix_schema(
+    State(state): State<AppState>,
+    Json(body): Json<SetupFixBody>,
+) -> ApiResult<Json<Value>> {
+    let (token, _) = resolve_token_page(&state, &body.token, "")?;
+    if body.database_id.is_empty() {
+        return Err(ApiError::bad_request("database_id 不能为空"));
+    }
+    let r = NotionClient::new(token)
+        .fix_database_schema(&body.database_id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("修复数据库结构失败: {e:#}")))?;
+    Ok(Json(json!({
+        "ok": true,
+        "added": r.added,
+        "renamed_title": r.renamed_title,
+        "conflicts": r.conflicts,
+    })))
 }
 
 async fn sync_now(State(state): State<AppState>) -> ApiResult<Json<Value>> {

@@ -15,7 +15,10 @@ export const api = {
   getStatus: () => unwrap(http.get('/status')),
   setup: (payload) => unwrap(http.post('/setup', payload)),
   verifySetup: (token, page_url) => unwrap(http.post('/setup/verify', { token, page_url })),
+  // 已配置状态下用本地保存的 token 列出候选库（含行数），统计行数较慢，放宽超时
+  setupCandidates: () => unwrap(http.get('/setup/candidates', { timeout: 60000 })),
   deleteDatabase: (payload) => unwrap(http.post('/setup/delete', payload)),
+  fixDatabase: (payload) => unwrap(http.post('/setup/fix', payload)),
   mergeDatabases: (payload) => unwrap(http.post('/setup/merge', payload)),
   pullFromNotion: () => unwrap(http.post('/sync/pull')),
   sync: () => unwrap(http.post('/sync')),

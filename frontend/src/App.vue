@@ -3,7 +3,7 @@
     <el-icon class="is-loading" :size="32"><Loading /></el-icon>
   </div>
 
-  <SetupView v-else-if="!configured" @done="onSetupDone" />
+  <SetupView v-else-if="!configured || showSetup" :closable="configured" :section="setupSection" @done="onSetupDone" />
 
   <div v-else :class="['app-root', { 'is-offline': !online }]">
     <!-- 离线状态条：顶栏之上，置顶 + 醒目 -->
@@ -63,20 +63,23 @@
          <el-button size="small" circle :type="remindOn ? 'primary' : 'default'" @click="toggleRemind">
           <el-icon><BellFilled v-if="remindOn" /><Bell v-else /></el-icon>
         </el-button>
-        <el-button size="small" :loading="syncing" @click="doSync">同步</el-button>
-        <el-button size="small" :loading="pulling" @click="doPull">拉取</el-button>
-        <el-button size="small" type="danger" plain :loading="resetting" @click="doReset">重置</el-button>
-        <el-dropdown trigger="click" @command="downloadExport">
-          <el-button size="small">导出</el-button>
+        <el-dropdown trigger="click" @command="onSettingsCommand">
+          <el-button size="small">⚙ 设置</el-button>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item command="json">全量备份（JSON）</el-dropdown-item>
-              <el-dropdown-item command="events">事件（CSV）</el-dropdown-item>
-              <el-dropdown-item command="expenses">消费（CSV）</el-dropdown-item>
+              <el-dropdown-item command="sync">同步</el-dropdown-item>
+              <el-dropdown-item command="pull">拉取（远端覆盖本地）</el-dropdown-item>
+              <el-dropdown-item divided command="export-json">导出全量备份（JSON）</el-dropdown-item>
+              <el-dropdown-item command="export-events">导出事件（CSV）</el-dropdown-item>
+              <el-dropdown-item command="export-expenses">导出消费（CSV）</el-dropdown-item>
+              <el-dropdown-item command="import">导入</el-dropdown-item>
+              <el-dropdown-item divided command="reset">重置（清空本地并重拉）</el-dropdown-item>
+              <el-dropdown-item divided command="db-merge">合并数据库</el-dropdown-item>
+              <el-dropdown-item command="db-delete">删除数据库</el-dropdown-item>
+              <el-dropdown-item command="db-rebind">重新绑定数据库</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
-        <el-button size="small" @click="pickImportFile">导入</el-button>
       </div>
     </header>
     <!-- 番茄钟进行中：贴在顶栏下方的红色进度条 + 倒计时 -->
@@ -225,6 +228,7 @@ import NotesView from './views/NotesView.vue'
 import IdeasView from './views/IdeasView.vue'
 import DailyView from './views/DailyView.vue'
 import ReportView from './views/ReportView.vue'
+import SetupView from './views/SetupView.vue'
 import FloatingButton from './components/FloatingButton.vue'
 import TodayTaskList from './components/TodayTaskList.vue'
 import MoneyExpenseList from './components/MoneyExpenseList.vue'
@@ -236,6 +240,8 @@ import AiAssistDialog from './components/AiAssistDialog.vue'
 
 const loading = ref(true)
 const configured = ref(false)
+const showSetup = ref(false) // 已配置后从「设置」重新打开 SetupView
+const setupSection = ref('') // ''=全部 / merge / delete / rebind
 const status = ref({ last_sync: null, last_error: null, pending: 0, remind_enabled: false })
 const syncing = ref(false)
 const pulling = ref(false)
@@ -763,7 +769,22 @@ async function doReset() {
   } catch (e) { ElMessage.error(`重置失败：${e.message}`); await fetchStatus() }
   finally { resetting.value = false }
 }
-function onSetupDone() { configured.value = true; fetchStatus() }
+function onSetupDone() { configured.value = true; showSetup.value = false; fetchStatus() }
+
+// 顶栏「设置」下拉：集中同步/拉取/重置/导入导出与数据库管理入口
+function onSettingsCommand(cmd) {
+  if (cmd === 'sync') doSync()
+  else if (cmd === 'pull') doPull()
+  else if (cmd === 'reset') doReset()
+  else if (cmd === 'import') pickImportFile()
+  else if (cmd === 'export-json') downloadExport('json')
+  else if (cmd === 'export-events') downloadExport('events')
+  else if (cmd === 'export-expenses') downloadExport('expenses')
+  else if (cmd.startsWith('db-')) {
+    setupSection.value = cmd.slice(3) // merge / delete / rebind
+    showSetup.value = true
+  }
+}
 
 // ---------- Tauri 全局快捷键（Alt+Q）→ 唤起快速录入 ----------
 // 仅桌面壳注入 Tauri 时生效；浏览器/纯 Web 下静默跳过

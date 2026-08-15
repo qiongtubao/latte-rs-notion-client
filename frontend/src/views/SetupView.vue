@@ -1,10 +1,16 @@
 <template>
   <div class="setup-page">
     <el-card class="setup-card">
-      <h2>欢迎使用 Latte</h2>
-      <p class="sub">首次使用需要连接你的 Notion，请按以下步骤操作：</p>
+      <div class="setup-head">
+        <h2>{{ pageTitle }}</h2>
+        <el-button v-if="closable" size="small" @click="emit('done')">← 返回</el-button>
+      </div>
+      <p v-if="closable" class="sub">
+        已自动加载你 Notion 根页面下的全部数据库及数据条数，可直接进行下方操作。
+      </p>
+      <p v-else class="sub">首次使用需要连接你的 Notion，请按以下步骤操作：</p>
 
-      <ol class="steps">
+      <ol v-if="!closable" class="steps">
         <li>
           打开
           <el-link type="primary" href="https://www.notion.so/profile/integrations" target="_blank">
@@ -19,7 +25,7 @@
         <li>在下方粘贴 Token 和页面 URL，点击「测试配置」。</li>
       </ol>
 
-      <el-form :model="form" label-width="90px" @submit.prevent>
+      <el-form v-if="!closable" :model="form" label-width="90px" @submit.prevent>
         <el-form-item label="Token">
           <el-input v-model="form.token" placeholder="ntn_xxxxxxxxxxxx" show-password />
         </el-form-item>
@@ -51,11 +57,21 @@
         <el-alert v-if="error" :title="error" type="error" :closable="false" class="err" />
       </el-form>
 
-      <!-- 数据库选择 -->
-      <template v-if="candidates.length > 0">
+      <!-- 管理模式：免填 token，用已保存配置直接加载 -->
+      <template v-else>
+        <div v-if="loadingCandidates" class="sub" style="margin: 8px 0;">
+          <el-icon class="is-loading"><Loading /></el-icon> 正在加载数据库…
+        </div>
+        <el-alert v-if="error" :title="error" type="error" :closable="false" class="err" />
+        <el-button size="small" :loading="loadingCandidates" @click="loadCandidates">刷新</el-button>
+      </template>
+
+      <!-- 数据库选择（重新绑定） -->
+      <template v-if="candidates.length > 0 && showRebind">
         <el-divider />
-        <h3>数据库选择</h3>
-        <p class="sub">如果同一个类型发现多个库，请手动选择要使用的库；留空则自动选择。</p>
+        <h3>重新绑定数据库</h3>
+        <p class="sub" v-if="closable">为每个类型选择要绑定的库，点击「保存绑定」生效；留空则自动选择 / 创建新库。</p>
+        <p class="sub" v-else>如果同一个类型发现多个库，请手动选择要使用的库；留空则自动选择。</p>
         <el-form label-width="110px">
           <el-form-item v-for="k in kindList" :key="k.key" :label="k.label">
             <el-select v-model="selectedIds[k.key]" clearable placeholder="自动选择 / 创建新库" style="width: 100%;">
@@ -68,12 +84,17 @@
               />
             </el-select>
           </el-form-item>
+          <el-form-item v-if="closable">
+            <el-button type="primary" :loading="submitting" @click="submit">保存绑定</el-button>
+          </el-form-item>
         </el-form>
+      </template>
 
-        <!-- 数据库管理 -->
+      <!-- 合并数据库 -->
+      <template v-if="candidates.length > 0 && showMerge">
         <el-divider />
-        <h3>数据库管理</h3>
-        <p class="sub">勾选同类型的多个库可进行合并；点击删除可清理空库或重复库。</p>
+        <h3>合并数据库</h3>
+        <p class="sub">勾选同类型的多个库，把数据复制到其中一个目标库。</p>
         <el-table :data="candidates" style="width: 100%; margin-top: 12px;" size="small" @selection-change="onSelectionChange">
           <el-table-column type="selection" width="40" />
           <el-table-column prop="title" label="标题" />
@@ -83,10 +104,42 @@
           <el-table-column label="行数" width="80">
             <template #default="{ row }">{{ row.row_count }}</template>
           </el-table-column>
-          <el-table-column label="结构" width="110">
+          <el-table-column label="结构" width="150">
             <template #default="{ row }">
               <el-tag v-if="row.schema_ok" type="success" size="small">匹配</el-tag>
-              <el-tag v-else type="warning" size="small">不匹配</el-tag>
+              <template v-else>
+                <el-tag type="warning" size="small">不匹配</el-tag>
+                <el-button type="warning" size="small" link :loading="fixingId === row.id" @click="fixSchema(row)">修复</el-button>
+              </template>
+            </template>
+          </el-table-column>
+        </el-table>
+        <div style="margin-top: 12px;">
+          <el-button type="primary" size="small" :disabled="!canMerge" @click="openMergeDialog">合并选中库</el-button>
+        </div>
+      </template>
+
+      <!-- 删除数据库 -->
+      <template v-if="candidates.length > 0 && showDelete">
+        <el-divider />
+        <h3>删除数据库</h3>
+        <p class="sub">删除后会被移到 Notion 回收站，用于清理空库或重复库；可勾选多个一键删除。</p>
+        <el-table :data="candidates" style="width: 100%; margin-top: 12px;" size="small" @selection-change="onDeleteSelectionChange">
+          <el-table-column type="selection" width="40" />
+          <el-table-column prop="title" label="标题" />
+          <el-table-column label="类型" width="100">
+            <template #default="{ row }">{{ kindLabel(row.kind) }}</template>
+          </el-table-column>
+          <el-table-column label="行数" width="80">
+            <template #default="{ row }">{{ row.row_count }}</template>
+          </el-table-column>
+          <el-table-column label="结构" width="150">
+            <template #default="{ row }">
+              <el-tag v-if="row.schema_ok" type="success" size="small">匹配</el-tag>
+              <template v-else>
+                <el-tag type="warning" size="small">不匹配</el-tag>
+                <el-button type="warning" size="small" link :loading="fixingId === row.id" @click="fixSchema(row)">修复</el-button>
+              </template>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="120">
@@ -96,7 +149,9 @@
           </el-table-column>
         </el-table>
         <div style="margin-top: 12px;">
-          <el-button type="primary" size="small" :disabled="!canMerge" @click="openMergeDialog">合并选中库</el-button>
+          <el-button type="danger" size="small" :disabled="!deleteSelection.length" :loading="batchDeleting" @click="deleteSelected">
+            一键删除选中库（{{ deleteSelection.length }}）
+          </el-button>
         </div>
       </template>
     </el-card>
@@ -126,12 +181,26 @@
 </template>
 
 <script setup>
-import { reactive, ref, computed } from 'vue'
+import { reactive, ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Loading } from '@element-plus/icons-vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { api } from '../api'
 
+// 已配置后从「设置」打开时 closable 为 true：显示返回按钮、隐藏新手引导；
+// section 为空时显示全部区块（首次配置流程），否则只显示对应功能区
+const props = defineProps({
+  closable: { type: Boolean, default: false },
+  section: { type: String, default: '' }, // '' / merge / delete / rebind
+})
+const showRebind = computed(() => !props.section || props.section === 'rebind')
+const showMerge = computed(() => !props.section || props.section === 'merge')
+const showDelete = computed(() => !props.section || props.section === 'delete')
+const pageTitle = computed(() => {
+  if (!props.closable) return '欢迎使用 Latte'
+  return { merge: '合并数据库', delete: '删除数据库', rebind: '重新绑定数据库' }[props.section] || '数据库管理'
+})
 const emit = defineEmits(['done'])
 
 async function notifySetupDone() {
@@ -171,6 +240,110 @@ const selectedIds = reactive({
 })
 
 const mergeSelection = ref([])
+const deleteSelection = ref([])
+const batchDeleting = ref(false)
+const fixingId = ref('')
+
+// 修复远端库结构：补齐缺失字段、title 列重命名；类型冲突的字段提示手动处理
+async function fixSchema(row) {
+  try {
+    await ElMessageBox.confirm(
+      `将按 Latte 标准结构修复「${row.title}」：补齐缺失的字段（含 select 选项）、必要时重命名标题列。已有数据和多余字段不会改动。`,
+      '修复数据库结构',
+      { confirmButtonText: '修复', cancelButtonText: '取消', type: 'info' }
+    )
+  } catch {
+    return
+  }
+  fixingId.value = row.id
+  try {
+    const r = await api.fixDatabase({ token: form.token.trim(), database_id: row.id })
+    const parts = []
+    if (r.added?.length) parts.push(`已补齐字段：${r.added.join('、')}`)
+    if (r.renamed_title) parts.push(`标题列「${r.renamed_title[0]}」已重命名为「${r.renamed_title[1]}」`)
+    if (!parts.length && !r.conflicts?.length) parts.push('结构已匹配，无需修改')
+    if (r.conflicts?.length) {
+      parts.push(`以下字段类型不一致，请在 Notion 中手动处理：${r.conflicts.join('、')}`)
+      ElMessage.warning(parts.join('；'))
+    } else {
+      ElMessage.success(parts.join('；'))
+    }
+    await refreshCandidates()
+  } catch (e) {
+    ElMessage.error(e.message || '修复失败')
+  } finally {
+    fixingId.value = ''
+  }
+}
+
+function onDeleteSelectionChange(rows) {
+  deleteSelection.value = rows
+}
+
+// 一键删除选中库：逐个调用删除接口（后端已限速），全部完成后统一刷新
+async function deleteSelected() {
+  const list = deleteSelection.value
+  if (!list.length) return
+  const totalRows = list.reduce((sum, c) => sum + (c.row_count || 0), 0)
+  try {
+    await ElMessageBox.confirm(
+      `确定删除选中的 ${list.length} 个数据库吗？共 ${totalRows} 条数据，删除后都会移到 Notion 回收站。\n\n` +
+        list.map((c) => `· ${c.title}（${c.row_count}条）`).join('\n'),
+      '一键删除确认',
+      { confirmButtonText: '全部删除', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  batchDeleting.value = true
+  let ok = 0
+  const failed = []
+  for (const c of list) {
+    try {
+      await api.deleteDatabase({ token: form.token.trim(), database_id: c.id })
+      ok++
+    } catch (e) {
+      failed.push(`${c.title}: ${e.message}`)
+    }
+  }
+  batchDeleting.value = false
+  if (failed.length) {
+    ElMessage.error(`已删除 ${ok} 个，失败 ${failed.length} 个：${failed.join('；')}`)
+  } else {
+    ElMessage.success(`已删除 ${ok} 个数据库`)
+  }
+  await refreshCandidates()
+}
+const loadingCandidates = ref(false)
+
+// 管理模式：用后端已保存的 token/页面直接加载候选库（含行数），无需重填配置
+async function loadCandidates() {
+  loadingCandidates.value = true
+  error.value = ''
+  try {
+    const res = await api.setupCandidates()
+    if (!res.token_valid) throw new Error('已保存的 Token 无效，请重新完成初始配置')
+    if (res.error) throw new Error(res.error)
+    candidates.value = res.candidates || []
+    mergeSelection.value = []
+    deleteSelection.value = []
+  } catch (e) {
+    error.value = e.message || '加载数据库失败'
+    candidates.value = []
+  } finally {
+    loadingCandidates.value = false
+  }
+}
+
+onMounted(() => {
+  if (props.closable) loadCandidates()
+})
+
+// 操作后刷新列表：管理模式走免 token 接口，首次配置走 verify
+async function refreshCandidates() {
+  if (props.closable) await loadCandidates()
+  else await testConfig()
+}
 
 const selectedCandidates = computed(() =>
   candidates.value.filter((c) => mergeSelection.value.includes(c.id))
@@ -289,7 +462,7 @@ async function deleteDb(row) {
   try {
     await api.deleteDatabase({ token: form.token.trim(), database_id: row.id })
     ElMessage.success('已删除')
-    await testConfig()
+    await refreshCandidates()
   } catch (e) {
     ElMessage.error(e.message || '删除失败')
   }
@@ -324,7 +497,7 @@ async function doMerge() {
     })
     ElMessage.success(`合并完成，共复制 ${res.copied} 条数据`)
     mergeDialogVisible.value = false
-    await testConfig()
+    await refreshCandidates()
   } catch (e) {
     ElMessage.error(e.message || '合并失败')
   } finally {
@@ -333,7 +506,8 @@ async function doMerge() {
 }
 
 async function submit() {
-  if (!form.token.trim() || !form.page_url.trim()) {
+  // 管理模式（重新绑定）允许留空：后端回退到已保存的 token / 页面
+  if (!props.closable && (!form.token.trim() || !form.page_url.trim())) {
     error.value = '请填写 Token 和页面 URL'
     return
   }
@@ -377,6 +551,12 @@ async function submit() {
 
 .sub {
   color: #909399;
+}
+
+.setup-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 
 .steps {
