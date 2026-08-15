@@ -12,28 +12,30 @@
         </div>
       </template>
 
-      <div class="grid" v-loading="loading">
-        <div v-for="w in weekNames" :key="w" class="cell week-name">{{ w }}</div>
-        <div
-          v-for="cell in cells"
-          :key="cell.key"
-          class="cell day"
-          :class="{ dim: !cell.inMonth, today: cell.isToday, clickable: cell.inMonth }"
-          @click="cell.inMonth && openDay(cell.date)"
-        >
-          <div class="day-num">{{ cell.dayNum }}</div>
-          <div v-if="cell.data && cell.data.seconds > 0" class="day-info time">
-            ⏱ {{ fmtHours(cell.data.seconds) }}
-          </div>
-          <div v-if="cell.data && cell.data.expense > 0" class="day-info expense">
-            {{ fmtMoney(cell.data.expense) }}
+      <div class="grid-scroll" v-loading="loading">
+        <div class="grid">
+          <div v-for="w in weekNames" :key="w" class="cell week-name">{{ w }}</div>
+          <div
+            v-for="cell in cells"
+            :key="cell.key"
+            class="cell day"
+            :class="{ dim: !cell.inMonth, today: cell.isToday, clickable: cell.inMonth }"
+            @click="cell.inMonth && openDay(cell.date)"
+          >
+            <div class="day-num">{{ cell.dayNum }}</div>
+            <div v-if="cell.data && cell.data.seconds > 0" class="day-info time">
+              ⏱ {{ fmtHours(cell.data.seconds) }}
+            </div>
+            <div v-if="cell.data && cell.data.expense > 0" class="day-info expense">
+              {{ fmtMoney(cell.data.expense) }}
+            </div>
           </div>
         </div>
       </div>
     </el-card>
 
     <!-- 当日明细抽屉：24 小时时间线 + 列表 -->
-    <el-drawer v-model="drawer" size="580px">
+    <el-drawer v-model="drawer" :size="drawerSize">
       <template #header>
         <div class="drawer-header">
           <el-button-group>
@@ -252,6 +254,11 @@ const drawer = ref(false)
 const dayLoading = ref(false)
 const selectedDate = ref('')
 const dayDetail = ref({ events: [], expenses: [] })
+// 窄窗口（如桌面弹窗）下抽屉占满全宽，避免 580px 超出窗口宽度
+const drawerSize = ref('580px')
+function updateDrawerSize() {
+  drawerSize.value = window.innerWidth < 620 ? '100%' : '580px'
+}
 
 const todayStr = dayjs().format('YYYY-MM-DD')
 
@@ -625,13 +632,18 @@ function scrollTimeline() {
 }
 
 onMounted(() => {
+  updateDrawerSize()
+  window.addEventListener('resize', updateDrawerSize)
   loadCalendar()
   nowTimer = setInterval(() => {
     nowTs.value = dayjs().unix()
   }, 60000)
 })
 
-onUnmounted(() => clearInterval(nowTimer))
+onUnmounted(() => {
+  clearInterval(nowTimer)
+  window.removeEventListener('resize', updateDrawerSize)
+})
 </script>
 
 <style scoped>
@@ -646,16 +658,20 @@ onUnmounted(() => clearInterval(nowTimer))
   font-weight: 600;
 }
 
+.grid-scroll {
+  overflow: hidden;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: 4px;
+  gap: 2px;
 }
 
 .cell {
-  min-height: 72px;
+  min-height: 64px;
   border-radius: 6px;
-  padding: 6px 8px;
+  padding: 4px 3px;
 }
 
 .week-name {
@@ -695,12 +711,15 @@ onUnmounted(() => clearInterval(nowTimer))
 }
 
 .day-num {
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .day-info {
-  font-size: 12px;
+  font-size: 11px;
   margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .day-info.time {

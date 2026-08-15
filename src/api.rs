@@ -29,6 +29,9 @@ use crate::notion::NotionClient;
 use crate::report::{self, Period};
 use crate::sync::{SyncStatus, sync_once};
 
+/// 通知回调：标题 + 正文
+pub type NotifyFn = dyn Fn(&str, &str) + Send + Sync;
+
 /// 共享状态
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +41,8 @@ pub struct AppState {
     pub sync_status: Arc<Mutex<SyncStatus>>,
     /// 进行中的番茄钟会话（内存态；进程重启即丢失，关联的计时事件不受影响）
     pub pomodoro: Arc<Mutex<Option<PomodoroSession>>>,
+    /// 系统通知发送回调（桌面端可替换为原生通知插件，Web 端用 notify-rust 兜底）
+    pub notifier: Arc<NotifyFn>,
 }
 
 /// 番茄钟时长（分钟）
@@ -3035,6 +3040,7 @@ mod tests {
             config: Arc::new(Mutex::new(cfg)),
             sync_status: Arc::new(Mutex::new(SyncStatus::default())),
             pomodoro: Arc::new(Mutex::new(None)),
+            notifier: Arc::new(|_, _| {}),
         }
     }
 

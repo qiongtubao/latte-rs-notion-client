@@ -15,6 +15,7 @@
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
-    "core:event:allow-listen"
+    "core:event:allow-listen",
+    "notification:default"
   ]
 }

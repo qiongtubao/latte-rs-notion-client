@@ -306,6 +306,8 @@ async function startPomo(t, minutes) {
 
 // 子按钮动作：＋添加 / ▲排序 / ✓完成 / ▶⏹计时（由悬浮按钮经 provide 下发）
 const subAction = inject('subAction')
+// 番茄钟启动回调：由 App.vue / PopupApp.vue 提供
+const pomodoroStart = inject('pomodoroStart')
 watch(subAction, (act) => {
   if (!act || act.key !== 'today') return
   if (act.action === 'add') {

@@ -3,6 +3,12 @@
     <header class="popup-header">
       <span class="popup-title">{{ currentLabel }}</span>
       <div class="popup-ops">
+        <!-- 今日任务小按钮：和 Web 版悬浮子按钮动作一致 -->
+        <template v-if="currentKey === 'today'">
+          <el-button size="small" text title="添加任务" @click="fireSubAction('add')">＋</el-button>
+          <el-button size="small" text title="切换排序" @click="fireSubAction('sort')">▲</el-button>
+          <el-button size="small" text title="显示/隐藏已完成" @click="fireSubAction('done')">✓</el-button>
+        </template>
         <el-button size="small" text title="打开主窗口" @click="openMain">
           <el-icon><FullScreen /></el-icon>
         </el-button>
@@ -23,18 +29,24 @@ import { computed, markRaw, onMounted, onUnmounted, provide, ref, shallowRef } f
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { Close, FullScreen } from '@element-plus/icons-vue'
-import TodayView from './views/TodayView.vue'
+import { ElMessage } from 'element-plus'
+import { api } from './api'
+import TodayTaskList from './components/TodayTaskList.vue'
 import MoneyView from './views/MoneyView.vue'
 import CalendarView from './views/CalendarView.vue'
-import ProjectsView from './views/ProjectsView.vue'
-import NotesView from './views/NotesView.vue'
+import ProjectList from './components/ProjectList.vue'
+import NoteList from './components/NoteList.vue'
+import IdeaList from './components/IdeaList.vue'
 
 const viewMap = {
-  today: TodayView,
+  // 今日任务使用精简列表（按优先级排序），和 Web 版悬浮按钮弹出的列表一致
+  today: TodayTaskList,
   money: MoneyView,
   calendar: CalendarView,
-  projects: ProjectsView,
-  notes: NotesView,
+  // 项目/知识库同样使用 Web 版悬浮窗口的精简组件
+  projects: ProjectList,
+  notes: NoteList,
+  ideas: IdeaList,
 }
 const LABELS = {
   today: '今日任务',
@@ -42,15 +54,30 @@ const LABELS = {
   calendar: '日历',
   projects: '项目',
   notes: '知识库',
+  ideas: '好想法',
 }
 
 const currentKey = ref('')
 const currentView = shallowRef(null)
 const currentLabel = computed(() => LABELS[currentKey.value] || '')
 
-// 各视图会 inject('subAction')（主窗口浮动按钮时代的快捷动作通道），这里提供空实现避免告警
+// 各视图会 inject('subAction')（主窗口浮动按钮时代的快捷动作通道），这里提供实现
 const subAction = ref(null)
 provide('subAction', subAction)
+
+// 番茄钟启动：和 App.vue 提供的行为一致
+provide('pomodoroStart', async (taskId, minutes) => {
+  try {
+    const r = await api.pomodoroTask(taskId, minutes)
+    ElMessage.success(`🍅 ${r.minutes} 分钟番茄钟已启动`)
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+})
+
+function fireSubAction(action) {
+  subAction.value = { key: currentKey.value, action }
+}
 
 let unlisten = null
 onMounted(async () => {

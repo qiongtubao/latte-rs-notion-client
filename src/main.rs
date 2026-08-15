@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 async fn main() -> Result<()> {
     let shutdown = Arc::new(Notify::new());
 
-    let (state, serve) = server::init_server(shutdown.clone()).await?;
+    let (state, serve) = server::init_server(shutdown.clone(), None).await?;
 
     // 等待 Ctrl-C
     let _ = tokio::signal::ctrl_c().await;

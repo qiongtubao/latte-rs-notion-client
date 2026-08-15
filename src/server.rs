@@ -53,11 +53,29 @@ fn backup_db_file(db_path: &std::path::Path) {
     }
 }
 
+/// 默认系统通知实现（notify-rust，Linux D-Bus / macOS / Windows 回退）。
+fn default_notifier(summary: &str, body: &str) {
+    let summary = summary.to_string();
+    let body = body.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .show()
+        {
+            eprintln!("发送系统通知失败：{e:?}");
+        }
+    });
+}
+
 /// 构建共享应用状态（DB / Notion 客户端 / 配置 / 同步状态）。
 /// Web 入口与 Tauri 壳都从这里拿 state。
+///
+/// `notifier` 为可选的系统通知回调；传 `None` 时使用 notify-rust 默认实现。
 pub fn build_state(
     cfg: config::Config,
     db_path: &std::path::Path,
+    notifier: Option<Arc<crate::api::NotifyFn>>,
 ) -> Result<AppState> {
     let db = Db::open(db_path).context("打开本地数据库失败")?;
     // 重建知识库全文索引（兜底漏钩子的历史数据；表小，重建开销可忽略）
@@ -65,12 +83,14 @@ pub fn build_state(
     if let Ok(notes) = db.all_notes() {
         crate::docgraph::export_notes_logged(&notes);
     }
+    let notifier = notifier.unwrap_or_else(|| Arc::new(default_notifier));
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         client: Arc::new(NotionClient::new(cfg.token.clone())),
         config: Arc::new(Mutex::new(cfg)),
         sync_status: Arc::new(Mutex::new(SyncStatus::default())),
         pomodoro: Arc::new(Mutex::new(None)),
+        notifier,
     };
     Ok(state)
 }
@@ -110,6 +130,7 @@ fn static_dir() -> Option<PathBuf> {
 /// - 桌面壳（Tauri）：持有 state 暴露 commands，需要关闭时 notify + await handle
 pub async fn init_server(
     shutdown: Arc<Notify>,
+    notifier: Option<Arc<crate::api::NotifyFn>>,
 ) -> Result<(AppState, tokio::task::JoinHandle<()>)> {
     let mut cfg = config::load()?.unwrap_or_default();
     if config::is_configured(&cfg) && cfg.api_token.is_empty() {
@@ -117,7 +138,7 @@ pub async fn init_server(
         config::save(&cfg)?;
         println!("外部 API token 已生成，见 config.toml");
     }
-    let state = build_state(cfg, &config::db_path())?;
+    let state = build_state(cfg, &config::db_path(), notifier)?;
     backup_db_file(&config::db_path());
 
     // 后台同步循环
@@ -219,7 +240,7 @@ async fn reminder_loop(state: AppState, shutdown: Arc<Notify>) {
                 .and_then(|db| db.due_reminders(last, now).ok())
                 .unwrap_or_default();
             for ev in due {
-                notify("Latte 提醒", &format!(
+                notify_with(&state.notifier, "Latte 提醒", &format!(
                     "该开始了：{}（{}）",
                     if ev.content.is_empty() { "(无内容)" } else { &ev.content },
                     ev.tag.label()
@@ -237,7 +258,8 @@ async fn reminder_loop(state: AppState, shutdown: Arc<Notify>) {
                 })
                 .unwrap_or_default();
             for it in due_items {
-                notify(
+                notify_with(
+                    &state.notifier,
                     "Latte 打卡",
                     &format!("🍅 该打卡了：{}{}", it.name, if it.unit.is_empty() { String::new() } else { format!("（{}）", it.unit) }),
                 );
@@ -249,14 +271,14 @@ async fn reminder_loop(state: AppState, shutdown: Arc<Notify>) {
                 .ok()
                 .and_then(|mut p| p.take_if(|s| s.end_ts <= now));
             if let Some(s) = pomo_done {
-                notify("Latte 番茄钟", &format!("🍅 {} 分钟到：{}，休息一下", s.minutes, s.task_title));
+                notify_with(&state.notifier, "Latte 番茄钟", &format!("🍅 {} 分钟到：{}，休息一下", s.minutes, s.task_title));
             }
             // 每日复盘：21:30 后推一次当天汇总（内存记日期当天只发一次；23:30 后不补发）
             let today = chrono::Local::now().date_naive();
             let review_ts = crate::report::local_midnight(today) + 21 * 3600 + 30 * 60;
             if last_review != Some(today) && now >= review_ts && now < review_ts + 2 * 3600 {
                 last_review = Some(today);
-                notify("Latte 每日复盘", &build_daily_review(&state, today, now));
+                notify_with(&state.notifier, "Latte 每日复盘", &build_daily_review(&state, today, now));
             }
         }
         last = now;
@@ -302,19 +324,9 @@ fn build_daily_review(state: &AppState, today: chrono::NaiveDate, now: i64) -> S
     parts.join(" · ")
 }
 
-/// 发系统通知（Linux D-Bus）；show() 是阻塞调用，放进 blocking 池，失败只打日志
-fn notify(summary: &str, body: &str) {
-    let summary = summary.to_string();
-    let body = body.to_string();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .show()
-        {
-            eprintln!("发送系统通知失败：{e:?}");
-        }
-    });
+/// 调用 state 里的通知回调发送系统通知。
+fn notify_with(notifier: &Arc<crate::api::NotifyFn>, summary: &str, body: &str) {
+    notifier(summary, body);
 }
 
 /// 同步循环退出后的最后冲刷：把仍在 dirty 的记录推送一次，然后关闭 DB。

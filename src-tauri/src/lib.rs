@@ -19,13 +19,14 @@ use tauri::{
     Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
+use tauri_plugin_notification::NotificationExt;
 
 #[cfg(debug_assertions)]
 const SERVER_URL: &str = "http://127.0.0.1:5173";
 #[cfg(not(debug_assertions))]
 const SERVER_URL: &str = "http://127.0.0.1:3210";
 /// 悬浮球 key 列表（与前端 PopupApp 的 viewMap 一一对应）
-const BALL_KEYS: [&str; 5] = ["today", "money", "calendar", "projects", "notes"];
+const BALL_KEYS: [&str; 6] = ["today", "money", "calendar", "projects", "notes", "ideas"];
 /// 弹窗尺寸（逻辑像素）
 const POPUP_W: f64 = 440.0;
 const POPUP_H: f64 = 560.0;
@@ -502,6 +503,16 @@ fn toggle_popup(app: tauri::AppHandle, key: String) -> Result<(), String> {
         *cur = Some(key.clone());
     }
 
+    // 不同功能使用不同弹窗尺寸：项目/知识库内容更宽
+    let (popup_w, popup_h) = match key.as_str() {
+        "projects" => (640.0, POPUP_H),
+        "notes" => (860.0, POPUP_H),
+        _ => (POPUP_W, POPUP_H),
+    };
+    popup
+        .set_size(tauri::LogicalSize::new(popup_w, popup_h))
+        .map_err(|e| e.to_string())?;
+
     // 位置：球在屏幕右半侧则弹窗放球左边，否则放右边；垂直方向居中并夹在屏幕内
     let pos = ball.outer_position().map_err(|e| e.to_string())?;
     let bsize = ball.outer_size().map_err(|e| e.to_string())?;
@@ -521,8 +532,8 @@ fn toggle_popup(app: tauri::AppHandle, key: String) -> Result<(), String> {
         ),
         None => (0, 0, 1920, 1080, 1.0),
     };
-    let pw = (POPUP_W * sf) as i32;
-    let ph = (POPUP_H * sf) as i32;
+    let pw = (popup_w * sf) as i32;
+    let ph = (popup_h * sf) as i32;
     let gap = (12.0 * sf) as i32;
     let ball_cx = pos.x + bsize.width as i32 / 2;
     let x = if ball_cx > mon_x + mon_w / 2 {
@@ -726,8 +737,14 @@ const FLOATING_UI_ENABLED: bool = true;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .manage(PopupKey::new(None))
         .setup(|app| {
+            // 请求 macOS 通知权限（首次运行会弹系统授权框）
+            match app.notification().request_permission() {
+                Ok(state) => eprintln!("[macOS] 通知权限状态: {:?}", state),
+                Err(e) => eprintln!("[macOS] 请求通知权限失败: {e:?}"),
+            }
             // 全局快捷键：Alt+Q 呼出主窗口并唤起快速录入（即使窗口未聚焦/已隐藏）
             use tauri_plugin_global_shortcut::{ShortcutEvent, ShortcutState};
             use tauri::Emitter;
@@ -790,7 +807,27 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let shutdown = Arc::new(tokio::sync::Notify::new());
-                match latte::server::init_server(shutdown.clone()).await {
+                // 桌面端使用 Tauri 原生通知插件，不再走 notify-rust
+                let app_handle = handle.clone();
+                let notifier: Arc<latte::api::NotifyFn> = Arc::new(move |summary: &str, body: &str| {
+                    let summary = summary.to_string();
+                    let body = body.to_string();
+                    let app_handle_inner = app_handle.clone();
+                    if let Err(e) = app_handle.run_on_main_thread(move || {
+                        if let Err(e) = app_handle_inner
+                            .notification()
+                            .builder()
+                            .title(&summary)
+                            .body(&body)
+                            .show()
+                        {
+                            eprintln!("[Tauri] 发送通知失败：{e:?}");
+                        }
+                    }) {
+                        eprintln!("[Tauri] 调度到主线程发送通知失败：{e:?}");
+                    }
+                });
+                match latte::server::init_server(shutdown.clone(), Some(notifier)).await {
                     Ok((_state, _serve)) => {
                         // 服务就绪；init_server 内部已 spawn serve，这里无需再持有
                         drop(_serve);
