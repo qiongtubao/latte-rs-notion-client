@@ -209,8 +209,9 @@ async function notifySetupDone() {
     if (win.label === 'setup') {
       await invoke('setup_done')
     }
-  } catch {
-    // Web 版或非 Tauri 环境忽略
+  } catch (e) {
+    // Web 版或非 Tauri 环境 getCurrentWindow 会失败；Tauri 环境下打印真实错误便于排查
+    console.error('setup_done 失败:', e)
   }
 }
 
@@ -530,8 +531,8 @@ async function submit() {
     }
     await api.setup(payload)
     ElMessage.success('配置成功')
-    emit('done')
     await notifySetupDone()
+    emit('done')
   } catch (e) {
     error.value = e.message
   } finally {

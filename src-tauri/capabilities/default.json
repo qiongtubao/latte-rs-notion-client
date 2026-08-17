@@ -5,17 +5,25 @@
   "windows": [
     "main",
     "popup",
+    "setup",
     "ball-*"
   ],
   "remote": {
     "urls": [
-      "http://127.0.0.1:3210"
+      "http://127.0.0.1:3210",
+      "http://127.0.0.1:5173"
     ]
   },
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
     "core:event:allow-listen",
-    "notification:default"
+    "notification:default",
+    "allow-show-main",
+    "allow-hide-popup",
+    "allow-toggle-popup",
+    "allow-get-global-shortcut",
+    "allow-set-global-shortcut",
+    "allow-setup-done"
   ]
 }

@@ -74,7 +74,7 @@ function onUp() {
   window.removeEventListener('mouseup', onUp)
   if (!dragging) {
     // 未发生拖拽：视为点击，切换快捷操作弹窗
-    invoke('toggle_popup', { key: props.ballKey }).catch(() => {})
+    invoke('toggle_popup', { key: props.ballKey }).catch((e) => console.error('toggle_popup 失败:', e))
   }
   dragging = false
 }
